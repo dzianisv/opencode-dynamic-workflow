@@ -10,7 +10,13 @@
  * engine (store recovery + notification queue wiring), and returns the hooks:
  *   - `event` → `runner.handleEvent` so the completion gate sees the live
  *     session.idle / session.error stream;
+ *   - `chat.message` → drains the per-parent notice queue into the parent's next
+ *     message (visible summary + synthetic retrieval hint); fully fenced so a
+ *     queue/render failure never kills the prompt;
  *   - `tool` — the `bg_*` family (task/output/cancel/list).
+ *
+ * Completion toasts ride the engine's `onNotify` seam: a `client.tui.showToast`-
+ * backed notifier fires per terminal transition (success/error/info variant).
  *
  * All logging goes through `client.app.log` (structured JSON) — never `console`.
  */
@@ -18,6 +24,10 @@
 import { adaptSdkClient } from "@drawers/core";
 import type { Plugin } from "@opencode-ai/plugin";
 import { createEngine, type EngineLogger } from "./engine";
+import {
+	createChatMessageHook,
+	createToastNotifier,
+} from "./hooks/notifications";
 import { createBgCancelTool } from "./tools/cancel";
 import { createBgListTool } from "./tools/list";
 import { createBgOutputTool } from "./tools/output";
@@ -49,9 +59,15 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		},
 	};
 
-	const { runner } = await createEngine({
+	const onNotify = createToastNotifier(
+		(data) => client.tui.showToast(data),
+		logger,
+	);
+
+	const { runner, queue } = await createEngine({
 		client: adaptSdkClient(client),
 		logger,
+		onNotify,
 	});
 
 	logger.info("background-agents plugin wired");
@@ -60,6 +76,7 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		event: async ({ event }) => {
 			await runner.handleEvent(event);
 		},
+		"chat.message": createChatMessageHook(queue, logger),
 		tool: {
 			bg_task: createBgTaskTool(runner),
 			bg_output: createBgOutputTool(runner),
