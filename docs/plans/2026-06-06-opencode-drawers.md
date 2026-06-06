@@ -93,7 +93,7 @@
 
 #### Task 1.2.1: Implement ConcurrencyManager (clean-room)
 
-- [ ] Done
+- [x] Done — deviation: `acquire()` returns `AcquireResult` (= `Promise<{id}>` with a synchronous readonly `id` property) so callers can cancel a still-queued waiter; superset of the planned contract. `limitFor()` surfaces `0` as the unlimited sentinel.
 
 **Context:** Design source: `.references/oh-my-opencode/src/features/background-agent/concurrency.ts` (175 lines; SUL-1.0 — reimplement the design, do not copy text). Key behaviors verified in analysis: limit resolution `modelConcurrency[model]` > `providerConcurrency[provider]` > `defaultConcurrency` > 5, with `0` meaning unlimited (`:25-40`); concurrency *key* follows where the config knob lives — full model string if a model limit is set, else provider, else model (`:42-53`); provider = `model.split('/')[0]`.
 
@@ -116,7 +116,7 @@
 
 #### Task 1.3.1: Core types, IDs, and the engine's public contract
 
-- [ ] Done
+- [x] Done — `handleEvent` typed against the SDK's `Event` discriminated union (32 members) instead of `unknown`; `notified?: boolean` added to `BgTask` for Epic 1.4; `TERMINAL_STATUSES`/`isTerminal` helpers exported.
 
 **Context:** Greenfield. The contract below is load-bearing: Epics 1.4/1.5 and both Phase 2/3 consumers program against it (snippet justified as a cross-epic contract).
 
