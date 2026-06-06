@@ -6,7 +6,9 @@ import {
 	type EngineClient,
 	type SessionRunner,
 } from "@drawers/core";
+import type { ToolContext } from "@opencode-ai/plugin";
 import { createWorkflowRun } from "./index";
+import { createStructuredOutputTool } from "./structured/tool";
 
 /**
  * Spec-conformance suite (Task 3.2.3). Scripts run as template strings against
@@ -100,6 +102,9 @@ function makeScriptedClient() {
 	const poisoned = new Set<string>();
 	const abortCalls: string[] = [];
 	const liveSessions = new Set<string>();
+	// Every promptAsync dispatch: the target sessionID and the concatenated text
+	// of its parts. Lets cases assert nudge re-prompts (resume → promptAsync).
+	const prompts: { sessionID: string; text: string }[] = [];
 	let createSeq = 0;
 	let highWater = 0;
 	let createThrowsNext = false;
@@ -122,7 +127,10 @@ function makeScriptedClient() {
 				}
 				return Promise.resolve({ data: { id } });
 			},
-			promptAsync() {
+			promptAsync(opts) {
+				const parts = opts.body?.parts ?? [];
+				const text = parts.map((p: { text?: string }) => p.text ?? "").join("");
+				prompts.push({ sessionID: opts.path.id, text });
 				return Promise.resolve(undefined);
 			},
 			abort(opts) {
@@ -142,6 +150,7 @@ function makeScriptedClient() {
 	return {
 		client,
 		abortCalls,
+		prompts,
 		highWater: () => highWater,
 		liveCount: () => liveSessions.size,
 		/** Queue the script the NEXT create() consumes. */
@@ -151,6 +160,8 @@ function makeScriptedClient() {
 		},
 		/** A session reaches a clean completion (drops out of the live set). */
 		completeSession: (id: string) => liveSessions.delete(id),
+		/** Re-add a completed session to the live set (e.g. before a resume turn). */
+		reviveSession: (id: string) => liveSessions.add(id),
 		isPoisoned: (id: string) => poisoned.has(id),
 		liveSessionIds: () => [...liveSessions],
 	};
@@ -212,7 +223,44 @@ async function completeAllLive(h: Harness): Promise<void> {
 	await flush();
 }
 
+/**
+ * Drive ONE session's current turn to completed via idle + grace at the given
+ * clock time. Used for structured-output cases that interleave tool calls and
+ * (for the nudge path) a second resume turn, where `completeAllLive`'s
+ * all-at-once sweep is too coarse.
+ */
+async function completeTurn(
+	h: Harness,
+	id: string,
+	clockTime: number,
+): Promise<void> {
+	await flush();
+	h.clock.set(clockTime);
+	h.client.reviveSession(id);
+	await h.runner.handleEvent({
+		type: "session.idle",
+		properties: { sessionID: id },
+	} as never);
+	await flush();
+	h.timers.fireAllTimers();
+	await flush();
+	h.client.completeSession(id);
+	await flush();
+}
+
 const META = `export const meta = { name: "wf", description: "round trip" };\n`;
+
+// JSON Schema used across the structured-output conformance cases.
+const N_SCHEMA = {
+	type: "object",
+	properties: { n: { type: "number" } },
+	required: ["n"],
+	additionalProperties: false,
+};
+
+function toolCtx(sessionID: string): ToolContext {
+	return { sessionID } as unknown as ToolContext;
+}
 
 // ---- (a) meta + return round-trip ----------------------------------------
 
@@ -461,5 +509,167 @@ describe("conformance (j) — abort() cancels live child + degrades later calls"
 		};
 		expect(rv.first).toBeNull();
 		expect(rv.secondIsNull).toBe(true);
+	});
+});
+
+// ---- (k) structured output: agent({ schema }) ----------------------------
+
+describe("conformance (k) — structured output", () => {
+	const SCRIPT = (schema: object) =>
+		`${META}const r = await agent("compute", { schema: ${JSON.stringify(
+			schema,
+		)} });\nreturn r;\n`;
+
+	test("valid first try → agent() resolves the validated OBJECT", async () => {
+		const h = makeHarness();
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_k1",
+		});
+		const tool = createStructuredOutputTool(run.registry);
+		const p = run.run(SCRIPT(N_SCHEMA));
+
+		// The child session exists + schema is registered after launch settles.
+		await flush();
+		await flush();
+		const child = h.client.liveSessionIds()[0];
+		expect(child).toBeDefined();
+		if (child === undefined) {
+			throw new Error("expected a live child");
+		}
+
+		// The child "calls the tool" with a valid value.
+		const accepted = await tool.execute({ result: '{"n":1}' }, toolCtx(child));
+		expect(accepted).toBe("accepted");
+
+		await completeAllLive(h);
+		const result = await p;
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ n: 1 });
+	});
+
+	test("invalid then valid → retry string first, then resolves the object", async () => {
+		const h = makeHarness();
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_k2",
+		});
+		const tool = createStructuredOutputTool(run.registry);
+		const p = run.run(SCRIPT(N_SCHEMA));
+		await flush();
+		await flush();
+		const child = h.client.liveSessionIds()[0];
+		if (child === undefined) {
+			throw new Error("expected a live child");
+		}
+
+		// First call: wrong type → retry string (the model would see this and fix).
+		const bad = await tool.execute({ result: '{"n":"oops"}' }, toolCtx(child));
+		expect(bad as string).toStartWith(
+			"schema validation failed — fix and call structured_output again: ",
+		);
+		// Second call: corrected → accepted.
+		const good = await tool.execute({ result: '{"n":2}' }, toolCtx(child));
+		expect(good).toBe("accepted");
+
+		await completeAllLive(h);
+		const result = await p;
+		// The SCRIPT never observed a parse error — only the validated object.
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ n: 2 });
+	});
+
+	test("child never calls the tool → ONE nudge re-prompt, agent() resolves null", async () => {
+		const h = makeHarness();
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_k3",
+		});
+		const p = run.run(SCRIPT(N_SCHEMA));
+		await flush();
+		await flush();
+		const child = h.client.liveSessionIds()[0];
+		if (child === undefined) {
+			throw new Error("expected a live child");
+		}
+
+		// First turn completes with NO tool call.
+		await completeTurn(h, child, 1000 + MIN_IDLE + 1);
+		// The runtime issues exactly one nudge (resume → promptAsync re-dispatch).
+		const nudges = h.client.prompts.filter(
+			(pr) => pr.sessionID === child && pr.text.includes("have not returned"),
+		);
+		expect(nudges.length).toBe(1);
+		// Second turn (post-nudge) completes, still with no tool call.
+		await completeTurn(h, child, 1000 + 3 * MIN_IDLE + 1);
+
+		const result = await p;
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toBeNull();
+	});
+
+	test("two concurrent structured agents do not cross-validate (registry isolation)", async () => {
+		const h = makeHarness();
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_k4",
+			cores: 8, // gate ≥ 2 so both children launch concurrently.
+		});
+		const tool = createStructuredOutputTool(run.registry);
+		// Two distinct schemas: A wants { n: number }; B wants { s: string }.
+		const SCHEMA_B = {
+			type: "object",
+			properties: { s: { type: "string" } },
+			required: ["s"],
+			additionalProperties: false,
+		};
+		const p = run.run(
+			`${META}const [a, b] = await parallel([\n` +
+				`  () => agent("A", { schema: ${JSON.stringify(N_SCHEMA)} }),\n` +
+				`  () => agent("B", { schema: ${JSON.stringify(SCHEMA_B)} }),\n` +
+				`]);\nreturn { a, b };\n`,
+		);
+		await flush();
+		await flush();
+		const live = h.client.liveSessionIds();
+		expect(live.length).toBe(2);
+		const [childA, childB] = live;
+		if (childA === undefined || childB === undefined) {
+			throw new Error("expected two live children");
+		}
+
+		// Each child validates against ITS OWN schema. The value valid for A is
+		// invalid for B and vice versa — registry isolation by sessionID.
+		const aOnA = await tool.execute({ result: '{"n":7}' }, toolCtx(childA));
+		const aOnB = await tool.execute({ result: '{"n":7}' }, toolCtx(childB));
+		expect(aOnA).toBe("accepted");
+		expect(aOnB as string).toStartWith("schema validation failed");
+
+		const bOnB = await tool.execute({ result: '{"s":"hi"}' }, toolCtx(childB));
+		expect(bOnB).toBe("accepted");
+
+		await completeAllLive(h);
+		const result = await p;
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ a: { n: 7 }, b: { s: "hi" } });
+	});
+
+	test("malformed schema in script → run status error mentioning schema compile", async () => {
+		const h = makeHarness();
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_k5",
+		});
+		// `type: "bogus"` is not a valid JSON Schema value — ajv rejects compile.
+		const result = await run.run(
+			`${META}return await agent("x", { schema: { type: "bogus" } });\n`,
+		);
+		expect(result.status).toBe("error");
+		expect(result.error?.toLowerCase()).toContain("schema");
 	});
 });

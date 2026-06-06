@@ -30,6 +30,16 @@ export {
 	type WorkflowPhase,
 } from "./runtime/meta";
 export {
+	createSchemaRegistry,
+	type SchemaRegistry,
+} from "./runtime/structured/registry";
+export { createStructuredOutputTool } from "./runtime/structured/tool";
+export {
+	type CompiledSchema,
+	compileSchema,
+	SchemaCompileError,
+} from "./runtime/structured/validate";
+export {
 	AgentCapError,
 	type AgentFn,
 	type AgentOpts,

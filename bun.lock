@@ -33,6 +33,7 @@
       "name": "opencode-drawer-workflows",
       "dependencies": {
         "@drawers/core": "workspace:*",
+        "@opencode-ai/plugin": "1.16.2",
         "acorn": "8.16.0",
         "ajv": "8.20.0",
       },

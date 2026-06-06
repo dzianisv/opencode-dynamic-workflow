@@ -10,10 +10,14 @@ import {
 } from "@drawers/core";
 import { createAgentPrimitive } from "./agent-call";
 import {
+	createSchemaRegistry,
+	type SchemaRegistry,
+} from "./structured/registry";
+import { SchemaCompileError } from "./structured/validate";
+import {
 	AgentCapError,
 	BudgetExhaustedError,
 	type BudgetView,
-	NotYetSupportedError,
 	type ProgressEvent,
 } from "./types";
 
@@ -36,6 +40,12 @@ interface FakeRunnerOpts {
 	awaitThrows?: Error;
 	/** When true, awaitCompletion blocks until the test resolves it. */
 	deferred?: boolean;
+	/** When set, the synthetic sessionID assigned to the launched task. */
+	sessionID?: string;
+	/** When set, resume() throws this (e.g. sessionExpired). */
+	resumeThrows?: Error;
+	/** Invoked when launch() runs, BEFORE awaitCompletion, with the sessionID. */
+	onLaunched?: (sessionID: string) => void;
 }
 
 /** Minimal SessionRunner fake covering only what the primitive touches. */
@@ -48,6 +58,8 @@ class FakeRunner implements SessionRunner {
 
 	constructor(private readonly opts: FakeRunnerOpts = {}) {}
 
+	resumes: { id: string; prompt: string }[] = [];
+
 	async launch(req: LaunchRequest): Promise<BgTask> {
 		if (this.opts.launchThrows) {
 			throw this.opts.launchThrows;
@@ -56,7 +68,13 @@ class FakeRunner implements SessionRunner {
 		this.seq += 1;
 		this.inFlight += 1;
 		this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
-		return makeTask(`bg_${this.seq}`, req);
+		const sessionID = this.opts.sessionID ?? `ses_${this.seq}`;
+		// Mirror core's synchronous onSessionCreated hook (registers schema).
+		req.onSessionCreated?.(sessionID);
+		this.opts.onLaunched?.(sessionID);
+		const task = makeTask(`bg_${this.seq}`, req);
+		task.sessionID = sessionID;
+		return task;
 	}
 
 	async awaitCompletion(taskId: string): Promise<BgTask> {
@@ -99,7 +117,11 @@ class FakeRunner implements SessionRunner {
 		return makeTaskWithStatus(taskId, "cancelled");
 	}
 
-	async resume(taskId: string): Promise<BgTask> {
+	async resume(taskId: string, prompt: string): Promise<BgTask> {
+		if (this.opts.resumeThrows) {
+			throw this.opts.resumeThrows;
+		}
+		this.resumes.push({ id: taskId, prompt });
 		return makeTaskWithStatus(taskId, "running");
 	}
 
@@ -162,6 +184,7 @@ interface HarnessOverrides {
 	currentPhase?: () => string | undefined;
 	liveTasks?: Set<string>;
 	defaults?: { agent: string; awaitTimeoutMs?: number };
+	registry?: SchemaRegistry;
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -171,6 +194,7 @@ function harness(overrides: HarnessOverrides = {}) {
 		overrides.gate ?? new ConcurrencyManager({ defaultConcurrency: 5 });
 	const counters = overrides.counters ?? { agents: 0 };
 	const liveTasks = overrides.liveTasks ?? new Set<string>();
+	const registry = overrides.registry ?? createSchemaRegistry();
 	const agent = createAgentPrimitive({
 		runner,
 		parentSessionID: "parent",
@@ -182,8 +206,9 @@ function harness(overrides: HarnessOverrides = {}) {
 		currentPhase: overrides.currentPhase ?? (() => undefined),
 		liveTasks,
 		defaults: overrides.defaults ?? { agent: "build" },
+		registry,
 	});
-	return { agent, events, runner, gate, counters, liveTasks };
+	return { agent, events, runner, gate, counters, liveTasks, registry };
 }
 
 describe("createAgentPrimitive — result mapping", () => {
@@ -230,12 +255,100 @@ describe("createAgentPrimitive — caps and budget throw", () => {
 		const { agent } = harness({ budget: budget(100, 0) });
 		await expect(agent("do it")).rejects.toBeInstanceOf(BudgetExhaustedError);
 	});
+});
 
-	test("schema option throws NotYetSupportedError", async () => {
+describe("createAgentPrimitive — structured output (schema)", () => {
+	const SCHEMA = {
+		type: "object",
+		properties: { n: { type: "number" } },
+		required: ["n"],
+	} as const;
+
+	test("a malformed schema detonates with SchemaCompileError (script bug)", async () => {
 		const { agent } = harness();
-		await expect(agent("do it", { schema: {} })).rejects.toBeInstanceOf(
-			NotYetSupportedError,
-		);
+		// `type: "bogus"` is not a valid JSON Schema keyword value — ajv rejects it.
+		await expect(
+			agent("do it", { schema: { type: "bogus" } }),
+		).rejects.toBeInstanceOf(SchemaCompileError);
+	});
+
+	test("registers the compiled schema and overrides tools on launch", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_x",
+			// Pre-store a result so completion resolves the object (no nudge).
+			onLaunched: () => registry.store("ses_x", { n: 7 }),
+		});
+		const { agent } = harness({ runner, registry });
+		const result = await agent("do it", { schema: SCHEMA });
+		expect(result).toEqual({ n: 7 });
+		const launch = runner.launches[0];
+		expect(launch?.toolsOverride).toEqual({ structured_output: true });
+		expect(launch?.onSessionCreated).toBeDefined();
+		// Prompt carries the schema-instruction suffix.
+		expect(launch?.prompt).toContain("structured_output");
+		expect(launch?.prompt).toContain(JSON.stringify(SCHEMA));
+	});
+
+	test("resolves the stored object when a result is present", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_y",
+			onLaunched: () => registry.store("ses_y", { n: 9 }),
+		});
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toEqual({ n: 9 });
+		// Cleared in finally.
+		expect(registry.resultFor("ses_y").present).toBe(false);
+		expect(registry.lookup("ses_y")).toBeUndefined();
+	});
+
+	test("no result on completion → nudges once then resolves null", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_z" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(1);
+		expect(runner.resumes[0]?.prompt).toContain("have not returned");
+	});
+
+	test("no result after the nudge → resolves null", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_n" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(1);
+	});
+
+	test("error status → null with no nudge", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "error", sessionID: "ses_e" });
+		const { agent } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(runner.resumes.length).toBe(0);
+	});
+
+	test("resume throwing (sessionExpired) → null, degrade, warn", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_r",
+			resumeThrows: new Error("sessionExpired"),
+		});
+		const { agent, events } = harness({ runner, registry });
+		expect(await agent("do it", { schema: SCHEMA })).toBeNull();
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+	});
+
+	test("clears the registry entry on completion regardless of outcome", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({ status: "completed", sessionID: "ses_c" });
+		const { agent } = harness({ runner, registry });
+		await agent("do it", { schema: SCHEMA });
+		expect(registry.lookup("ses_c")).toBeUndefined();
+		expect(registry.resultFor("ses_c").present).toBe(false);
 	});
 });
 

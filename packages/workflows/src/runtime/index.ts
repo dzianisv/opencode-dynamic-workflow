@@ -19,6 +19,10 @@ import { parallel, pipeline } from "./compose";
 import { evaluateScript } from "./evaluate";
 import { parseScript, type WorkflowMeta } from "./meta";
 import {
+	createSchemaRegistry,
+	type SchemaRegistry,
+} from "./structured/registry";
+import {
 	type AgentFn,
 	type AgentOpts,
 	type BudgetView,
@@ -71,6 +75,13 @@ export interface WorkflowResult {
 export interface WorkflowRun {
 	run(source: string): Promise<WorkflowResult>;
 	abort(): void;
+	/**
+	 * The per-run structured-output schema/result registry backing
+	 * `agent({ schema })`. Exposed because Phase 4's plugin shell registers the
+	 * global `structured_output` tool against THIS SAME instance — the child's
+	 * tool call and the agent primitive's result read must share state.
+	 */
+	registry: SchemaRegistry;
 }
 
 /** Permissive default budget (spec §6): no target → remaining is Infinity. */
@@ -115,6 +126,10 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 
 	const budget = deps.budget ?? defaultBudget();
 
+	// One schema/result registry per run, shared by the agent primitive and (in
+	// Phase 4) the global structured_output tool.
+	const registry = createSchemaRegistry();
+
 	// The real agent primitive over the core runner.
 	const innerAgent = createAgentPrimitive({
 		runner: deps.runner,
@@ -130,6 +145,7 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 			agent: deps.defaults?.agent ?? DEFAULT_AGENT,
 			awaitTimeoutMs: deps.defaults?.awaitTimeoutMs,
 		},
+		registry,
 	});
 
 	// Wrap the primitive so that after abort(), NEW calls resolve null immediately
@@ -199,5 +215,5 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		}
 	}
 
-	return { run, abort };
+	return { run, abort, registry };
 }

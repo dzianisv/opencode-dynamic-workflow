@@ -20,7 +20,7 @@
 |-------|-----------|-------|--------|
 | 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Complete |
-| 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Detailed |
+| 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
 | 5 | Both plugins published to npm and installable in a clean project via `"plugin": [...]` | 5.1 | Epic-level |
 
@@ -542,7 +542,7 @@ interface SessionRunner {
 
 #### Task 3.3.2: `structured_output` tool factory + `agent({ schema })` wiring
 
-- [ ] Done
+- [x] Done — 44 tests for the slice; whole repo 304. Deviations: agent captured RED retroactively (stash-based, genuine failures against untouched tests — process slip, disclosed); parse-failure tool string carries the same retry cue as the validation path; `WorkflowRun` now exposes `registry` (Phase 4's global tool must bind the per-run instance — contract documented on the type). Process note recorded: stricter TDD ordering enforcement in future dispatch prompts.
 
 **Context:** Spec §3.3: with `schema`, `agent()` resolves to the VALIDATED object; mismatches surface as tool errors so the MODEL retries — never a script-level parse failure; epic Done-when adds "retry-then-error" for a child that never produces conforming output. The tool is built and tested here as a factory (`ToolDefinition` via the `tool()` helper, same pattern as `packages/background-agents/src/tools/*.ts`); actual registration with opencode is Phase 4's plugin shell. Lesson from Phase 2 (NaN bug, task.ts/output.ts): opencode's raw execute path does NOT apply Zod defaults — coerce every arg defensively.
 
