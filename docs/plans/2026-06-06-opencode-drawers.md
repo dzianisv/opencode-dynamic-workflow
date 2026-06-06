@@ -48,7 +48,7 @@
 
 #### Task 1.1.1: Scaffold the Bun workspaces monorepo
 
-- [ ] Done
+- [x] Done
 
 **Context:** Repo is empty except `docs/`, `.claude/`, `WORKFLOWS_HL_SPEC.md`, `.gitignore` (already ignores `.references/`, `node_modules/`, `dist/`). Layout decided in the architecture: `packages/core`, later `packages/background-agents`, `packages/workflows`.
 
