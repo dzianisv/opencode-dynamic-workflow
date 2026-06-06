@@ -18,7 +18,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Detailed |
+| 1 | Core engine launches, completes, cancels and persists background sessions against a real headless opencode; full unit + race coverage | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | `opencode-drawer-agents` plugin installable locally: `bg_task`/`bg_output`/`bg_cancel`/`bg_list` work e2e with passive notifications and restart survival | 2.1, 2.2, 2.3 | Epic-level |
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Epic-level |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Epic-level |
@@ -260,7 +260,7 @@ interface SessionRunner {
 
 #### Task 1.5.1: Smoke harness plugin + scripted headless run
 
-- [ ] Done
+- [x] Done — PASS against real opencode 1.16.2 (verified independently). EngineClient structural subset matched the live SDK exactly — zero core changes. Environmental gotchas recorded for Phase 2: (1) opencode resolves config from `PWD` env var, not spawn cwd — pin `PWD` when spawning; (2) `OPENCODE_PURE=1` disables ALL external plugins including ours; (3) `opencode run` is single-turn — parent turn end shuts the server down and aborts running children (the engine finalized the abort correctly); (4) global agent configs can silently override the configured model — force via `run --model`.
 
 **Context:** Plugin loading rules: auto-scan glob is `{plugin,plugins}/*.{ts,js}`, one level deep, or explicit `opencode.json` `plugin` array with local paths (`.claude/skills/opencode-plugin-dev/SKILL.md:157-180`). The plugin loader calls all exports as functions — never export classes from the entry (better-async hit this: `.references/better-opencode-async-agents/src/index.ts:16-17`). Hooks fire inside headless `opencode run` (`SKILL.md:85-86`). Testing guidance: `.claude/skills/opencode-plugin-dev/references/testing.md`.
 
