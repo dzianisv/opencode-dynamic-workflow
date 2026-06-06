@@ -108,6 +108,20 @@ export interface SessionRunnerDeps {
 	setIntervalFn?: IntervalFactory;
 	/** Auto-start the safety poll on construction. Default true. */
 	startPoll?: boolean;
+	/**
+	 * Tasks recovered from persistence at restart. Registered into the live map on
+	 * construction so `list`/`readOutput` see them immediately. Terminal tasks are
+	 * registered as-is. Non-terminal tasks are verified against the engine
+	 * asynchronously (see {@link createSessionRunner}'s recovery routine): a live
+	 * session is re-tracked as `running`; a gone/sessionless task is finalized as
+	 * `error("lost during restart")` through the gate.
+	 *
+	 * Slot policy: recovered running tasks occupy NO concurrency slot. The original
+	 * process's slots died with it; re-acquiring here could deadlock startup if the
+	 * recovered running set exceeds the concurrency limit (acquire would queue with
+	 * nothing to release it). They are tracked for completion/stale handling only.
+	 */
+	recoveredTasks?: BgTask[];
 }
 
 const DEFAULT_MAX_DEPTH = 2;
@@ -228,6 +242,61 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 
 	if (deps.startPoll !== false) {
 		gate.start();
+	}
+
+	/**
+	 * Restart recovery. Synchronous part runs now (register every recovered task
+	 * into the live map so `list`/`readOutput` see them immediately, terminal or
+	 * not); the async part (session verification for non-terminal tasks) is kicked
+	 * off detached and tracked in {@link recovery} so `dispose` can await it.
+	 *
+	 * Slot policy: a recovered RUNNING task takes NO concurrency slot (see
+	 * {@link SessionRunnerDeps.recoveredTasks}). It is registered so the gate's
+	 * safety poll/idle path can complete it; its `freeSlot` at terminal time is a
+	 * clean no-op (no held slot, no queued waiter).
+	 */
+	let recovery: Promise<void> = Promise.resolve();
+	const recovered = deps.recoveredTasks;
+	if (recovered && recovered.length > 0) {
+		const pending: Promise<void>[] = [];
+		for (const task of recovered) {
+			// Register as-is regardless of status. The gate reads activity from
+			// `startedAt ?? createdAt` (both preserved), so stale-timeout applies to
+			// recovered running tasks without any extra wiring.
+			tasks.set(task.id, task);
+
+			if (isTerminal(task.status)) {
+				continue; // terminal: visible to list/readOutput, no session check.
+			}
+
+			// Non-terminal: a recovered running/pending task must be re-validated.
+			const sessionID = task.sessionID;
+			if (!sessionID) {
+				// No session ever created → it cannot be resumed or verified.
+				gate.tryComplete(task.id, "error", "lost during restart");
+				continue;
+			}
+			pending.push(
+				client.session.get({ path: { id: sessionID } }).then(
+					() => {
+						// Alive: ensure it sits at `running` so the gate tracks it.
+						// Do NOT route through setIntermediate's persist on every
+						// recovery; persist via the gate only on terminal flips. A
+						// pending recovered task is promoted to running here.
+						const live = tasks.get(task.id);
+						if (live && !isTerminal(live.status)) {
+							live.status = "running";
+						}
+					},
+					() => {
+						// Gone: finalize through the gate (releases nothing, persists
+						// the error, fires onTaskComplete).
+						gate.tryComplete(task.id, "error", "lost during restart");
+					},
+				),
+			);
+		}
+		recovery = Promise.all(pending).then(() => undefined);
 	}
 
 	/** Non-terminal status write (pending/running). Terminal flips go via the gate. */
@@ -531,7 +600,12 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		resume,
 		readOutput,
 		handleEvent: (event) => gate.handleEvent(event),
-		dispose: () => gate.dispose(),
+		dispose: async () => {
+			// Drain in-flight recovery verification before tearing the gate down so
+			// a recovered task's error/running resolution is never lost mid-restart.
+			await recovery;
+			await gate.dispose();
+		},
 	};
 }
 

@@ -1071,3 +1071,193 @@ describe("createSessionRunner — slot accounting baseline", () => {
 		expect(concurrency.runningCount(model)).toBe(0);
 	});
 });
+
+// ===========================================================================
+// Restart recovery (Task 1.4.1)
+// ===========================================================================
+
+function recoveredTask(over: Partial<BgTask> = {}): BgTask {
+	return {
+		id: "bg_rec00001",
+		sessionID: "ses_rec",
+		parentSessionID: "ses_parent",
+		description: "recovered task",
+		agent: "build",
+		status: "running",
+		createdAt: 1000,
+		startedAt: 1100,
+		depth: 0,
+		concurrencyKey: "anthropic/opus",
+		model: "anthropic/opus",
+		...over,
+	};
+}
+
+describe("createSessionRunner — restart recovery", () => {
+	// 6. recovery alive-session: re-tracked running, completes via a later idle.
+	test("recovered running task with a live session is re-tracked and completes via idle (full lifecycle)", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const clock = mutableClock(2000);
+		const timers = makeTimers();
+		const completes: BgTask[] = [];
+		const persisted: BgTask[] = [];
+
+		h.setMessages("ses_alive", [
+			{ info: { role: "assistant" }, parts: [{ type: "text", text: "done" }] },
+		]);
+
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			setTimer: timers.setTimer,
+			setIntervalFn: timers.setIntervalFn,
+			config: { minIdleMs: 5000, pollMs: 5000 },
+			onTaskComplete: (t) => completes.push({ ...t }),
+			persist: async (t) => {
+				persisted.push({ ...t });
+			},
+			recoveredTasks: [
+				recoveredTask({
+					id: "bg_alive001",
+					sessionID: "ses_alive",
+					status: "running",
+					startedAt: 1500,
+				}),
+			],
+		});
+
+		// Visible immediately, before the async session.get settles.
+		expect(runner.list().map((t) => t.id)).toEqual(["bg_alive001"]);
+
+		// Let the recovery session.get resolve (alive).
+		await flush();
+		expect(h.getCalls).toContain("ses_alive");
+		expect(at(runner.list(), 0).status).toBe("running");
+
+		// Recovered running task holds NO slot.
+		expect(concurrency.runningCount("anthropic/opus")).toBe(0);
+
+		// Now drive completion via idle + grace.
+		await completeViaIdle(runner, timers, clock, "ses_alive", 1500, 5000);
+		expect(at(runner.list(), 0).status).toBe("completed");
+		expect(completes.map((t) => t.id)).toContain("bg_alive001");
+
+		await runner.dispose();
+	});
+
+	// 7. recovery gone-session: finalized error("lost during restart"), persisted.
+	test("recovered running task whose session is gone is finalized error('lost during restart') and persisted", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const persisted: BgTask[] = [];
+		const completes: BgTask[] = [];
+		h.setGetFails("ses_gone", true);
+
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(9000),
+			startPoll: false,
+			onTaskComplete: (t) => completes.push({ ...t }),
+			persist: async (t) => {
+				persisted.push({ ...t });
+			},
+			recoveredTasks: [
+				recoveredTask({
+					id: "bg_gone0001",
+					sessionID: "ses_gone",
+					status: "running",
+				}),
+			],
+		});
+
+		await flush();
+		await runner.dispose();
+
+		const final = at(runner.list(), 0);
+		expect(final.status).toBe("error");
+		expect(final.error).toBe("lost during restart");
+		// Persisted in its terminal state.
+		const lastPersist = persisted.find(
+			(t) => t.id === "bg_gone0001" && t.status === "error",
+		);
+		expect(lastPersist?.error).toBe("lost during restart");
+		expect(completes.map((t) => t.id)).toContain("bg_gone0001");
+		// No slot was ever acquired.
+		expect(concurrency.runningCount("anthropic/opus")).toBe(0);
+	});
+
+	// 7b. non-terminal recovered task with no sessionID → error, no session.get.
+	test("recovered non-terminal task with no sessionID is finalized error without a session.get", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+			startPoll: false,
+			recoveredTasks: [
+				recoveredTask({
+					id: "bg_nosess01",
+					sessionID: undefined,
+					status: "pending",
+				}),
+			],
+		});
+
+		await flush();
+		await runner.dispose();
+		expect(at(runner.list(), 0).status).toBe("error");
+		expect(at(runner.list(), 0).error).toBe("lost during restart");
+		expect(h.getCalls).not.toContain("bg_nosess01");
+	});
+
+	// 8. recovery terminal task: registered, listable, readOutput works, no get.
+	test("recovered terminal task is registered + listable + readable with no session.get call", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		h.setMessages("ses_term", [
+			{
+				info: { role: "assistant" },
+				parts: [{ type: "text", text: "final answer" }],
+			},
+		]);
+
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+			startPoll: false,
+			recoveredTasks: [
+				recoveredTask({
+					id: "bg_term0001",
+					sessionID: "ses_term",
+					status: "completed",
+					completedAt: 1300,
+				}),
+			],
+		});
+
+		await flush();
+
+		expect(runner.list().map((t) => t.id)).toEqual(["bg_term0001"]);
+		expect(at(runner.list(), 0).status).toBe("completed");
+
+		const out = await runner.readOutput("bg_term0001");
+		expect(out.status).toBe("completed");
+		expect(out.summaryText).toBe("final answer");
+
+		// No session.get for a recovered TERMINAL task.
+		expect(h.getCalls).not.toContain("ses_term");
+
+		await runner.dispose();
+	});
+});
