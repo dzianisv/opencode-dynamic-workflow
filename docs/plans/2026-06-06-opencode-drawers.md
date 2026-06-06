@@ -291,7 +291,7 @@ interface SessionRunner {
 
 #### Task 2.1.1: SDK client adapter in core + plugin package scaffold with engine wiring
 
-- [ ] Done
+- [x] Done — `onTaskComplete` seam already existed on `SessionRunnerDeps` (no core contract change). Additions: core package.json gained `exports` (`"."` → `./src/index.ts`) so the bare `@drawers/core` workspace import resolves; `createEngine` gained injectable `fs?` seam (test DI, forwards to store). Flag for later: engine's `markNotified` does an O(n) `list()` scan per flushed notice — add `runner.get(id)` if batches ever bite.
 
 **Context:** The smoke plugin (`packages/core/test-harness/plugin/smoke-plugin.ts:60-77`) hand-rolls the real-SDK→`EngineClient` adapter; both Phase 2 and Phase 4 plugins need the identical adapter — it belongs in core, written once. The full wiring recipe (store→recover→runner→event hook) is proven at `smoke-plugin.ts:79-116`. Core's public surface is exported from `packages/core/src/index.ts`.
 
