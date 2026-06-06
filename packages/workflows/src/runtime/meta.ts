@@ -126,6 +126,11 @@ function parseModule(source: string): acorn.Program {
 		return acorn.parse(source, {
 			ecmaVersion: "latest",
 			sourceType: "module",
+			// The body's top-level `return` becomes the workflow result (spec §3.1,
+			// §3.3) and is evaluated inside an AsyncFunction by evaluate.ts. Allowing
+			// it here lets the SAME source parse as a module (for the meta header)
+			// without rejecting the body's `return`.
+			allowReturnOutsideFunction: true,
 		});
 	} catch (err) {
 		if (err instanceof SyntaxError) {

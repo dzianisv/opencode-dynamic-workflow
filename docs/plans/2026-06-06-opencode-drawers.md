@@ -499,7 +499,7 @@ interface SessionRunner {
 
 #### Task 3.2.3: Runtime assembly + spec-conformance suite
 
-- [ ] Done
+- [x] Done — 20 new tests (conformance a-j + unit), full suite green. Deviations: meta.ts gained `allowReturnOutsideFunction: true` (LOAD-BEARING — ES-module parse forbade the spec-mandated top-level `return`; latent seam surfaced at first parse→evaluate integration); gate floor `max(1, ...)` (cores=2 would yield 0 = UNLIMITED in ConcurrencyManager); no separate phase progress event — phase titles flow via agent:start only (Phase 4 renders from there).
 
 **Context:** Glue 3.1 + 3.2 into the phase's public surface: `createWorkflowRun`. Spec §2.3/§3.3: `phase(title)` sets the progress group for subsequent `agent()` calls (per-call `opts.phase` wins inside concurrent stages); `log(message)` emits a narrator line; `args` passed verbatim; `budget` present from day one (§6 view; Phase 3 default provider = `{ total: null, spent: () => 0 }` so `remaining()` is `Infinity` — 4.3 swaps in the real token source); `workflow()` throws `NotYetSupportedError("sub-workflows arrive with the workflows plugin (Phase 4)")` — a complete API surface beats a ReferenceError. Cores: `os.availableParallelism()` via `node:os` (Bun implements it), injectable for tests. The conformance suite drives the REAL `createSessionRunner` with the fake-EngineClient pattern from `packages/core/src/session-runner.test.ts:54-100` (`makeClient()` deferreds) — fidelity over a FakeRunner where it matters.
 
@@ -523,7 +523,7 @@ interface SessionRunner {
 
 #### Task 3.3.1: Core `onSessionCreated` hook + schema registry + validator
 
-- [ ] Done
+- [x] Done — hook ordering proven via call log (create → hook → promptAsync); throwing hook teardown combines the cancel-across-create orphan-abort idiom + create-rejection gate.tryComplete (the gate's error path alone would leak the session — only `cancelled` aborts); ajv 8.20.0 pinned. registry resultFor carries `present` flag (stored-undefined ≠ never-stored).
 
 **Context:** The race this kills: `agent({ schema })` must have the child's sessionID → schema mapping registered BEFORE the child can call `structured_output` — but the sessionID only exists after `session.create` resolves, and `launch()` dispatches `promptAsync` immediately after (session-runner.ts:455-463). A post-launch registration loses the race. Per elaboration deviation (c): the hook is a SYNCHRONOUS callback in core's launch, between create resolving and the prompt dispatch. Validation: `ajv` (new dep, workflows package only) compiles the JSON Schema once per `agent()` call.
 

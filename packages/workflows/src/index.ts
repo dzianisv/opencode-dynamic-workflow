@@ -16,6 +16,12 @@ export {
 } from "./runtime/compose";
 export { DeterminismError, evaluateScript } from "./runtime/evaluate";
 export {
+	createWorkflowRun,
+	type WorkflowResult,
+	type WorkflowRun,
+	type WorkflowRunDeps,
+} from "./runtime/index";
+export {
 	MetaError,
 	type ParsedScript,
 	parseScript,
