@@ -48,6 +48,22 @@ export type ProgressEvent =
 export type ProgressEmitter = (e: ProgressEvent) => void;
 
 /**
+ * One journaled `agent()` call (spec §7). Only SETTLED, NON-null results are
+ * journaled: a failed/null agent must re-run on resume, never replay its failure.
+ * `key` is the {@link computeCallKey} hash of `(prompt, opts)`; `index` is the
+ * deterministic call ordinal (every `agent()` invocation, cached or live).
+ *
+ * Lives here (not in `../plugin/journal`) so the runtime layer stays free of any
+ * plugin import — journal.ts imports this type from the runtime instead.
+ */
+export interface JournalEntry {
+	index: number;
+	key: string;
+	status: "ok";
+	result: unknown;
+}
+
+/**
  * The complete set of globals available to a workflow script body (spec §3.3).
  * `pipeline`/`parallel` keep permissive signatures here — their concrete typing
  * arrives with their implementation (Task 3.2.2).

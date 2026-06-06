@@ -26,6 +26,7 @@ import {
 	type AgentFn,
 	type AgentOpts,
 	type BudgetView,
+	type JournalEntry,
 	NotYetSupportedError,
 	type ProgressEmitter,
 	type ProgressEvent,
@@ -54,6 +55,12 @@ export interface WorkflowRunDeps {
 	/** External progress sink; fenced so a throw cannot kill the run. */
 	onProgress?: ProgressEmitter;
 	defaults?: { agent?: string; awaitTimeoutMs?: number };
+	/**
+	 * Deterministic-resume seam (spec §7). Present on a resume: `entries` is the
+	 * prior run's journal (replayed for the longest unchanged prefix), `onRecord`
+	 * captures each settled non-null live result for the new journal.
+	 */
+	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
 }
 
 /** The terminal outcome of a workflow run (spec §2.3, §3.3). */
@@ -110,6 +117,10 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 	const liveTasks = new Set<string>();
 	const currentPhaseBox: { value?: string } = {};
 	const progress: ProgressEvent[] = [];
+	// Resume seam (§7): the deterministic call ordinal and the "prefix still
+	// intact" latch are run-level, shared by every agent() invocation.
+	const callIndex = { value: 0 };
+	const prefixIntact = { value: true };
 
 	let aborted = false;
 
@@ -146,6 +157,9 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 			awaitTimeoutMs: deps.defaults?.awaitTimeoutMs,
 		},
 		registry,
+		replay: deps.replay,
+		prefixIntact,
+		callIndex,
 	});
 
 	// Wrap the primitive so that after abort(), NEW calls resolve null immediately

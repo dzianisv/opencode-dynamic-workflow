@@ -574,7 +574,7 @@ interface SessionRunner {
 
 #### Task 4.1.1: Hoist notification presentation into core
 
-- [ ] Done
+- [x] Done — moved suite passed with zero assertion edits (bit-identical proof). Deviations: logger retyped to core's `NotificationQueueLogger` (EngineLogger structurally assignable, agents compiles unchanged); render parametrization is ONE knob (`toastTitle`) — the other "agents-specific strings" turned out data-driven or already overridable; no invented knobs.
 
 **Context:** `createChatMessageHook` (background-agents `src/hooks/notifications.ts:121-124`) and `createToastNotifier` (`:181-184`) are generic over `NotificationQueue`/`TaskNotice` (both already in core `notify.ts`) — nothing BgTask-specific beyond wording. The workflows plugin needs identical passive delivery (notice → parent's next message + toast) and MUST NOT import from `opencode-drawer-agents`.
 
@@ -634,7 +634,7 @@ interface SessionRunner {
 
 #### Task 4.2.1: Journal module + replay seam in the runtime
 
-- [ ] Done
+- [x] Done — strict TDD honored (module-not-found RED). JournalEntry lives in runtime/types.ts (runtime stays plugin-import-free). Deviation (narrower, safer): `load()` tolerates only a truncated FINAL line; interior bad lines throw — mid-file corruption must not silently void replay correctness.
 
 **Context:** Spec §7: every run journals its `agent()` calls; resume replays — longest unchanged prefix of `(prompt, opts)` pairs returns cached results instantly; first edited/new call and everything after runs live. Call INDEX is deterministic: `pipeline`/`parallel` invoke their callbacks synchronously in array order and the determinism sandbox bans the only sources of ordering drift, so invocation order is stable across replays of an unchanged script. The structured variant's result (a JSON object) journals identically.
 

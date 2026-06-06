@@ -8,6 +8,7 @@ import {
 	type TaskOutput,
 	type TaskStatus,
 } from "@drawers/core";
+import { computeCallKey } from "../plugin/journal";
 import { createAgentPrimitive } from "./agent-call";
 import {
 	createSchemaRegistry,
@@ -18,6 +19,7 @@ import {
 	AgentCapError,
 	BudgetExhaustedError,
 	type BudgetView,
+	type JournalEntry,
 	type ProgressEvent,
 } from "./types";
 
@@ -185,6 +187,12 @@ interface HarnessOverrides {
 	liveTasks?: Set<string>;
 	defaults?: { agent: string; awaitTimeoutMs?: number };
 	registry?: SchemaRegistry;
+	replay?: {
+		entries: JournalEntry[];
+		onRecord: (e: JournalEntry) => void;
+	};
+	prefixIntact?: { value: boolean };
+	callIndex?: { value: number };
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -195,6 +203,8 @@ function harness(overrides: HarnessOverrides = {}) {
 	const counters = overrides.counters ?? { agents: 0 };
 	const liveTasks = overrides.liveTasks ?? new Set<string>();
 	const registry = overrides.registry ?? createSchemaRegistry();
+	const prefixIntact = overrides.prefixIntact ?? { value: true };
+	const callIndex = overrides.callIndex ?? { value: 0 };
 	const agent = createAgentPrimitive({
 		runner,
 		parentSessionID: "parent",
@@ -207,8 +217,21 @@ function harness(overrides: HarnessOverrides = {}) {
 		liveTasks,
 		defaults: overrides.defaults ?? { agent: "build" },
 		registry,
+		replay: overrides.replay,
+		prefixIntact,
+		callIndex,
 	});
-	return { agent, events, runner, gate, counters, liveTasks, registry };
+	return {
+		agent,
+		events,
+		runner,
+		gate,
+		counters,
+		liveTasks,
+		registry,
+		prefixIntact,
+		callIndex,
+	};
 }
 
 describe("createAgentPrimitive — result mapping", () => {
@@ -473,5 +496,213 @@ describe("createAgentPrimitive — launch wiring and live tasks", () => {
 		expect(await agent("p", { isolation: "worktree" })).toBe("OK");
 		expect(events.some((e) => e.type === "warn")).toBe(true);
 		expect(runner.launches.length).toBe(1);
+	});
+});
+
+// ---- replay / journal seam -----------------------------------------------
+
+describe("createAgentPrimitive — live path records non-null results", () => {
+	test("a non-null text result is journaled via onRecord with index+key", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "TEXT" });
+		const { agent } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		const out = await agent("prompt one");
+		expect(out).toBe("TEXT");
+		expect(recorded).toEqual([
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "prompt one" }),
+				status: "ok",
+				result: "TEXT",
+			},
+		]);
+	});
+
+	test("a structured OBJECT result is journaled too", async () => {
+		const recorded: JournalEntry[] = [];
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_obj",
+			onLaunched: () => registry.store("ses_obj", { n: 5 }),
+		});
+		const SCHEMA = {
+			type: "object",
+			properties: { n: { type: "number" } },
+			required: ["n"],
+		} as const;
+		const { agent } = harness({
+			runner,
+			registry,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		const out = await agent("prompt", { schema: SCHEMA });
+		expect(out).toEqual({ n: 5 });
+		expect(recorded.length).toBe(1);
+		expect(recorded[0]?.result).toEqual({ n: 5 });
+	});
+
+	test("a null result (failed agent) is NOT journaled", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "error" });
+		const { agent } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		expect(await agent("prompt")).toBeNull();
+		expect(recorded).toEqual([]);
+	});
+
+	test("callIndex advances once per live call", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "T" });
+		const callIndex = { value: 0 };
+		const { agent } = harness({
+			runner,
+			callIndex,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		await agent("a");
+		await agent("b");
+		expect(callIndex.value).toBe(2);
+		expect(recorded.map((e) => e.index)).toEqual([0, 1]);
+	});
+});
+
+describe("createAgentPrimitive — cached replay path", () => {
+	test("full-prefix replay returns cached results with ZERO launches and status cached", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const {
+			agent,
+			events,
+			runner: r,
+		} = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		expect((r as FakeRunner).launches.length).toBe(0);
+		const ends = events.filter((e) => e.type === "agent:end");
+		expect(
+			ends.every((e) => e.type === "agent:end" && e.status === "cached"),
+		).toBe(true);
+		const starts = events.filter((e) => e.type === "agent:start");
+		expect(starts.length).toBe(2);
+	});
+
+	test("cached calls still advance counters.agents and hit the 1000 cap", async () => {
+		const runner = new FakeRunner({ status: "completed" });
+		const entries: JournalEntry[] = [
+			{
+				index: 1000,
+				key: computeCallKey({ prompt: "x" }),
+				status: "ok",
+				result: "cached",
+			},
+		];
+		// counters already at the cap: a cached call must STILL throw.
+		const { agent } = harness({
+			runner,
+			counters: { agents: 1000 },
+			callIndex: { value: 1000 },
+			replay: { entries, onRecord: () => {} },
+		});
+		await expect(agent("x")).rejects.toBeInstanceOf(AgentCapError);
+	});
+
+	test("divergence: key mismatch flips prefixIntact and runs live from there", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "EDITED" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const prefixIntact = { value: true };
+		const { agent, prefixIntact: pi } = harness({
+			runner,
+			prefixIntact,
+			replay: { entries, onRecord: () => {} },
+		});
+		// First call matches → cached.
+		expect(await agent("a")).toBe("cached-a");
+		expect(pi.value).toBe(true);
+		// Second call's prompt was edited → key mismatch → runs LIVE.
+		expect(await agent("b")).toBe("LIVE");
+		expect(pi.value).toBe(false);
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("a later coincidentally-matching key still runs live once prefix is broken", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "EDITED" }), // call 0 will mismatch
+				status: "ok",
+				result: "cached-0",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }), // call 1 WOULD match coincidentally
+				status: "ok",
+				result: "cached-1",
+			},
+		];
+		const { agent } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Call 0 diverges immediately (prompt "a" != journaled "EDITED").
+		expect(await agent("a")).toBe("LIVE");
+		// Call 1's key matches entries[1], but the prefix is already broken → LIVE.
+		expect(await agent("b")).toBe("LIVE");
+		expect((runner as FakeRunner).launches.length).toBe(2);
+	});
+
+	test("index past entries.length runs live (no entry for that index)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const { agent, prefixIntact } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a"); // index 0 cached
+		expect(await agent("b")).toBe("LIVE"); // index 1 >= length → live
+		expect(prefixIntact.value).toBe(false);
+		expect((runner as FakeRunner).launches.length).toBe(1);
 	});
 });

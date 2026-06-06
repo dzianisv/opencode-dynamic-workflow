@@ -4,6 +4,15 @@
  */
 
 export {
+	type CallKeyInput,
+	computeCallKey,
+	createJournal,
+	type Journal,
+	type JournalFs,
+	type JournalLogger,
+	type JournalOptions,
+} from "./plugin/journal";
+export {
 	type AgentPrimitiveDeps,
 	createAgentPrimitive,
 } from "./runtime/agent-call";
@@ -45,6 +54,7 @@ export {
 	type AgentOpts,
 	BudgetExhaustedError,
 	type BudgetView,
+	type JournalEntry,
 	NotYetSupportedError,
 	type ProgressEmitter,
 	type ProgressEvent,

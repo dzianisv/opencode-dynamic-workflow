@@ -1,4 +1,5 @@
 import type { ConcurrencyManager, SessionRunner } from "@drawers/core";
+import { computeCallKey } from "../plugin/journal";
 import type { SchemaRegistry } from "./structured/registry";
 import { compileSchema } from "./structured/validate";
 import {
@@ -7,6 +8,7 @@ import {
 	type AgentOpts,
 	BudgetExhaustedError,
 	type BudgetView,
+	type JournalEntry,
 	type ProgressEmitter,
 } from "./types";
 
@@ -40,6 +42,24 @@ export interface AgentPrimitiveDeps {
 	 * child's tool call and this primitive's `resultFor` read share state.
 	 */
 	registry: SchemaRegistry;
+	/**
+	 * Deterministic-resume seam (spec §7). When present, the longest unchanged
+	 * prefix of `(prompt, opts)` pairs replays from `entries` instead of launching;
+	 * every settled non-null live result is reported via `onRecord` for the journal.
+	 */
+	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
+	/**
+	 * Run-level "the replayed prefix is still intact" latch. Starts true; flips
+	 * false FOREVER on the first divergence (key mismatch or index past the
+	 * journal), so a later coincidentally-matching key still runs live.
+	 */
+	prefixIntact: { value: boolean };
+	/**
+	 * Run-level deterministic call ordinal. Counts EVERY `agent()` invocation in
+	 * order — cached or live — so a replay indexes the journal at the same points
+	 * the original did. Advances in lockstep with `counters.agents`.
+	 */
+	callIndex: { value: number };
 }
 
 /** The single nudge sent when a child completes without a structured result. */
@@ -78,6 +98,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		liveTasks,
 		defaults,
 		registry,
+		replay,
+		prefixIntact,
+		callIndex,
 	} = deps;
 	const awaitTimeoutMs = defaults.awaitTimeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
 
@@ -85,6 +108,43 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		prompt: string,
 		opts: AgentOpts = {},
 	): Promise<unknown> {
+		// 0. Claim this call's deterministic ordinal (every invocation, cached or
+		// live, in order — so a replay indexes the journal at the same points).
+		const index = callIndex.value;
+		callIndex.value += 1;
+
+		const label = opts.label ?? prompt.slice(0, LABEL_PREFIX_LEN);
+		const phase = opts.phase ?? currentPhase();
+
+		const key = computeCallKey({
+			prompt,
+			label: opts.label,
+			phase: opts.phase,
+			schema: opts.schema,
+			model: opts.model,
+			agentType: opts.agentType,
+		});
+
+		// 0b. Replay (spec §7): while the prefix is intact and this index has a
+		// matching journaled key, return the cached result WITHOUT launching. The
+		// cap STILL applies (a replay must hit it where the original did), so check
+		// and increment counters exactly as the live path does — before resolving.
+		if (replay !== undefined && prefixIntact.value) {
+			const cached = replay.entries[index];
+			if (cached !== undefined && cached.key === key) {
+				if (counters.agents >= AGENT_LIFETIME_CAP) {
+					throw new AgentCapError();
+				}
+				counters.agents += 1;
+				emit({ type: "agent:start", label, phase });
+				emit({ type: "agent:end", label, status: "cached" });
+				return cached.result;
+			}
+			// Divergence: this call edited/new (key mismatch or past the journal).
+			// The prefix is broken FOREVER — a later coincidental match still runs live.
+			prefixIntact.value = false;
+		}
+
 		// 1. Lifetime cap — increment BEFORE acquire so queued calls count too.
 		if (counters.agents >= AGENT_LIFETIME_CAP) {
 			throw new AgentCapError();
@@ -110,9 +170,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					"isolation:'worktree' is not supported (no worktree session primitive); running without isolation",
 			});
 		}
-
-		const label = opts.label ?? prompt.slice(0, LABEL_PREFIX_LEN);
-		const phase = opts.phase ?? currentPhase();
 
 		// With a schema, the child returns its result by calling structured_output;
 		// it must be told so (suffix) and granted the tool (override).
@@ -157,15 +214,22 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			const done = await runner.awaitCompletion(task.id, awaitTimeoutMs);
 			status = done.status;
 
-			// 10. Map terminal status to a result.
+			// 10. Map terminal status to a result, then journal it if non-null.
+			let result: unknown;
 			if (compiled !== undefined) {
-				return await resolveStructured(task, done.status, sessionId);
+				result = await resolveStructured(task, done.status, sessionId);
+			} else if (done.status === "completed") {
+				// Non-structured: completed → final text, else degrade to null.
+				result = (await runner.readOutput(task.id)).summaryText;
+			} else {
+				result = null;
 			}
-			// Non-structured: completed → final text, else degrade to null.
-			if (done.status === "completed") {
-				return (await runner.readOutput(task.id)).summaryText;
+			// Spec §7: only SETTLED non-null results are journaled — a failed/null
+			// agent must re-run on resume, not replay its failure.
+			if (result !== null && result !== undefined) {
+				replay?.onRecord({ index, key, status: "ok", result });
 			}
-			return null;
+			return result;
 		} catch (err) {
 			// launch()/awaitCompletion() throwing is a degrade, not a detonation.
 			status = "error";
