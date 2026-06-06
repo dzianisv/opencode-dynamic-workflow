@@ -425,7 +425,7 @@ interface SessionRunner {
 
 #### Task 3.1.1: Scaffold `packages/workflows` + pure-literal meta parser
 
-- [ ] Done
+- [x] Done — `ef9323b`; 18 tests. Deviations: root `typecheck` script extended to cover the new package (gate was a no-op otherwise); acorn pinned 8.16.0 exact (repo convention); `whenToUse` included in WorkflowMeta per spec §3.2 (task sketch omitted it).
 
 **Context:** The package does not exist. Mirror `packages/background-agents`' shape: `package.json` (`name: "opencode-drawer-workflows"`, `type: module`, `private: true`, deps `@drawers/core@workspace:*` + `acorn`, devDep `bun-types@1.3.14`) and two-line `tsconfig.json` extending `../../tsconfig.base.json` (see `packages/background-agents/tsconfig.json`). Spec §3.2: every script begins `export const meta = {...}` as a PURE literal — no variables, calls, spreads, or interpolation; `name` + `description` required strings; `phases` optional `{title, detail?, model?}[]`. Spec §3.1: scripts are plain JavaScript — TypeScript syntax fails to parse.
 
@@ -443,7 +443,7 @@ interface SessionRunner {
 
 #### Task 3.1.2: Sandboxed body evaluation with determinism guards
 
-- [ ] Done
+- [x] Done — 15 tests. Deviations: `WorkflowDate` ctor typed `unknown[]` + cast to `typeof Date` (the zero-arg branch the spec bans is a tsc type error against real Date overloads; documented inline); console shadow joins varargs into ONE narrator string (reconciled to types.ts's `log(message: string)` contract).
 
 **Context:** Spec §3.1: body runs in async context (top-level `await`, and the script's `return` value is the workflow result); `Date.now()`, `Math.random()`, argless `new Date()` THROW; no filesystem/Node APIs. Threat model is resume-cache poisoning (nondeterministic values reaching `agent()` prompts void the §7 replay cache), NOT containment — the author already holds bash. So shadowing by parameter injection is the right weight: no `vm`, no realms. Consumes `bodySource` from 3.1.1.
 
@@ -466,7 +466,7 @@ interface SessionRunner {
 
 #### Task 3.2.1: `agent()` primitive over the core runner
 
-- [ ] Done
+- [x] Done — 17 tests incl. max-in-flight==limit proof against real ConcurrencyManager. Deviations: `AgentPrimitiveDeps` exported as named interface (referenceable by 3.2.3 wiring); `awaitCompletion` timeout maps to null+warn like any throw (degrade) — a timed-out agent is indistinguishable from a crashed one at script level, by design.
 
 **Context:** Spec §3.3 row 1 + §9: `agent(prompt, opts?)` resolves to the subagent's final text, or `null` on terminal failure/cancellation — never rejects for agent-level failure; ONLY caps/budget throw. Core provides everything needed: `runner.launch` (session-runner.ts:359-467), `runner.awaitCompletion`, `runner.readOutput` whose `summaryText` is exactly "last assistant message text" (session-runner.ts:632-644). SPAWN_GUARD already disables `bg_*`/`workflow*` in children (session-runner.ts:130-138) — workflow children inherit that for free. Concurrency: standalone `ConcurrencyManager` (concurrency.ts:56) accepts an arbitrary string key with `defaultConcurrency` — per elaboration deviation (b), key = runId, limit `min(16, cores − 2)`.
 
@@ -483,7 +483,7 @@ interface SessionRunner {
 
 #### Task 3.2.2: `pipeline()` and `parallel()` composition
 
-- [ ] Done
+- [x] Done — 18 tests incl. deferred-controlled no-barrier interleaving proof. Deviation (load-bearing): `parallel` uses `Promise.resolve().then(() => thunk())` not `.then(thunk)` — `.then(nonCallable)` is identity-passthrough per ES spec, so the literal vision one-liner would yield `undefined` (not `null`) for non-function thunks; explicit invocation routes both sync throws and non-callable TypeError into `.catch(() => null)`. ItemCapError's canonical home is compose.ts (carries count/cap); types.ts re-exports.
 
 **Context:** Spec §3.3 rows 2-3, §4, §5, §9. These are PURE composition functions — they never touch the runner; they compose whatever async functions the script passes (usually closures over `agent()`). `pipeline(items, ...stages)`: per-item independent chains, NO barrier between stages, stage signature `(prevResult, originalItem, index)`, a throwing stage drops THAT item to `null` and skips its remaining stages. `parallel(thunks)`: barrier, failing thunk → `null` in the result array, the call itself NEVER rejects. Both: >4096 items/thunks → explicit throw at call time (never silent truncation).
 
