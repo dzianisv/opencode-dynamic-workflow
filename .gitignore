@@ -1,0 +1,17 @@
+# Reference clones (upstream source + prior art) — never committed
+.references/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor noise
+.DS_Store
