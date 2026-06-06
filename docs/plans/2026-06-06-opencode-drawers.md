@@ -352,7 +352,7 @@ interface SessionRunner {
 
 #### Task 2.2.1: `chat.message` flush hook + TUI toasts
 
-- [ ] Done
+- [x] Done — Part/TextPart types derived structurally from the `Hooks["chat.message"]` signature itself (no direct `@opencode-ai/sdk` dep added to the plugin package); `createToastNotifier` is a tested unit (sync throw AND rejected promise both swallowed+logged); engine.ts needed no change — 2.1.1's seams sufficed, only index.ts wires onNotify + hook.
 
 **Context:** Hook signature (`.claude/skills/opencode-plugin-dev/references/hooks.md:66-75`): `"chat.message"(input: { sessionID, ... }, output: { message: UserMessage; parts: Part[] })` — mutation is by in-place reference: PUSH onto `output.parts`, never reassign. Core queue: `flushFor(parentSessionID)` drains oldest-first and fire-and-forgets `markNotified` (`packages/core/src/notify.ts`); `seed(tasks)` was already wired at engine construction if 2.1.1 did its job — verify, don't duplicate. Toast surface: `client.tui.showToast` typed per `docs/sdk-surface-audit.md` row h (check exact params there). Notice dedup across restarts is core's job (`notified` flag persisted) — the hook layer stays dumb.
 
@@ -376,7 +376,7 @@ interface SessionRunner {
 
 #### Task 2.3.1: Fork transcript builder (pure)
 
-- [ ] Done
+- [x] Done — real compaction markers found and honored: `AssistantMessage.summary?: boolean` AND `CompactionPart` (`type: "compaction"`); slice after the LAST of either (marker dropped). Drift predicate: zero blocks + any part with unextracted payload (non-text kind carrying `.text`, or tool part with output/error under an unknown status) → throw; all-legitimately-skippable → `""`. SDK shapes restated as local line-referenced interfaces with compile-time `satisfies` grounding (SDK isn't a direct dep of the plugin package).
 
 **Context:** Input is the REAL `session.messages` shape: `{ info: Message, parts: Part[] }[]` — verify part type names against the installed SDK's `types.gen.d.ts` (audit row c/j; known kinds: `text` w/ optional `synthetic`, `tool` w/ `state.{status,output,error}`, `step-start`/`step-finish`, `file`, etc.). better-async's fork silently produced empty transcripts when part names drifted (`.references/better-opencode-async-agents/src/fork/index.ts:168,264`) — our builder must THROW on a transcript that yields zero content from a non-empty input (loud, not silent). Core already has truncation precedent: `readOutput`'s head+tail error preservation (session-runner.ts, Task 1.3.4) — same patterns, but this builder belongs to the plugin (presentation), not core.
 
