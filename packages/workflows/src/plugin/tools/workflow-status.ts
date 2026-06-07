@@ -226,6 +226,13 @@ interface AgentRow {
 	phase?: string;
 	status?: string;
 	model?: string;
+	/**
+	 * The child sessionID bound at `agent:launched` (Task 8.1.5). Carried on the row
+	 * so a still-running occurrence pulls ITS OWN live snapshot — critical for
+	 * concurrent same-label agents, where one shared head row would otherwise show
+	 * the last-launched session's stats for every sibling.
+	 */
+	sessionID?: string;
 	/** Total tokens (already summed); absent on cached / un-tracked agents. */
 	tokens?: number;
 	toolCalls?: number;
@@ -368,9 +375,19 @@ function liveAgentRows(
 		queue.push(idx);
 		open.set(label, queue);
 	};
-	const peek = (label: string): number | undefined => open.get(label)?.[0];
 	const dequeue = (label: string): number | undefined =>
 		open.get(label)?.shift();
+	/** Remove a specific open index for a label (the sessionID-matched end path). */
+	const dropOpen = (label: string, idx: number): void => {
+		const queue = open.get(label);
+		if (queue === undefined) {
+			return;
+		}
+		const at = queue.indexOf(idx);
+		if (at !== -1) {
+			queue.splice(at, 1);
+		}
+	};
 
 	for (const e of progress) {
 		if (e.type === "agent:start") {
@@ -381,14 +398,22 @@ function liveAgentRows(
 			rows.push(row);
 			enqueue(e.label, rows.length - 1);
 		} else if (e.type === "agent:launched") {
-			// Bind launch metadata onto the earliest still-open occurrence. Pull the
-			// live snapshot eagerly so a still-running row shows current stats.
-			const idx = peek(e.label);
+			// Bind launch metadata onto the first still-open occurrence for this label
+			// whose session is not yet bound — NOT the FIFO head. With N concurrent
+			// same-label agents, every `agent:launched` would otherwise stamp the same
+			// head row (last-writer-wins), leaving the siblings model-less and stat-less
+			// until their end. Claiming the first UNBOUND open row gives each launch its
+			// own occurrence, mirroring the engine's per-sessionID disambiguation.
+			const queue = open.get(e.label);
+			const idx = queue?.find((i) => rows[i]?.sessionID === undefined);
 			const row = idx !== undefined ? rows[idx] : undefined;
 			if (row !== undefined) {
+				row.sessionID = e.sessionID;
 				if (e.model !== undefined) {
 					row.model = e.model;
 				}
+				// Pull THIS row's own live snapshot (by its bound session) so a still-
+				// running occurrence shows its own current stats, not a sibling's.
 				const snap = statsSnapshot(e.sessionID);
 				if (snap !== undefined) {
 					row.tokens = totalTokens(snap.tokens);
@@ -396,7 +421,22 @@ function liveAgentRows(
 				}
 			}
 		} else if (e.type === "agent:end") {
-			const idx = dequeue(e.label);
+			// A launched end carries its own sessionID — pair it to the row that bound
+			// that exact session (correct under concurrent same-label agents, whose ends
+			// arrive in completion, not launch, order). A cached/sessionless end falls
+			// back to the FIFO head (the documented chronological approximation).
+			let idx: number | undefined;
+			if (e.sessionID !== undefined) {
+				idx = rows.findIndex((r) => r.sessionID === e.sessionID);
+				if (idx === -1) {
+					idx = undefined;
+				} else {
+					dropOpen(e.label, idx);
+				}
+			}
+			if (idx === undefined) {
+				idx = dequeue(e.label);
+			}
 			const row = idx !== undefined ? rows[idx] : undefined;
 			if (row !== undefined) {
 				// The enriched fields (model/tokens/toolCalls/durationMs) are optional on

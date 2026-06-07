@@ -328,52 +328,60 @@ const SUBDIR_FEED = "workflow-feed";
 const STATS_THROTTLE_MS = 2000;
 
 /**
+ * Synthesize an append as read-modify-write over `readFile`/`writeFile` (ENOENT →
+ * start empty), for an {@link FsFacade} that has no native `appendFile` — only the
+ * in-memory test fs. This is O(n) per append (it rewrites the whole file), so it is
+ * the FALLBACK only: a production facade backed by `node:fs/promises` exposes the
+ * native O(1) `appendFile` and never lands here. Callers' own single-serial write
+ * chain guarantees no two appends interleave for one file.
+ */
+function synthesizeAppend(
+	fs: FsFacade,
+): (path: string, data: string, enc: "utf-8") => Promise<void> {
+	return async (path, data, enc) => {
+		let prior = "";
+		try {
+			prior = await fs.readFile(path, enc);
+		} catch (err) {
+			if ((err as { code?: string }).code !== "ENOENT") {
+				throw err;
+			}
+		}
+		await fs.writeFile(path, prior + data, enc);
+	};
+}
+
+/**
  * Adapt the engine's {@link FsFacade} to the {@link JournalFs} the journal needs.
- * `FsFacade` has no `appendFile`, so it is synthesized as read-modify-write over
- * `readFile`/`writeFile` (ENOENT → start empty). This keeps the in-memory test
- * fs unchanged — it already exposes `readFile`/`writeFile`. The journal's own
- * single-serial write chain guarantees no two appends interleave for one file.
+ * Prefers the facade's native `appendFile` (the production `node:fs/promises` path,
+ * O(1) per line); falls back to the read-modify-write {@link synthesizeAppend} only
+ * for an in-memory test fs that lacks it. The journal's single-serial write chain
+ * guarantees no two appends interleave for one file.
  */
 function journalFsFromFacade(fs: FsFacade): JournalFs {
+	const append = fs.appendFile?.bind(fs) ?? synthesizeAppend(fs);
 	return {
 		mkdir: (path, opts) => fs.mkdir(path, opts),
 		readFile: (path, enc) => fs.readFile(path, enc),
-		appendFile: async (path, data, enc) => {
-			let prior = "";
-			try {
-				prior = await fs.readFile(path, enc);
-			} catch (err) {
-				if ((err as { code?: string }).code !== "ENOENT") {
-					throw err;
-				}
-			}
-			await fs.writeFile(path, prior + data, enc);
-		},
+		appendFile: append,
 	};
 }
 
 /**
  * Adapt the engine's {@link FsFacade} to the {@link FeedFs} the live feed writer
- * needs (Task 8.1.2). The feed only mkdir's + appends; `appendFile` is synthesized
- * as read-modify-write over `readFile`/`writeFile` exactly as the journal's, so the
- * in-memory test fs (which has no native `appendFile`) works unchanged. The writer's
- * own dead-state fence absorbs any error this raises — a broken disk drops feed
- * lines but never breaks the run.
+ * needs (Task 8.1.2). The feed is the high-frequency observability bus (every
+ * lifecycle event plus throttled stats lines), so it MUST use the native O(1)
+ * `appendFile` the production facade exposes — read-modify-write would make the
+ * feed-write path O(n²) in line count, quadratic IO precisely on the long runs the
+ * feed exists to observe. The synthesized fallback is used only by the in-memory
+ * test fs (tiny files). The writer's own dead-state fence absorbs any error this
+ * raises — a broken disk drops feed lines but never breaks the run.
  */
 function feedFsFromFacade(fs: FsFacade): FeedFs {
+	const append = fs.appendFile?.bind(fs) ?? synthesizeAppend(fs);
 	return {
 		mkdir: (path, opts) => fs.mkdir(path, opts),
-		appendFile: async (path, data, enc) => {
-			let prior = "";
-			try {
-				prior = await fs.readFile(path, enc);
-			} catch (err) {
-				if ((err as { code?: string }).code !== "ENOENT") {
-					throw err;
-				}
-			}
-			await fs.writeFile(path, prior + data, enc);
-		},
+		appendFile: append,
 	};
 }
 
@@ -929,9 +937,17 @@ export function createWorkflowEngine(
 		// Fire DETACHED — never await the run. On settle, DRAIN the journal AND the
 		// feed, then update the record. The settle promise is exposed on the handle so
 		// workflow_status's wait_ms blocks until both are durable (resume-safe; the
-		// viewer sees the run:end line). The feed's run:end is appended ONCE — here on
-		// natural settle, or in stopRun on cancel (which removes the writer from the
-		// map so this branch can't double-write it).
+		// viewer sees the run:end line).
+		//
+		// The feed's `run:end` is ALWAYS appended here, never in stopRun. The run()
+		// promise resolves only once the workflow body's every `await agent()` has
+		// unblocked — and on cancel, abort() flips the in-flight children terminal,
+		// which is exactly what unblocks those awaits and flushes their `agent:end`
+		// through onProgress FIRST. So writing `run:end` here keeps it the terminal
+		// feed line on EVERY path (success, error, cancel): the framing invariant a
+		// TUI viewer relies on. A cancel pre-flips the record to `cancelled`; the feed
+		// then carries that terminal status, and the record is re-persisted so the
+		// last in-flight agent's rollup (mutated after stopRun's settle) is durable.
 		handle.settled = run
 			.run(resolved.source)
 			.then(async (result) => {
@@ -939,24 +955,28 @@ export function createWorkflowEngine(
 				return result;
 			})
 			.then(async (result) => {
-				// A stopRun() may have already flipped the record to cancelled; do not
-				// clobber a terminal record with the run's own (also-terminal) result.
-				if (handle.record.status !== "running") {
-					return;
+				// A stopRun() may have already flipped the record to cancelled. Do not
+				// clobber it with the run's own (also-terminal) result — but still finalize
+				// the feed and re-persist the record below, since the in-flight agents'
+				// ends arrived (and rolled up) only after stopRun ran.
+				if (handle.record.status === "running") {
+					settleRecord(handle, {
+						status: result.status,
+						returnValue: result.returnValue,
+						error: result.error,
+						agentCount: result.agentCount,
+						// Snapshot the budget spend at settle for status display (Task 4.3.1).
+						...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
+						// Persist diagnostics for any degraded calls (Task 7.2.1); omit the
+						// field entirely on a clean run.
+						...(diagnostics.length > 0 ? { diagnostics } : {}),
+					});
+				} else {
+					// Cancelled by stopRun: re-persist so the final in-flight rollup lands on
+					// disk (stopRun's settle ran before those ends arrived).
+					persistRecord(handle.record);
 				}
-				settleRecord(handle, {
-					status: result.status,
-					returnValue: result.returnValue,
-					error: result.error,
-					agentCount: result.agentCount,
-					// Snapshot the budget spend at settle for status display (Task 4.3.1).
-					...(budget !== undefined ? { budgetSpent: budget.spent() } : {}),
-					// Persist diagnostics for any degraded calls (Task 7.2.1); omit the
-					// field entirely on a clean run.
-					...(diagnostics.length > 0 ? { diagnostics } : {}),
-				});
-				await finalizeFeed(runId, {
-					status: result.status,
+				await finalizeFeed(handle, {
 					...(result.agentCount !== undefined
 						? { agentCount: result.agentCount }
 						: {}),
@@ -965,16 +985,17 @@ export function createWorkflowEngine(
 			})
 			.catch(async (err: unknown) => {
 				// createWorkflowRun.run() never rejects, but fence defensively.
-				if (handle.record.status !== "running") {
-					return;
+				if (handle.record.status === "running") {
+					settleRecord(handle, {
+						status: "error",
+						error: err instanceof Error ? err.message : String(err),
+						// Carry any diagnostics collected before the throw (Task 7.2.1).
+						...(diagnostics.length > 0 ? { diagnostics } : {}),
+					});
+				} else {
+					persistRecord(handle.record);
 				}
-				settleRecord(handle, {
-					status: "error",
-					error: err instanceof Error ? err.message : String(err),
-					// Carry any diagnostics collected before the throw (Task 7.2.1).
-					...(diagnostics.length > 0 ? { diagnostics } : {}),
-				});
-				await finalizeFeed(runId, { status: "error" });
+				await finalizeFeed(handle, {});
 			});
 
 		return { runId, scriptPath, name };
@@ -982,20 +1003,29 @@ export function createWorkflowEngine(
 
 	/**
 	 * Write the feed's terminal `run:end` line, drain the writer, and drop it from
-	 * the per-run map (Task 8.1.2). Idempotent by map presence: whoever finalizes
-	 * first (natural settle or stopRun) consumes the writer; later callers no-op.
-	 * Fenced — `settled()` never rejects, so a feed flush failure can't fail a run.
+	 * the per-run map (Task 8.1.2). Always driven from the run's own settle branch,
+	 * which resolves only after every in-flight `agent:end` has flushed — so `run:end`
+	 * is the terminal feed line on success, error, AND cancel. The line carries the
+	 * record's terminal status (a stopRun pre-flips it to `cancelled`). Idempotent by
+	 * map presence; fenced — `settled()` never rejects, so a flush failure can't fail
+	 * a run.
 	 */
 	async function finalizeFeed(
-		runId: string,
-		end: { status: string; agentCount?: number; budgetSpent?: number },
+		handle: RunHandle,
+		end: { agentCount?: number; budgetSpent?: number },
 	): Promise<void> {
+		const runId = handle.record.id;
 		const feed = feeds.get(runId);
 		if (feed === undefined) {
 			return;
 		}
 		feeds.delete(runId);
-		feed.append({ type: "run:end", ...end, at: clock.now() });
+		feed.append({
+			type: "run:end",
+			status: handle.record.status,
+			...end,
+			at: clock.now(),
+		});
 		await feed.settled();
 	}
 
@@ -1004,13 +1034,12 @@ export function createWorkflowEngine(
 		if (handle?.record.status !== "running") {
 			return;
 		}
+		// Abort flips the in-flight children terminal (fire-and-forget) and flips the
+		// record to cancelled. The feed's `run:end` is NOT written here: the detached
+		// settle branch above writes it after the aborted children's `agent:end`
+		// events drain, so `run:end` stays the terminal feed line on cancel too.
 		handle.run?.abort();
 		settleRecord(handle, { status: "cancelled" });
-		// Frame the cancelled feed (Task 8.1.2). stopRun is synchronous, so fire the
-		// finalize detached — the writer is fenced and its chain serializes the
-		// run:end after any in-flight progress appends. Removing it from the map here
-		// guarantees the detached natural-settle branch won't double-write run:end.
-		void finalizeFeed(runId, { status: "cancelled" });
 	}
 
 	/**

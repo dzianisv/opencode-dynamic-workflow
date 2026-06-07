@@ -1221,6 +1221,78 @@ describe("createWorkflowStatusTool — CC-style agent tree, LIVE run (Task 8.1.5
 		expect(out).toContain("(no phase)");
 		expect(out).toContain("loner");
 	});
+
+	test("concurrent same-label agents each bind their OWN model + live stats", async () => {
+		// The parallel() case: N agents sharing a label, launched back-to-back before
+		// any ends. Each agent:launched must claim a DISTINCT occurrence (not the FIFO
+		// head), so both running rows show their own model and their own live snapshot
+		// — not the last-launched session's, last-writer-wins onto a shared head row.
+		const progress = enriched([
+			{ type: "agent:start", label: "worker", phase: "Fan", at: 1_000 },
+			{ type: "agent:start", label: "worker", phase: "Fan", at: 1_001 },
+			{
+				type: "agent:launched",
+				label: "worker",
+				phase: "Fan",
+				sessionID: "ses_1",
+				model: "anthropic/claude-opus-4-8",
+				at: 1_010,
+			},
+			{
+				type: "agent:launched",
+				label: "worker",
+				phase: "Fan",
+				sessionID: "ses_2",
+				model: "anthropic/claude-haiku-4-5",
+				at: 1_011,
+			},
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_tree0006", createdAt: 1_000 }),
+			progress,
+			now: () => 60_000,
+		};
+		const engine = fakeEngineWithStats([handle], {
+			ses_1: {
+				tokens: {
+					input: 30_000,
+					output: 1_000,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 5,
+				lastTools: [],
+				updatedAt: 50_000,
+			},
+			ses_2: {
+				tokens: {
+					input: 7_000,
+					output: 500,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 2,
+				lastTools: [],
+				updatedAt: 50_000,
+			},
+		});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_tree0006" }, ctx());
+
+		// Both occurrences appear as distinct rows under the phase (2 total, 0 done).
+		expect(out).toMatch(/Fan\s+0\/2/);
+		// First occurrence: opus model + ses_1 live stats (31000 → 31.0k, 5 tools).
+		expect(out).toContain("opus-4-8");
+		expect(out).toContain("31.0k tok");
+		expect(out).toContain("5 tools");
+		// Second occurrence: haiku model + ses_2 live stats (7500 → 7.5k, 2 tools) —
+		// NOT a duplicate of the first row's model/stats.
+		expect(out).toContain("haiku-4-5");
+		expect(out).toContain("7.5k tok");
+		expect(out).toContain("2 tools");
+	});
 });
 
 describe("createWorkflowStatusTool — CC-style agent tree, SETTLED run (Task 8.1.5)", () => {

@@ -1760,6 +1760,77 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 
 		await engine.dispose();
 	});
+
+	test("a facade with a native appendFile drives feed writes O(1) — no read-modify-write per line", async () => {
+		// The production facade (node:fs/promises) exposes a native appendFile. The
+		// feed is the high-frequency observability bus, so each line MUST go through
+		// that O(1) append — NOT the read-modify-write synthesis (which re-reads the
+		// whole growing file per line, O(n²) overall). We assert it by injecting a
+		// facade whose appendFile is real but whose readFile would throw if the feed
+		// path were ever read back — proving the synthesis path is not taken.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "a" });\nreturn r;\n`;
+		const key = computeCallKey({ prompt: "do work", label: "a" });
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_prior003",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_prior003.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_prior003.js`]: SCRIPT,
+			[JOURNALS("wf_prior003")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_prior003.json`]: JSON.stringify(priorRecord),
+		});
+		// Native append: concatenate onto the in-memory file, exactly like
+		// node:fs/promises.appendFile. Count the calls per feed path.
+		const appendCalls = new Map<string, number>();
+		facade.appendFile = async (path: string, data: string) => {
+			appendCalls.set(path, (appendCalls.get(path) ?? 0) + 1);
+			files.set(path, (files.get(path) ?? "") + data);
+		};
+		// Trap any read-back of the feed file — the O(1) path must never read it.
+		const baseRead = facade.readFile.bind(facade);
+		const feedReads: string[] = [];
+		facade.readFile = async (path: string, enc: "utf-8") => {
+			if (path.includes("/workflow-feed/")) {
+				feedReads.push(path);
+			}
+			return baseRead(path, enc);
+		};
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_feed0003"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_prior003",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// The feed was written via native appendFile, once per line, and NEVER read
+		// back (no read-modify-write).
+		expect(appendCalls.get(FEED("wf_feed0003")) ?? 0).toBeGreaterThan(0);
+		expect(feedReads).toEqual([]);
+		const lines = readFeed(files, "wf_feed0003");
+		expect(lines.at(0)?.type).toBe("run:start");
+		expect(lines.at(-1)?.type).toBe("run:end");
+
+		await engine.dispose();
+	});
 });
 
 // ---- Task 8.1.3: session stats collector → throttled agent:stats feed lines ---
@@ -2129,6 +2200,59 @@ describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8
 			sessionID: second,
 			status: "cancelled",
 		});
+
+		await engine.dispose();
+	});
+
+	test("a cancel with an in-flight child still leaves run:end as the LAST feed line", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_cxl0001"),
+		});
+		await engine.ready();
+
+		// Two sequential agents: the first completes, the second is in flight at stop.
+		// Aborting flips the second child terminal, so its `agent:end` flushes through
+		// onProgress AFTER stopRun returns — the feed must still close with run:end.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		bump(500);
+		await driveIdle(engine, first, bump);
+
+		await flush();
+		expect(sessions.length).toBe(2);
+		engine.stopRun(handle.runId);
+		// Let the abort round-trip resolve the in-flight child + drain the settle chain.
+		await engine.statusOf(handle.runId)?.settled;
+		await flush();
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("cancelled");
+
+		const lines = readFeed(files, "wf_cxl0001");
+		// The framing invariant: first line run:start, LAST line run:end — even though
+		// the in-flight child's agent:end fired after stopRun.
+		expect(lines.at(0)?.type).toBe("run:start");
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("cancelled");
+		// The in-flight (second) agent's end is present and lands BEFORE run:end.
+		const ends = lines.filter((l) => l.type === "agent:end");
+		expect(ends.length).toBe(2);
+		const lastEndIdx = lines.map((l) => l.type).lastIndexOf("agent:end");
+		const runEndIdx = lines.map((l) => l.type).lastIndexOf("run:end");
+		expect(lastEndIdx).toBeLessThan(runEndIdx);
 
 		await engine.dispose();
 	});
