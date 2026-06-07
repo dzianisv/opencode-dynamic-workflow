@@ -10,7 +10,8 @@
  * engine to piggyback on — a quiet run (slow child, no SDK events) would never tick
  * a piggybacked check. `readdir(dir)` + `rm(sentinelPath)` is the whole detection,
  * both already on the facade. The poll cadence and interval fns are injectable so
- * tests drive `tick()` directly with zero timers.
+ * tests drive `tick()` directly with zero timers; the default real-`setInterval`
+ * handle is UNREF'd so the loop never keeps the process alive on its own.
  *
  * Steady state is a MISSING control dir (no run has touched it): a `readdir` that
  * throws (ENOENT or otherwise) degrades to "no sentinels" and is logged ONCE at
@@ -70,7 +71,19 @@ function errorText(err: unknown): string {
 export function createControlWatcher(
 	opts: ControlWatcherOptions,
 ): ControlWatcher {
-	const setIntervalFn = opts.setIntervalFn ?? ((cb, ms) => setInterval(cb, ms));
+	// The default interval is UNREF'd: a referenced 1s repeating timer would hold the
+	// event loop open, blocking the at-idle exit `opencode run` depends on (the engine
+	// is never disposed on that path until process teardown) and ticking forever in a
+	// long-lived serve/TUI process. Unref lets the loop exit naturally while the timer
+	// still fires for as long as the process lives. Injected fns are left untouched —
+	// tests drive `tick()` directly and never arm a real timer.
+	const setIntervalFn =
+		opts.setIntervalFn ??
+		((cb, ms) => {
+			const handle = setInterval(cb, ms);
+			(handle as { unref?: () => void }).unref?.();
+			return handle;
+		});
 	const clearIntervalFn =
 		opts.clearIntervalFn ??
 		((handle) => clearInterval(handle as ReturnType<typeof setInterval>));

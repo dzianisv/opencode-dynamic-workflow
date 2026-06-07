@@ -2368,4 +2368,39 @@ describe("createWorkflowEngine — external control channel (Task 8.2.2)", () =>
 
 		await engine.dispose();
 	});
+
+	test("dispose() clears the control poll interval (no tick races a disposed engine)", async () => {
+		const { facade } = makeFs();
+		// Real handle id so clearIntervalFn receives exactly what setIntervalFn returned.
+		const armed: number[] = [];
+		const cleared: number[] = [];
+		let seq = 0;
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0003"),
+			setIntervalFn: (_cb: () => void) => {
+				seq += 1;
+				armed.push(seq);
+				return seq;
+			},
+			clearIntervalFn: (handle: unknown) => {
+				cleared.push(handle as number);
+			},
+		});
+		await engine.ready();
+
+		// The watcher arms exactly one interval at construction.
+		expect(armed).toEqual([1]);
+		expect(cleared).toEqual([]);
+
+		await engine.dispose();
+
+		// dispose() must stop the watcher, clearing the same handle setInterval returned.
+		expect(cleared).toEqual([1]);
+	});
 });

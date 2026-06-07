@@ -46,6 +46,16 @@
  *      API retry backoff — which a tool cannot emulate). That bug class is owned by
  *      the six deterministic unit tests in packages/core/src/completion.test.ts.
  *
+ *   F. external control channel — the model launches `longrun` AND blocks the turn
+ *      on workflow_status(wait_ms) (Scenario E's keep-alive), so the in-process
+ *      server — and the engine's control poll loop — stays ALIVE. While the turn is
+ *      blocked, THIS HARNESS (a process other than the server) touches the sentinel
+ *      <dataDir>/workflow-control/<runId>.cancel. PASS iff the engine's poll loop
+ *      observes it inside the live server, settles the run `cancelled`, and consumes
+ *      the sentinel — the only honest end-to-end proof of Epic 8.2 against a real
+ *      opencode. See the scenarioF header for the load-bearing `opencode run`
+ *      lifecycle invariant (process exits at top-level idle, not on child drain).
+ *
  * Cross-process observation: the harness reads the persisted run-record + task JSON
  * files under $OPENCODE_DRAWERS_DATA_DIR directly (the authoritative signal), in
  * addition to the model echoing tool output to stdout.
@@ -581,7 +591,7 @@ async function scenarioE(dataDir: string, beforeCount: number): Promise<void> {
 	);
 }
 
-async function scenarioF(dataDir: string, beforeCount: number): Promise<void> {
+async function scenarioF(dataDir: string): Promise<void> {
 	log("");
 	log(
 		"=== Scenario F: external touch cancels a live run (filesystem sentinel) ===",
@@ -595,9 +605,29 @@ async function scenarioF(dataDir: string, beforeCount: number): Promise<void> {
 	// consumes (unlinks) the sentinel. This is the honest proof that 8.2.2's watcher
 	// fires in a real server, not just in unit tests.
 	//
-	// Reuse Scenario B's `longrun` script — one slow agent — but launch it WITHOUT any
-	// in-session stop: the model calls `workflow` only and replies with the run_id.
-	// The cancel comes exclusively from the external touch below.
+	// LOAD-BEARING LIFECYCLE INVARIANT (the reason this scenario is shaped the way it
+	// is). `opencode run` is the NON-INTERACTIVE in-process server: it "exits when the
+	// session goes idle" — its event loop breaks the moment the TOP-LEVEL session goes
+	// idle and does NOT wait for detached child sessions to drain
+	// (.references/opencode/packages/opencode/src/cli/cmd/run.ts: the run loop breaks
+	// on `session.status … idle` for `sessionID`, then `await session.prompt(...)`
+	// returns and the process tears down — verified against opencode 1.16.2, the
+	// vendored ground-truth source under .references/opencode). The engine — and its
+	// control poll loop — lives
+	// INSIDE that ephemeral process. A `workflow` call returns the run_id immediately
+	// and detaches the run, so if the model called `workflow` ALONE and replied, the
+	// top-level turn would go idle at once, the process would exit, and the poll loop
+	// would be gone BEFORE this harness could touch the sentinel — a guaranteed 30s
+	// timeout, not a real assertion. So Scenario F keeps the turn (hence the process,
+	// hence the poll loop) ALIVE across the cancel window the SAME way Scenario E does:
+	// the model calls `workflow` THEN `workflow_status(wait_ms)`, which BLOCKS the
+	// top-level turn until the run settles. While the parent blocks, this harness
+	// captures the live runId and touches the sentinel; the live watcher cancels the
+	// run; `workflow_status` unblocks (the run is now `cancelled`); the turn ends and
+	// the process exits cleanly. The capture+touch therefore CANNOT await process
+	// close — we spawn without blocking and race the touch against the still-open turn.
+	//
+	// Reuse Scenario B's `longrun` script — one slow agent.
 	const longrunScript = [
 		"export const meta = { name: 'longrun', description: 'one long agent' };",
 		"const r = await agent('Count slowly from 1 to 50, one number per line.', { label: 'long' });",
@@ -606,57 +636,140 @@ async function scenarioF(dataDir: string, beforeCount: number): Promise<void> {
 		.join("\n")
 		.replace(/'/g, "\\'");
 	const prompt =
-		"You have a tool named workflow. It IS available. " +
+		"You have tools named workflow and workflow_status. They ARE available. " +
 		"This is an explicit multi-agent orchestration request (opt-in satisfied). " +
 		"In this single turn, do EXACTLY this and nothing else: " +
 		`(1) call workflow with { "script": "${longrunScript}" }. ` +
-		"(2) Reply with only the run_id it returns. " +
-		"Do NOT call workflow_stop. Do NOT call any other tool. Do not refuse.";
-	// Snapshot the ids already on disk so we identify only F's new run, never a prior
-	// one (same discipline as Scenario D/E).
-	const priorIds = new Set((await readRuns(dataDir)).map((r) => r.id));
-	await runUntilRunAppears(prompt, dataDir, beforeCount);
+		"(2) Take the run_id it returns and immediately call workflow_status with " +
+		'that run_id and { "wait_ms": 90000 } so you BLOCK until the workflow settles. ' +
+		"(3) Then reply with only the result text workflow_status returned. " +
+		"Do NOT call workflow_stop. Do not refuse, do not poll in a loop — " +
+		"workflow_status(wait_ms) already waits.";
 
-	// Identify the NEW run while it is still live: poll the store (bounded ~10s, same
-	// sleep/deadline shape as waitForTerminal) for a `running` record whose id is not
-	// in the prior set. Capturing it `running` is what makes this a LIVE-run cancel.
-	const runId = await (async () => {
-		const deadline = Date.now() + 10_000;
-		while (Date.now() < deadline) {
-			const fresh = (await readRuns(dataDir)).find(
-				(r) => r.status === "running" && !priorIds.has(r.id),
-			);
-			if (fresh) {
-				return fresh.id;
+	const controlDir = join(dataDir, "workflow-control");
+
+	// One attempt: spawn the run WITHOUT awaiting process close (the turn must stay
+	// open while we touch), capture the new `running` runId, touch its sentinel, then
+	// await close. Returns the captured runId on success, or undefined if the model
+	// refused (no new run appeared) so the caller can retry — mirroring
+	// runUntilRunAppears' refusal resilience.
+	async function attempt(): Promise<string | undefined> {
+		const priorIds = new Set((await readRuns(dataDir)).map((r) => r.id));
+		// Spawn but DO NOT await: the top-level turn is blocked in workflow_status,
+		// keeping the engine (and its poll loop) alive while we capture + touch.
+		const runPromise = runOpencode(prompt, dataDir);
+		// Ensure a rejected spawn (timeout/spawn error) never becomes an unhandled
+		// rejection while we race the capture below; the awaited `runPromise` at the
+		// end still surfaces a real failure.
+		runPromise.catch(() => {});
+
+		// Capture the NEW run while it is still live: poll the store (bounded ~30s,
+		// generous for first-token latency on a cold model) for a `running` record
+		// whose id is not in the prior set. Capturing it `running` is what makes this
+		// a LIVE-run cancel.
+		const captured = await (async () => {
+			const deadline = Date.now() + 30_000;
+			while (Date.now() < deadline) {
+				const fresh = (await readRuns(dataDir)).find(
+					(r) => r.status === "running" && !priorIds.has(r.id),
+				);
+				if (fresh) {
+					return fresh.id;
+				}
+				await sleep(500);
 			}
-			await sleep(500);
+			return undefined;
+		})();
+
+		if (captured === undefined) {
+			// The turn may have finished without ever reaching `running` (model refusal,
+			// or it cancelled itself). Settle the spawn and report no-capture so the
+			// caller can retry on refusal.
+			const run = await runPromise;
+			if (run.code !== 0) {
+				throw new Error(
+					`Scenario F: run nonzero exit (${run.code})\nstderr:\n${trim(run.stderr)}`,
+				);
+			}
+			log(
+				"  no NEW run reached status 'running' — model likely refused; retrying …",
+			);
+			return undefined;
+		}
+
+		log(`  captured live run ${captured} (status running)`);
+
+		// The literal external `touch`: this harness process — NOT the opencode server —
+		// writes the sentinel into the control dir using node:fs/promises. mkdir is
+		// recursive because the control dir is not created until something touches it.
+		const sentinelName = `${captured}.cancel`;
+		await mkdir(controlDir, { recursive: true });
+		await writeFile(join(controlDir, sentinelName), "");
+		log(`  external touch: ${join(controlDir, sentinelName)}`);
+
+		// Now the turn can end: workflow_status unblocks once the watcher cancels the
+		// run. Await the process close so the run is fully settled on disk before we
+		// assert (and so a real spawn failure surfaces).
+		const run = await runPromise;
+		if (run.code !== 0) {
+			throw new Error(
+				`Scenario F: run nonzero exit (${run.code})\nstderr:\n${trim(run.stderr)}`,
+			);
+		}
+		return captured;
+	}
+
+	let runId: string | undefined;
+	for (let i = 1; i <= 3 && runId === undefined; i += 1) {
+		log(`  attempt ${i}/3 …`);
+		runId = await attempt();
+	}
+	if (runId === undefined) {
+		throw new Error(
+			"Scenario F: the model never launched a live workflow across 3 attempts " +
+				"(no NEW run reached 'running'). Model-behavior issue, not a plugin fault.",
+		);
+	}
+	const sentinelName = `${runId}.cancel`;
+
+	// The engine's poll loop must have observed the sentinel and cancelled the live
+	// run. By here the process has exited, so the record is already terminal on disk;
+	// a generous deadline still covers the settle. Distinguish the two failure modes
+	// so a future opencode `run` lifecycle change yields an ACTIONABLE message rather
+	// than a bare timeout: a still-`running` (orphaned) record means the poll loop
+	// never fired — the process exited before the touch landed (the lifecycle
+	// invariant above broke); any other terminal status means the cancel path itself
+	// misbehaved.
+	let record: RunRecord;
+	try {
+		record = await waitForTerminal(
+			dataDir,
+			(r) => r.id === runId && r.status === "cancelled",
+			30_000,
+		);
+	} catch (err) {
+		const final = (await readRuns(dataDir)).find((r) => r.id === runId);
+		const status = final?.status ?? "(record vanished)";
+		if (status === "running") {
+			throw new Error(
+				`Scenario F: run ${runId} is still 'running' (orphaned) — the engine's ` +
+					`poll loop never fired. The opencode 'run' process most likely exited ` +
+					`before the external touch landed (the in-process server tore down at ` +
+					`top-level idle). Verify the workflow_status(wait_ms) keep-alive held the ` +
+					`turn open, and re-check the run.ts lifecycle invariant for the pinned ` +
+					`opencode version. Underlying: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 		throw new Error(
-			"Scenario F: no NEW run reached status 'running' within 10s — could not " +
-				"capture a live run to cancel externally.",
+			`Scenario F: run ${runId} settled '${status}', not 'cancelled' — the external ` +
+				`sentinel was seen but the cancel path produced the wrong terminal state. ` +
+				`Underlying: ${err instanceof Error ? err.message : String(err)}`,
 		);
-	})();
-	log(`  captured live run ${runId} (status running)`);
-
-	// The literal external `touch`: this harness process — NOT the opencode server —
-	// writes the sentinel into the control dir using node:fs/promises. mkdir is
-	// recursive because the control dir is not created until something touches it.
-	const controlDir = join(dataDir, "workflow-control");
-	const sentinelName = `${runId}.cancel`;
-	await mkdir(controlDir, { recursive: true });
-	await writeFile(join(controlDir, sentinelName), "");
-	log(`  external touch: ${join(controlDir, sentinelName)}`);
-
-	// The engine's poll loop must observe the sentinel and cancel the live run.
-	const record = await waitForTerminal(
-		dataDir,
-		(r) => r.id === runId && r.status === "cancelled",
-		30_000,
-	);
+	}
 	log(`  run ${record.id} settled 'cancelled' via external sentinel`);
 
 	// The sentinel must be CONSUMED (unlinked) by the watcher. The unlink happens in
-	// the same tick as the cancel, but the file probe races the record settle, so
+	// the same tick as the cancel, but the file probe may race the record settle, so
 	// poll briefly (~5s).
 	const consumed = await (async () => {
 		const deadline = Date.now() + 5_000;
@@ -703,8 +816,9 @@ async function main(): Promise<void> {
 		await scenarioD(dataDir, afterC);
 		const afterD = (await readRuns(dataDir)).length;
 		await scenarioE(dataDir, afterD);
-		const afterE = (await readRuns(dataDir)).length;
-		await scenarioF(dataDir, afterE);
+		// Scenario F captures its NEW run by `running` status against a per-attempt id
+		// snapshot (not a count threshold), so it needs no beforeCount plumbing.
+		await scenarioF(dataDir);
 
 		log("");
 		log("================ PASS ================");

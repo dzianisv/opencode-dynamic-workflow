@@ -41,6 +41,17 @@ function enoentFs() {
 	return fs;
 }
 
+/**
+ * Yield the microtask queue repeatedly so a fire-and-forget async `tick()` settles
+ * to quiescence, regardless of how many awaits its internal chain has. Ten turns is
+ * generous slack over the current readdir → onCancel → rm depth.
+ */
+async function drainMicrotasks(turns = 10): Promise<void> {
+	for (let i = 0; i < turns; i += 1) {
+		await Promise.resolve();
+	}
+}
+
 interface LoggedDebug {
 	msg: string;
 	meta?: Record<string, unknown>;
@@ -218,11 +229,52 @@ describe("createControlWatcher — start/stop", () => {
 		watcher.start();
 		expect(armedCb).toBeDefined();
 		armedCb?.();
-		// Let the async tick the callback kicked off settle.
-		await Promise.resolve();
-		await Promise.resolve();
+		// Drain to quiescence rather than counting `tick()`'s internal awaits — the
+		// callback is fire-and-forget (`void tick()`), and tick() has a multi-await
+		// chain (readdir → onCancel → rm). A fixed turn count would couple this test
+		// to that depth and flake if a future await (or a real-microtask fs fake) is
+		// added; looping until the work has settled does not.
+		await drainMicrotasks();
 
 		expect(cancelled).toEqual(["wf_timer"]);
 		expect(present.has("wf_timer.cancel")).toBe(false);
+	});
+
+	test("the default interval is unref'd so it never holds the process open", () => {
+		// In production no one injects setIntervalFn, so createControlWatcher arms a
+		// real `setInterval`. A REFERENCED 1s repeating timer would keep the event
+		// loop alive — blocking the at-idle exit `opencode run` depends on, and
+		// ticking forever in a long-lived serve/TUI process. The default MUST call
+		// `.unref()` on the handle. Spy on the global to capture the timer it returns.
+		const realSetInterval = globalThis.setInterval;
+		const realClearInterval = globalThis.clearInterval;
+		let unrefCalls = 0;
+		let captured: ReturnType<typeof realSetInterval> | undefined;
+		globalThis.setInterval = ((cb: () => void, ms: number) => {
+			const handle = realSetInterval(cb, ms);
+			const realUnref = handle.unref.bind(handle);
+			handle.unref = () => {
+				unrefCalls += 1;
+				return realUnref();
+			};
+			captured = handle;
+			return handle;
+		}) as typeof globalThis.setInterval;
+		try {
+			const watcher = createControlWatcher({
+				dir: DIR,
+				fs: makeFs().fs,
+				intervalMs: 1000,
+				onCancel: async () => {},
+			});
+			watcher.start();
+			expect(unrefCalls).toBe(1);
+			watcher.stop();
+		} finally {
+			if (captured !== undefined) {
+				realClearInterval(captured);
+			}
+			globalThis.setInterval = realSetInterval;
+		}
 	});
 });
