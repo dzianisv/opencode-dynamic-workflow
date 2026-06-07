@@ -60,6 +60,16 @@ export type ProgressEvent =
 export type ProgressEmitter = (e: ProgressEvent) => void;
 
 /**
+ * A {@link ProgressEvent} stamped with the wall-clock time it was observed (Task
+ * 6.2.1). The runtime stays deliberately clock-free — it emits bare
+ * {@link ProgressEvent}s — and the ENGINE stamps `at = clock.now()` at its
+ * `onProgress` boundary before pushing onto the handle. This keeps fake clocks
+ * authoritative in tests and confines the only timestamp source to the one layer
+ * that already owns an injected {@link Clock}.
+ */
+export type StampedProgressEvent = ProgressEvent & { at: number };
+
+/**
  * One journaled `agent()` call (spec §7). Only SETTLED, NON-null results are
  * journaled: a failed/null agent must re-run on resume, never replay its failure.
  * `key` is the {@link computeCallKey} hash of `(prompt, opts)`; `index` is the

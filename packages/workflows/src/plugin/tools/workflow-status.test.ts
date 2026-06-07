@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolContext } from "@opencode-ai/plugin";
-import type { ProgressEvent } from "../../runtime/types";
+import type { ProgressEvent, StampedProgressEvent } from "../../runtime/types";
 import type { RunHandle, RunRecord, WorkflowEngine } from "../engine";
 import { createWorkflowStatusTool } from "./workflow-status";
+
+/** Stamp a flat list of events at successive `at` offsets (Task 6.2.1 helper). */
+function stamp(events: ProgressEvent[], ats: number[]): StampedProgressEvent[] {
+	return events.map((e, i) => ({ ...e, at: ats[i] ?? 0 }));
+}
 
 /**
  * Tests for `workflow_status` (Task 4.1.3). The render is a pure function of the
@@ -99,7 +104,8 @@ describe("createWorkflowStatusTool — header", () => {
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_done0001" }, ctx());
 		expect(out).toContain("completed");
-		expect(out).toContain("2500ms");
+		// 2500ms → humanized to seconds-with-one-decimal (shared formatter).
+		expect(out).toContain("(2.5s)");
 	});
 });
 
@@ -187,17 +193,20 @@ describe("createWorkflowStatusTool — wait_ms (single-turn settle affordance)",
 
 describe("createWorkflowStatusTool — flat chronological progress render", () => {
 	test("phase headers inserted on phase change; markers per agent status", async () => {
-		const progress: ProgressEvent[] = [
-			{ type: "agent:start", label: "scout", phase: "discover" },
-			{ type: "agent:end", label: "scout", status: "completed" },
-			{ type: "log", message: "found 3 targets" },
-			{ type: "agent:start", label: "impl-a", phase: "build" },
-			{ type: "agent:end", label: "impl-a", status: "cached" },
-			{ type: "agent:start", label: "impl-b", phase: "build" },
-			{ type: "agent:end", label: "impl-b", status: "error" },
-			{ type: "warn", message: "budget tight" },
-			{ type: "agent:start", label: "stray" },
-		];
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "scout", phase: "discover" },
+				{ type: "agent:end", label: "scout", status: "completed" },
+				{ type: "log", message: "found 3 targets" },
+				{ type: "agent:start", label: "impl-a", phase: "build" },
+				{ type: "agent:end", label: "impl-a", status: "cached" },
+				{ type: "agent:start", label: "impl-b", phase: "build" },
+				{ type: "agent:end", label: "impl-b", status: "error" },
+				{ type: "warn", message: "budget tight" },
+				{ type: "agent:start", label: "stray" },
+			],
+			[],
+		);
 		const engine = fakeEngine([
 			{ record: makeRecord({ id: "wf_prog0001" }), progress },
 		]);
@@ -303,14 +312,17 @@ describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
 	});
 
 	test("terminal run appends 'N cached / M live agent calls' from progress", async () => {
-		const progress: ProgressEvent[] = [
-			{ type: "agent:start", label: "a", phase: "p" },
-			{ type: "agent:end", label: "a", status: "cached" },
-			{ type: "agent:start", label: "b", phase: "p" },
-			{ type: "agent:end", label: "b", status: "cached" },
-			{ type: "agent:start", label: "c", phase: "p" },
-			{ type: "agent:end", label: "c", status: "completed" },
-		];
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "p" },
+				{ type: "agent:end", label: "a", status: "cached" },
+				{ type: "agent:start", label: "b", phase: "p" },
+				{ type: "agent:end", label: "b", status: "cached" },
+				{ type: "agent:start", label: "c", phase: "p" },
+				{ type: "agent:end", label: "c", status: "completed" },
+			],
+			[],
+		);
 		const engine = fakeEngine([
 			{
 				record: makeRecord({
@@ -331,10 +343,13 @@ describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
 	});
 
 	test("a non-resumed terminal run still reports cached/live counts", async () => {
-		const progress: ProgressEvent[] = [
-			{ type: "agent:start", label: "a", phase: "p" },
-			{ type: "agent:end", label: "a", status: "completed" },
-		];
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "p" },
+				{ type: "agent:end", label: "a", status: "completed" },
+			],
+			[],
+		);
 		const engine = fakeEngine([
 			{
 				record: makeRecord({
@@ -353,10 +368,13 @@ describe("createWorkflowStatusTool — resume (Task 4.2.2)", () => {
 	});
 
 	test("a running run does NOT append the cached/live tally — placeholder", async () => {
-		const progress: ProgressEvent[] = [
-			{ type: "agent:start", label: "a", phase: "p" },
-			{ type: "agent:end", label: "a", status: "cached" },
-		];
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "p" },
+				{ type: "agent:end", label: "a", status: "cached" },
+			],
+			[],
+		);
 		const engine = fakeEngine([
 			{ record: makeRecord({ id: "wf_run_old1" }), progress },
 		]);
@@ -423,12 +441,339 @@ describe("createWorkflowStatusTool — budget line (Task 4.3.1)", () => {
 	});
 });
 
+describe("createWorkflowStatusTool — live elapsed + counts (Task 6.2.1)", () => {
+	test("a LIVE run with a now() view shows total elapsed in the header", async () => {
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_live0001", createdAt: 1_000 }),
+			progress: [],
+			// Live clock view: 4200ms past createdAt.
+			now: () => 5_200,
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_live0001" }, ctx());
+		// Status word then elapsed in parens (no double "running") — 4200ms → "4.2s".
+		expect(out).toContain("wf_live0001 — demo workflow — running (4.2s)");
+	});
+
+	test("per-agent elapsed renders on a done marker (end.at − start.at)", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "scout", phase: "discover" },
+				{ type: "agent:end", label: "scout", status: "completed" },
+			],
+			[1_100, 1_900],
+		);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_live0002", createdAt: 1_000 }),
+			progress,
+			now: () => 2_000,
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_live0002" }, ctx());
+		// 1900 − 1100 = 800ms on the done line.
+		expect(out).toContain("[done] scout (800ms)");
+	});
+
+	test("a still-running agent shows no per-agent elapsed (no end to pair)", async () => {
+		const progress = stamp(
+			[{ type: "agent:start", label: "busy", phase: "p" }],
+			[1_100],
+		);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_live0003", createdAt: 1_000 }),
+			progress,
+			now: () => 3_000,
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_live0003" }, ctx());
+		expect(out).toContain("[running] busy");
+		expect(out).not.toContain("[running] busy (");
+	});
+
+	test("a LIVE run shows a counts line: running / done / failed / cached", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "p" },
+				{ type: "agent:end", label: "a", status: "completed" },
+				{ type: "agent:start", label: "b", phase: "p" },
+				{ type: "agent:end", label: "b", status: "cached" },
+				{ type: "agent:start", label: "c", phase: "p" },
+				{ type: "agent:end", label: "c", status: "error" },
+				{ type: "agent:start", label: "d", phase: "p" },
+			],
+			[1_100, 1_200, 1_300, 1_400, 1_500, 1_600, 1_700],
+		);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_live0004", createdAt: 1_000 }),
+			progress,
+			now: () => 2_000,
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_live0004" }, ctx());
+		// 1 still running (d), 1 done (a), 1 failed (c), 1 cached (b).
+		expect(out).toContain("1 running / 1 done / 1 failed / 1 cached");
+	});
+
+	test("repeated labels pair chronologically (first-unmatched-start)", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "dup", phase: "p" },
+				{ type: "agent:end", label: "dup", status: "completed" },
+				{ type: "agent:start", label: "dup", phase: "p" },
+				{ type: "agent:end", label: "dup", status: "completed" },
+			],
+			[1_000, 1_300, 1_500, 2_100],
+		);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_live0005", createdAt: 1_000 }),
+			progress,
+			now: () => 3_000,
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_live0005" }, ctx());
+		// First pair: 1300−1000=300ms; second: 2100−1500=600ms — in chronological order.
+		expect(out).toContain("[done] dup (300ms)");
+		expect(out).toContain("[done] dup (600ms)");
+		expect(out.indexOf("(300ms)")).toBeLessThan(out.indexOf("(600ms)"));
+	});
+
+	test("a recovered run (no now view) renders as today — no elapsed header, no counts line", async () => {
+		// Recovered runs are flipped to a terminal status on recovery and carry no
+		// live now() view; the live-only surfaces must stay absent.
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_recov001",
+				status: "error",
+				completedAt: 2_000,
+				error: "interrupted by restart",
+			}),
+			progress: [],
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_recov001" }, ctx());
+		expect(out).not.toContain("running ");
+		expect(out).not.toContain(" running / ");
+	});
+});
+
+describe("createWorkflowStatusTool — live TUI title during wait_ms (Task 6.2.3)", () => {
+	/** A fake interval scheduler the test fires manually (no real 1s wall wait). */
+	function fakeTimers() {
+		const cbs = new Map<number, () => void>();
+		let next = 1;
+		return {
+			cbs,
+			setIntervalFn: (cb: () => void): number => {
+				const id = next;
+				next += 1;
+				cbs.set(id, cb);
+				return id;
+			},
+			clearIntervalFn: (id: unknown): void => {
+				cbs.delete(id as number);
+			},
+			/** Fire every live interval callback once. */
+			tick: () => {
+				for (const cb of cbs.values()) {
+					cb();
+				}
+			},
+		};
+	}
+
+	/** A ToolContext whose metadata({ title }) calls are captured. */
+	function captureCtx(): {
+		context: ToolContext;
+		titles: string[];
+	} {
+		const titles: string[] = [];
+		const context = {
+			sessionID: "ses_parent",
+			metadata: (input: { title?: string }) => {
+				if (input.title !== undefined) {
+					titles.push(input.title);
+				}
+			},
+		} as unknown as ToolContext;
+		return { context, titles };
+	}
+
+	test("a blocked wait with progress emits a metadata title reflecting live counts", async () => {
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "Review" },
+				{ type: "agent:end", label: "a", status: "completed" },
+				{ type: "agent:start", label: "b", phase: "Review" },
+			],
+			[1_100, 1_500, 1_600],
+		);
+		let resolveSettle: () => void = () => {};
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_tui00001",
+				description: "review-changes",
+				status: "running",
+				createdAt: 1_000,
+			}),
+			progress,
+			now: () => 2_000,
+			settled: new Promise<void>((r) => {
+				resolveSettle = r;
+			}),
+		};
+		const engine = fakeEngine([handle]);
+		const timers = fakeTimers();
+		const t = createWorkflowStatusTool(engine, {
+			setIntervalFn: timers.setIntervalFn,
+			clearIntervalFn: timers.clearIntervalFn,
+		});
+		const { context, titles } = captureCtx();
+
+		// Start the blocked call; fire one tick mid-flight, then settle.
+		const pending = (
+			t as unknown as {
+				execute: (
+					a: Record<string, unknown>,
+					c: ToolContext,
+				) => Promise<unknown>;
+			}
+		).execute({ run_id: "wf_tui00001", wait_ms: 5_000 }, context);
+		// Let the execute body register the interval, then fire it.
+		await Promise.resolve();
+		timers.tick();
+		resolveSettle();
+		await pending;
+
+		expect(titles.length).toBeGreaterThan(0);
+		const last = titles[titles.length - 1] ?? "";
+		// Title carries the name, current phase, done/seen agents, and elapsed.
+		expect(last).toContain("review-changes");
+		expect(last).toContain("Review");
+		expect(last).toContain("1/2");
+		await engine.dispose?.();
+	});
+
+	test("the interval is always cleared on settle (no leaked timer)", async () => {
+		let resolveSettle: () => void = () => {};
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_tui00002",
+				status: "running",
+				createdAt: 1_000,
+			}),
+			progress: [],
+			now: () => 2_000,
+			settled: new Promise<void>((r) => {
+				resolveSettle = r;
+			}),
+		};
+		const engine = fakeEngine([handle]);
+		const timers = fakeTimers();
+		const t = createWorkflowStatusTool(engine, {
+			setIntervalFn: timers.setIntervalFn,
+			clearIntervalFn: timers.clearIntervalFn,
+		});
+		const { context } = captureCtx();
+
+		const pending = (
+			t as unknown as {
+				execute: (
+					a: Record<string, unknown>,
+					c: ToolContext,
+				) => Promise<unknown>;
+			}
+		).execute({ run_id: "wf_tui00002", wait_ms: 5_000 }, context);
+		await Promise.resolve();
+		resolveSettle();
+		await pending;
+		// Cleared: no live callbacks remain.
+		expect(timers.cbs.size).toBe(0);
+	});
+
+	test("no interval is registered when wait_ms is 0/absent", async () => {
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_tui00003",
+				status: "running",
+				createdAt: 1_000,
+			}),
+			progress: [],
+			now: () => 2_000,
+			settled: new Promise<void>(() => {}),
+		};
+		const engine = fakeEngine([handle]);
+		const timers = fakeTimers();
+		const t = createWorkflowStatusTool(engine, {
+			setIntervalFn: timers.setIntervalFn,
+			clearIntervalFn: timers.clearIntervalFn,
+		});
+		const { context } = captureCtx();
+		// No wait_ms → immediate snapshot, no interval ever set.
+		await run(t, { run_id: "wf_tui00003" }, context);
+		expect(timers.cbs.size).toBe(0);
+	});
+
+	test("a metadata throw never escapes (host may not implement it)", async () => {
+		let resolveSettle: () => void = () => {};
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_tui00004",
+				status: "running",
+				createdAt: 1_000,
+			}),
+			progress: [],
+			now: () => 2_000,
+			settled: new Promise<void>((r) => {
+				resolveSettle = r;
+			}),
+		};
+		const engine = fakeEngine([handle]);
+		const timers = fakeTimers();
+		const t = createWorkflowStatusTool(engine, {
+			setIntervalFn: timers.setIntervalFn,
+			clearIntervalFn: timers.clearIntervalFn,
+		});
+		const throwingCtx = {
+			sessionID: "ses_parent",
+			metadata: () => {
+				throw new Error("host has no metadata channel");
+			},
+		} as unknown as ToolContext;
+
+		const pending = (
+			t as unknown as {
+				execute: (
+					a: Record<string, unknown>,
+					c: ToolContext,
+				) => Promise<unknown>;
+			}
+		).execute({ run_id: "wf_tui00004", wait_ms: 5_000 }, throwingCtx);
+		await Promise.resolve();
+		// Firing the tick must not throw despite metadata throwing.
+		expect(() => timers.tick()).not.toThrow();
+		resolveSettle();
+		const out = outputText((await pending) as string | { output: string });
+		// Final render still produced.
+		expect(out).toContain("wf_tui00004");
+		expect(timers.cbs.size).toBe(0);
+	});
+});
+
 describe("createWorkflowStatusTool — running tally suppression", () => {
 	test("a running run does NOT append the cached/live tally", async () => {
-		const progress: ProgressEvent[] = [
-			{ type: "agent:start", label: "a", phase: "p" },
-			{ type: "agent:end", label: "a", status: "cached" },
-		];
+		const progress = stamp(
+			[
+				{ type: "agent:start", label: "a", phase: "p" },
+				{ type: "agent:end", label: "a", status: "cached" },
+			],
+			[],
+		);
 		const engine = fakeEngine([
 			{ record: makeRecord({ id: "wf_running01" }), progress },
 		]);

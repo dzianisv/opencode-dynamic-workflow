@@ -50,7 +50,11 @@ import {
 	createSchemaRegistry,
 	type SchemaRegistry,
 } from "../runtime/structured/registry";
-import type { BudgetView, JournalEntry, ProgressEvent } from "../runtime/types";
+import type {
+	BudgetView,
+	JournalEntry,
+	StampedProgressEvent,
+} from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
@@ -96,7 +100,19 @@ export interface RunRecord {
 export interface RunHandle {
 	run?: WorkflowRun;
 	record: RunRecord;
-	progress: ProgressEvent[];
+	/**
+	 * Engine-stamped progress (Task 6.2.1): the runtime emits clock-free
+	 * {@link ProgressEvent}s, the engine stamps each with `at = clock.now()` at its
+	 * onProgress boundary. `workflow_status` reads `at` for per-agent elapsed.
+	 */
+	progress: StampedProgressEvent[];
+	/**
+	 * A live wall-clock view for elapsed rendering (Task 6.2.1). The engine sets it
+	 * to its injected `clock.now` for LIVE runs only — recovered runs (flipped to a
+	 * terminal status on restart, with no in-memory clock) leave it absent, so the
+	 * live-only elapsed/counts surfaces stay off and recovered runs render as today.
+	 */
+	now?: () => number;
 	/**
 	 * The live token budget view (Task 4.3.1), present only when this run was
 	 * launched with `budgetTokens`. `workflow_status` reads it for LIVE spend
@@ -188,6 +204,13 @@ export interface WorkflowEngine {
 	stopRun(runId: string): void;
 	/** Snapshot of a run handle (record + progress), or undefined when unknown. */
 	statusOf(runId: string): RunHandle | undefined;
+	/**
+	 * Live (status `running`) run handles owned by a parent session (Task 6.2.4).
+	 * The chat.message digest hook reads this to prepend a one-line digest per live
+	 * run on the parent's next message. Recovered runs are never `running` (startup
+	 * recovery flips them to error), so they are excluded by construction.
+	 */
+	liveRunsFor(parentSessionID: string): RunHandle[];
 	/** Forward an SDK event to the runner's completion gate. */
 	handleEvent(
 		event: Parameters<SessionRunner["handleEvent"]>[0],
@@ -556,7 +579,14 @@ export function createWorkflowEngine(
 			record.budgetTotal = budget.total ?? undefined;
 		}
 
-		const handle: RunHandle = { record, progress: [], budget };
+		// `now` is the live clock view for elapsed rendering (Task 6.2.1) — present
+		// only while this process owns the run. Recovered handles omit it.
+		const handle: RunHandle = {
+			record,
+			progress: [],
+			now: () => clock.now(),
+			budget,
+		};
 		runs.set(runId, handle);
 		persistRecord(record);
 
@@ -586,7 +616,9 @@ export function createWorkflowEngine(
 			resolveSubWorkflow,
 			...(budget !== undefined ? { budget } : {}),
 			onProgress: (e) => {
-				handle.progress.push(e);
+				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
+				// the timestamp comes from the engine's injected clock here.
+				handle.progress.push({ ...e, at: clock.now() });
 				logger?.debug("workflow progress", { runId, event: e });
 			},
 			replay: {
@@ -655,6 +687,19 @@ export function createWorkflowEngine(
 		return runs.get(runId);
 	}
 
+	function liveRunsFor(parentSessionID: string): RunHandle[] {
+		const out: RunHandle[] = [];
+		for (const handle of runs.values()) {
+			if (
+				handle.record.status === "running" &&
+				handle.record.parentSessionID === parentSessionID
+			) {
+				out.push(handle);
+			}
+		}
+		return out;
+	}
+
 	// Startup recovery: load persisted records, flip stale `running` → error, seed
 	// the queue from terminal records. Runs as a promise `ready()` awaits.
 	const readyPromise = (async () => {
@@ -687,6 +732,7 @@ export function createWorkflowEngine(
 		},
 		stopRun,
 		statusOf,
+		liveRunsFor,
 		handleEvent: (event) => runner.handleEvent(event),
 		dispose: async () => {
 			await readyPromise;

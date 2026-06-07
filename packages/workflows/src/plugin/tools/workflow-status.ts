@@ -15,8 +15,9 @@
  */
 
 import { type ToolContext, tool } from "@opencode-ai/plugin";
-import type { ProgressEvent } from "../../runtime/types";
+import type { StampedProgressEvent } from "../../runtime/types";
 import type { RunHandle, RunRecord, WorkflowEngine } from "../engine";
+import { humanizeDuration } from "../format";
 
 /** Head-truncation ceiling for the rendered result JSON. */
 const RESULT_MAX = 2000;
@@ -25,6 +26,20 @@ const NO_PHASE = "(no phase)";
 
 /** Upper bound on `wait_ms` — two minutes, matching the run-spawn ceiling. */
 const WAIT_MS_CAP = 120_000;
+
+/** Cadence of the live-title refresh while a wait blocks (Task 6.2.3). */
+const TITLE_TICK_MS = 1_000;
+
+/**
+ * Injectable interval scheduler (Task 6.2.3). Defaults to the globals; tests pass
+ * deterministic fakes so the ~1s title tick fires on demand rather than on a real
+ * wall clock. This is a TEST SEAM, not a user-facing config knob — it carries no
+ * default behavior change and is invisible to the tool's args/description.
+ */
+export interface WorkflowStatusTimers {
+	setIntervalFn: (cb: () => void, ms: number) => unknown;
+	clearIntervalFn: (handle: unknown) => void;
+}
 
 /** Coerce a raw arg to string (opencode's raw path may hand a non-string). */
 function coerceId(raw: unknown): string {
@@ -84,22 +99,50 @@ function renderResult(returnValue: unknown): string {
 	return `result: ${json.slice(0, RESULT_MAX)} … (truncated)`;
 }
 
-/** A single chronological pass: phase headers on change + agent/log/warn lines. */
-function renderProgress(progress: ProgressEvent[]): string[] {
-	// First, resolve each agent label's end-status so a start line can render its
-	// terminal marker in place (a start with no end → running).
-	const endStatus = new Map<string, string>();
-	for (const e of progress) {
-		if (e.type === "agent:end") {
-			endStatus.set(e.label, e.status);
+/**
+ * Pair each `agent:start` with its matching `agent:end` by first-unmatched-start
+ * per label (Task 6.2.1). Labels may repeat, so a strict label→last-end map would
+ * mis-attribute status and duration; chronological pairing (consume the earliest
+ * still-open start when an end arrives) is the documented approximation. Returns,
+ * per start event index, the matched end's status (undefined → still running) and
+ * the elapsed `end.at − start.at` (undefined when unmatched).
+ */
+function pairStartsToEnds(
+	progress: StampedProgressEvent[],
+): Map<number, { status?: string; elapsedMs?: number }> {
+	const result = new Map<number, { status?: string; elapsedMs?: number }>();
+	// Per label: a FIFO of open start indices awaiting an end.
+	const open = new Map<string, number[]>();
+	progress.forEach((e, i) => {
+		if (e.type === "agent:start") {
+			result.set(i, {});
+			const queue = open.get(e.label) ?? [];
+			queue.push(i);
+			open.set(e.label, queue);
+		} else if (e.type === "agent:end") {
+			const queue = open.get(e.label);
+			const startIdx = queue?.shift();
+			if (startIdx !== undefined) {
+				const start = progress[startIdx];
+				result.set(startIdx, {
+					status: e.status,
+					elapsedMs: start !== undefined ? e.at - start.at : undefined,
+				});
+			}
 		}
-	}
+	});
+	return result;
+}
+
+/** A single chronological pass: phase headers on change + agent/log/warn lines. */
+function renderProgress(progress: StampedProgressEvent[]): string[] {
+	const paired = pairStartsToEnds(progress);
 
 	const lines: string[] = [];
 	let currentPhase: string | undefined;
 	let phaseEmitted = false;
 
-	for (const e of progress) {
+	progress.forEach((e, i) => {
 		switch (e.type) {
 			case "agent:start": {
 				const phase = e.phase ?? NO_PHASE;
@@ -108,9 +151,16 @@ function renderProgress(progress: ProgressEvent[]): string[] {
 					currentPhase = phase;
 					phaseEmitted = true;
 				}
-				const end = endStatus.get(e.label);
-				const marker = end !== undefined ? endMarker(end) : "running";
-				lines.push(`  [${marker}] ${e.label}`);
+				const match = paired.get(i);
+				const marker =
+					match?.status !== undefined ? endMarker(match.status) : "running";
+				// Per-agent elapsed (Task 6.2.1): only on a settled marker that carries a
+				// paired duration. A still-running agent has no end to pair, so no suffix.
+				const suffix =
+					match?.elapsedMs !== undefined
+						? ` (${humanizeDuration(match.elapsedMs)})`
+						: "";
+				lines.push(`  [${marker}] ${e.label}${suffix}`);
 				break;
 			}
 			case "agent:end":
@@ -123,8 +173,43 @@ function renderProgress(progress: ProgressEvent[]): string[] {
 				lines.push(`  warn: ${e.message}`);
 				break;
 		}
-	}
+	});
 	return lines;
+}
+
+/**
+ * Live per-state tally (Task 6.2.1), counted off the same paired starts/ends as
+ * the progress tree: a start with no matched end is `running`; a matched end maps
+ * `cached`→cached, `completed`→done, anything else→failed.
+ */
+export interface LiveCounts {
+	running: number;
+	done: number;
+	failed: number;
+	cached: number;
+}
+
+/** Tally live per-state counts from stamped progress (Task 6.2.1 / reused by 6.2.3/6.2.4). */
+export function liveCounts(progress: StampedProgressEvent[]): LiveCounts {
+	const paired = pairStartsToEnds(progress);
+	const counts: LiveCounts = { running: 0, done: 0, failed: 0, cached: 0 };
+	// Walk starts by index to read each one's paired result.
+	progress.forEach((e, i) => {
+		if (e.type !== "agent:start") {
+			return;
+		}
+		const match = paired.get(i);
+		if (match?.status === undefined) {
+			counts.running += 1;
+		} else if (match.status === "cached") {
+			counts.cached += 1;
+		} else if (match.status === "completed") {
+			counts.done += 1;
+		} else {
+			counts.failed += 1;
+		}
+	});
+	return counts;
 }
 
 /**
@@ -132,7 +217,7 @@ function renderProgress(progress: ProgressEvent[]): string[] {
  * `cached` was replayed; every other terminal end was a live launch. Counted off
  * the same events the progress tree renders.
  */
-function agentCallTally(progress: ProgressEvent[]): {
+function agentCallTally(progress: StampedProgressEvent[]): {
 	cached: number;
 	live: number;
 } {
@@ -170,6 +255,37 @@ function budgetLine(handle: RunHandle): string | undefined {
 	return `budget: ${spent}/${total} output tokens`;
 }
 
+/** The phase of the most recent `agent:start` (the run's current focus), or undefined. */
+function currentPhase(progress: StampedProgressEvent[]): string | undefined {
+	for (let i = progress.length - 1; i >= 0; i -= 1) {
+		const e = progress[i];
+		if (e !== undefined && e.type === "agent:start") {
+			return e.phase ?? NO_PHASE;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The compact live TUI title (Task 6.2.3): `<name> · <phase> · <done>/<seen>
+ * agents · <elapsed>ms`. `done` = settled agents (done+failed+cached), `seen` =
+ * every started agent; counts come from the same {@link liveCounts} tally as the
+ * status render. The phase segment is omitted when no agent has started yet.
+ */
+function liveTitle(handle: RunHandle, nowMs: number): string {
+	const c = liveCounts(handle.progress);
+	const done = c.done + c.failed + c.cached;
+	const seen = done + c.running;
+	const phase = currentPhase(handle.progress);
+	const elapsed = nowMs - handle.record.createdAt;
+	const segments = [handle.record.description];
+	if (phase !== undefined) {
+		segments.push(phase);
+	}
+	segments.push(`${done}/${seen} agents`, humanizeDuration(elapsed));
+	return segments.join(" · ");
+}
+
 /** Render the full status text for one run handle. */
 function render(handle: RunHandle): string {
 	const record: RunRecord = handle.record;
@@ -180,7 +296,14 @@ function render(handle: RunHandle): string {
 		header += ` — resumed from ${record.resumedFrom}`;
 	}
 	if (terminal && record.completedAt !== undefined) {
-		header += ` (${record.completedAt - record.createdAt}ms)`;
+		header += ` (${humanizeDuration(record.completedAt - record.createdAt)})`;
+	}
+	// LIVE total-elapsed (Task 6.2.1): a running run with a live clock view appends
+	// the elapsed in parens after the status word — `— running (<elapsed>)`
+	// (clock.now() − createdAt). Recovered runs carry no `now` view (and are
+	// terminal anyway), so this surface stays off for them.
+	if (!terminal && handle.now !== undefined) {
+		header += ` (${humanizeDuration(handle.now() - record.createdAt)})`;
 	}
 
 	const parts: string[] = [header];
@@ -188,6 +311,15 @@ function render(handle: RunHandle): string {
 	const progressLines = renderProgress(handle.progress);
 	if (progressLines.length > 0) {
 		parts.push("", ...progressLines);
+	}
+
+	// LIVE counts line (Task 6.2.1): only while running with a live clock view.
+	if (!terminal && handle.now !== undefined) {
+		const c = liveCounts(handle.progress);
+		parts.push(
+			"",
+			`${c.running} running / ${c.done} done / ${c.failed} failed / ${c.cached} cached`,
+		);
 	}
 
 	const budget = budgetLine(handle);
@@ -211,7 +343,17 @@ function render(handle: RunHandle): string {
 	return parts.join("\n");
 }
 
-export function createWorkflowStatusTool(engine: WorkflowEngine) {
+export function createWorkflowStatusTool(
+	engine: WorkflowEngine,
+	timers?: WorkflowStatusTimers,
+) {
+	const setIntervalFn =
+		timers?.setIntervalFn ??
+		((cb: () => void, ms: number) => setInterval(cb, ms));
+	const clearIntervalFn =
+		timers?.clearIntervalFn ??
+		((handle: unknown) =>
+			clearInterval(handle as ReturnType<typeof setInterval>));
 	return tool({
 		description:
 			"Inspect a workflow run by run_id: live progress (phase groups, agent " +
@@ -233,7 +375,7 @@ export function createWorkflowStatusTool(engine: WorkflowEngine) {
 						"before rendering. Omit or 0 to read the current snapshot immediately.",
 				),
 		},
-		async execute(args, _context: ToolContext) {
+		async execute(args, context: ToolContext) {
 			const runId = coerceId(args.run_id);
 			const handle = engine.statusOf(runId);
 			if (handle === undefined) {
@@ -250,7 +392,31 @@ export function createWorkflowStatusTool(engine: WorkflowEngine) {
 				handle.record.status === "running" &&
 				handle.settled !== undefined
 			) {
-				await Promise.race([handle.settled, timeout(waitMs)]);
+				// Live TUI title (Task 6.2.3): while blocked, push a compact title on a
+				// ~1s interval — the ONLY live-display channel a plugin gets. `metadata`
+				// is best-effort (a host may not implement it), so every call is fenced;
+				// the interval is ALWAYS cleared in `finally` so the timer never leaks.
+				// Only when `now` is present (a live, in-this-process run) — recovered
+				// runs have no clock view and would render a meaningless elapsed.
+				const setTitle = (): void => {
+					if (handle.now === undefined) {
+						return;
+					}
+					try {
+						context.metadata({ title: liveTitle(handle, handle.now()) });
+					} catch {
+						// Host has no metadata channel (or it threw) — never propagate.
+					}
+				};
+				const ticker = setIntervalFn(setTitle, TITLE_TICK_MS);
+				try {
+					// Paint once immediately so the title reflects state before the first
+					// tick, then race settle vs timeout as before.
+					setTitle();
+					await Promise.race([handle.settled, timeout(waitMs)]);
+				} finally {
+					clearIntervalFn(ticker);
+				}
 			}
 			return render(handle);
 		},
