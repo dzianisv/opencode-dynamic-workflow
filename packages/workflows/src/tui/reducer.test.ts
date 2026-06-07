@@ -1,0 +1,368 @@
+import { describe, expect, test } from "bun:test";
+import type { FeedEvent } from "../plugin/feed";
+import {
+	createRunStateReducer,
+	parseFeedLine,
+	type RunViewState,
+} from "./reducer";
+
+/**
+ * Tests for the feed parser + run-state reducer (Task 8.3.1). The reducer is a
+ * pure fold over already-parsed `FeedEvent[]` — no clock, no io — so every test
+ * hand-builds a feed and asserts the resulting model. The pairing rules MIRROR
+ * `workflow-status.ts` exactly so the on-disk feed view and the in-memory handle
+ * view agree (concurrent same-label agents keep their own sessionID-bound stats).
+ */
+
+/** Reduce a feed in file order and return the final view state. */
+function reduce(events: FeedEvent[]): RunViewState {
+	const reducer = createRunStateReducer();
+	for (const e of events) {
+		reducer.apply(e);
+	}
+	return reducer.state();
+}
+
+describe("parseFeedLine", () => {
+	test("parses each FeedEvent member to its typed event", () => {
+		const lines: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_1", parentSessionID: "ses_p", at: 1 },
+			{ type: "agent:start", label: "impl", phase: "build", at: 2 },
+			{
+				type: "agent:launched",
+				label: "impl",
+				phase: "build",
+				sessionID: "ses_a",
+				model: "anthropic/claude-opus-4-8",
+				agentType: "build",
+				at: 3,
+			},
+			{
+				type: "agent:stats",
+				label: "impl",
+				sessionID: "ses_a",
+				tokens: {
+					input: 10,
+					output: 2,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 1,
+				lastTools: ["read(foo.ts)"],
+				at: 4,
+			},
+			{
+				type: "agent:end",
+				label: "impl",
+				status: "completed",
+				sessionID: "ses_a",
+				at: 5,
+			},
+			{ type: "run:cancel-requested", runId: "wf_1", at: 6 },
+			{ type: "run:end", status: "completed", at: 7 },
+			{ type: "log", message: "hi", at: 8 },
+			{ type: "warn", message: "careful", at: 9 },
+		];
+		for (const line of lines) {
+			expect(parseFeedLine(JSON.stringify(line))).toEqual(line);
+		}
+	});
+
+	test("returns undefined for a truncated half-line", () => {
+		const full = JSON.stringify({
+			type: "run:start",
+			runId: "wf_1",
+			parentSessionID: "ses_p",
+			at: 1,
+		});
+		const half = full.slice(0, Math.floor(full.length / 2));
+		expect(parseFeedLine(half)).toBeUndefined();
+	});
+
+	test("returns undefined for an unknown type", () => {
+		expect(
+			parseFeedLine(JSON.stringify({ type: "something:else" })),
+		).toBeUndefined();
+	});
+
+	test("returns undefined for a missing/non-string type", () => {
+		expect(parseFeedLine(JSON.stringify({ at: 1 }))).toBeUndefined();
+		expect(parseFeedLine(JSON.stringify({ type: 42 }))).toBeUndefined();
+	});
+
+	test("returns undefined for non-JSON and for a JSON non-object", () => {
+		expect(parseFeedLine("{not json")).toBeUndefined();
+		expect(parseFeedLine("42")).toBeUndefined();
+		expect(parseFeedLine("null")).toBeUndefined();
+		expect(parseFeedLine('"a string"')).toBeUndefined();
+	});
+});
+
+describe("createRunStateReducer — full multi-phase feed", () => {
+	const tokens = (over: Partial<Record<string, number>> = {}) => ({
+		input: 0,
+		output: 0,
+		reasoning: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		...over,
+	});
+
+	const feed: FeedEvent[] = [
+		{ type: "run:start", runId: "wf_run", parentSessionID: "ses_p", at: 100 },
+		// Phase "build": one live agent + one cached agent.
+		{ type: "agent:start", label: "impl", phase: "build", at: 110 },
+		{
+			type: "agent:launched",
+			label: "impl",
+			phase: "build",
+			sessionID: "ses_impl",
+			model: "anthropic/claude-opus-4-8",
+			agentType: "build",
+			at: 120,
+		},
+		{
+			type: "agent:stats",
+			label: "impl",
+			sessionID: "ses_impl",
+			tokens: tokens({ input: 50, output: 10 }),
+			toolCalls: 2,
+			lastTools: ["read(a.ts)", "edit(a.ts)"],
+			at: 130,
+		},
+		{
+			type: "agent:end",
+			label: "impl",
+			status: "completed",
+			sessionID: "ses_impl",
+			durationMs: 80,
+			tokens: tokens({ input: 60, output: 12, reasoning: 1 }),
+			toolCalls: 3,
+			model: "anthropic/claude-opus-4-8",
+			agentType: "build",
+			at: 200,
+		} as FeedEvent,
+		// A cached end (no sessionID, no stats).
+		{ type: "agent:start", label: "cachedwork", phase: "build", at: 205 },
+		{ type: "agent:end", label: "cachedwork", status: "cached", at: 206 },
+		// Phase "review": one live agent.
+		{ type: "agent:start", label: "review", phase: "review", at: 210 },
+		{
+			type: "agent:launched",
+			label: "review",
+			phase: "review",
+			sessionID: "ses_review",
+			model: "anthropic/claude-sonnet-4-5",
+			agentType: "review",
+			at: 220,
+		},
+		{
+			type: "agent:end",
+			label: "review",
+			status: "completed",
+			sessionID: "ses_review",
+			durationMs: 40,
+			tokens: tokens({ input: 30, output: 5 }),
+			toolCalls: 1,
+			model: "anthropic/claude-sonnet-4-5",
+			agentType: "review",
+			at: 260,
+		} as FeedEvent,
+		{ type: "run:end", status: "completed", at: 300 },
+	];
+
+	test("sets runId/startedAt/endedAt and terminal status", () => {
+		const s = reduce(feed);
+		expect(s.runId).toBe("wf_run");
+		expect(s.startedAt).toBe(100);
+		expect(s.endedAt).toBe(300);
+		expect(s.status).toBe("completed");
+	});
+
+	test("groups agents by phase with first-appearance order", () => {
+		const s = reduce(feed);
+		expect(s.phases.map((p) => p.name)).toEqual(["build", "review"]);
+	});
+
+	test("computes phase done/total/marker", () => {
+		const s = reduce(feed);
+		const build = s.phases[0];
+		const review = s.phases[1];
+		expect(build?.total).toBe(2);
+		expect(build?.done).toBe(2);
+		expect(build?.marker).toBe("✓");
+		expect(review?.total).toBe(1);
+		expect(review?.done).toBe(1);
+		expect(review?.marker).toBe("✓");
+	});
+
+	test("closes the live agent with enriched duration and summed tokens", () => {
+		const s = reduce(feed);
+		const impl = s.phases[0]?.agents.find((a) => a.label === "impl");
+		expect(impl?.status).toBe("completed");
+		expect(impl?.durationMs).toBe(80);
+		expect(impl?.model).toBe("anthropic/claude-opus-4-8");
+		expect(impl?.sessionID).toBe("ses_impl");
+		// 60 + 12 + 1 + 0 + 0 (the enriched end's snapshot, summed).
+		expect(impl?.tokens).toBe(73);
+		expect(impl?.toolCalls).toBe(3);
+	});
+
+	test("renders a cached end with no stats", () => {
+		const s = reduce(feed);
+		const cached = s.phases[0]?.agents.find((a) => a.label === "cachedwork");
+		expect(cached?.status).toBe("cached");
+		expect(cached?.tokens).toBeUndefined();
+		expect(cached?.sessionID).toBeUndefined();
+	});
+});
+
+describe("createRunStateReducer — concurrent same-label agents", () => {
+	const tokens = (input: number) => ({
+		input,
+		output: 0,
+		reasoning: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+	});
+
+	test("each occurrence retains its OWN sessionID-bound stats", () => {
+		const feed: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_c", parentSessionID: "ses_p", at: 1 },
+			{ type: "agent:start", label: "rev", phase: "fan", at: 10 },
+			{ type: "agent:start", label: "rev", phase: "fan", at: 11 },
+			{
+				type: "agent:launched",
+				label: "rev",
+				phase: "fan",
+				sessionID: "ses_1",
+				model: "m1",
+				at: 12,
+			},
+			{
+				type: "agent:launched",
+				label: "rev",
+				phase: "fan",
+				sessionID: "ses_2",
+				model: "m2",
+				at: 13,
+			},
+			{
+				type: "agent:stats",
+				label: "rev",
+				sessionID: "ses_2",
+				tokens: tokens(200),
+				toolCalls: 9,
+				lastTools: ["grep(x)"],
+				at: 14,
+			},
+			{
+				type: "agent:stats",
+				label: "rev",
+				sessionID: "ses_1",
+				tokens: tokens(100),
+				toolCalls: 4,
+				lastTools: ["read(y)"],
+				at: 15,
+			},
+			// Ends arrive in COMPLETION order (ses_2 first), each carrying its sessionID.
+			{
+				type: "agent:end",
+				label: "rev",
+				status: "completed",
+				sessionID: "ses_2",
+				durationMs: 50,
+				tokens: tokens(220),
+				toolCalls: 10,
+				at: 60,
+			} as FeedEvent,
+			{
+				type: "agent:end",
+				label: "rev",
+				status: "completed",
+				sessionID: "ses_1",
+				durationMs: 90,
+				tokens: tokens(110),
+				toolCalls: 5,
+				at: 100,
+			} as FeedEvent,
+			{ type: "run:end", status: "completed", at: 200 },
+		];
+		const s = reduce(feed);
+		const agents = s.phases[0]?.agents ?? [];
+		expect(agents.length).toBe(2);
+		const bySession = new Map(agents.map((a) => [a.sessionID, a]));
+		expect(bySession.get("ses_1")?.model).toBe("m1");
+		expect(bySession.get("ses_1")?.tokens).toBe(110);
+		expect(bySession.get("ses_1")?.toolCalls).toBe(5);
+		expect(bySession.get("ses_1")?.durationMs).toBe(90);
+		expect(bySession.get("ses_2")?.model).toBe("m2");
+		expect(bySession.get("ses_2")?.tokens).toBe(220);
+		expect(bySession.get("ses_2")?.toolCalls).toBe(10);
+		expect(bySession.get("ses_2")?.durationMs).toBe(50);
+	});
+});
+
+describe("createRunStateReducer — cancel-requested then terminal", () => {
+	test("flips to cancelling, then settles to the terminal status", () => {
+		const reducer = createRunStateReducer();
+		reducer.apply({
+			type: "run:start",
+			runId: "wf_x",
+			parentSessionID: "ses_p",
+			at: 1,
+		});
+		reducer.apply({ type: "agent:start", label: "a", phase: "p", at: 2 });
+		reducer.apply({ type: "run:cancel-requested", runId: "wf_x", at: 3 });
+		expect(reducer.state().status).toBe("cancelling");
+		reducer.apply({ type: "run:end", status: "cancelled", at: 4 });
+		expect(reducer.state().status).toBe("cancelled");
+		expect(reducer.state().endedAt).toBe(4);
+	});
+});
+
+describe("createRunStateReducer — in-flight prefix (no run:end)", () => {
+	test("yields a coherent running state with open occurrences", () => {
+		const feed: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_p", parentSessionID: "ses_p", at: 1 },
+			{ type: "agent:start", label: "impl", phase: "build", at: 10 },
+			{
+				type: "agent:launched",
+				label: "impl",
+				phase: "build",
+				sessionID: "ses_impl",
+				model: "anthropic/claude-opus-4-8",
+				at: 20,
+			},
+			{
+				type: "agent:stats",
+				label: "impl",
+				sessionID: "ses_impl",
+				tokens: {
+					input: 40,
+					output: 8,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+				toolCalls: 2,
+				lastTools: ["read(z.ts)"],
+				at: 30,
+			},
+		];
+		const s = reduce(feed);
+		expect(s.status).toBe("running");
+		expect(s.endedAt).toBeUndefined();
+		const impl = s.phases[0]?.agents[0];
+		expect(impl?.status).toBeUndefined();
+		expect(impl?.sessionID).toBe("ses_impl");
+		// Live stats from the throttled agent:stats line (48 total).
+		expect(impl?.tokens).toBe(48);
+		expect(impl?.toolCalls).toBe(2);
+		expect(impl?.lastTools).toEqual(["read(z.ts)"]);
+		expect(s.phases[0]?.done).toBe(0);
+		expect(s.phases[0]?.total).toBe(1);
+		expect(s.phases[0]?.marker).toBe("…");
+	});
+});

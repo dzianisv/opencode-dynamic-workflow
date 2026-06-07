@@ -1272,7 +1272,7 @@ interface SessionRunner {
 
 #### Task 8.3.1: Feed parser + run-state reducer — JSONL lines → phases/agents/stats model
 
-- [ ] Done
+- [x] Done
 
 **Context:** the feed file is the viewer's ONLY data source (Phase 8 binding decision). Each `<dataDir>/workflow-feed/<runId>.jsonl` line is one `FeedEvent` (`packages/workflows/src/plugin/feed.ts:118-124`): `RunStartLine` (`feed.ts:56-63`), `RunCancelRequestedLine` (`feed.ts:71-75`), `RunEndLine` (`feed.ts:78-89`), `AgentStatsLine` (`feed.ts:99-117`), or an `EnrichedProgressEvent` (`feed.ts:39-54` — a `StampedProgressEvent` plus, for live `agent:end`, `durationMs`/`tokens`/`toolCalls`/`model`/`agentType`). The underlying `ProgressEvent` union (`packages/workflows/src/runtime/types.ts:53-98`) carries `agent:start {label,phase?}`, `agent:launched {label,phase?,sessionID,model?,agentType?}`, `agent:end {label,status,sessionID?,note?}`, `log`, `warn`; every line carries `at: number` (engine clock). The server-side `workflow_status` already reduces the SAME logical stream from the in-memory handle: it pairs starts→ends in order (`packages/workflows/src/plugin/tools/workflow-status.ts:323`), groups by phase under a `(no phase)` bucket (`workflow-status.ts:51`), builds an `AgentRow` (`workflow-status.ts:224-243`), and formats with `formatTokens`/`formatDuration`/`shortModel`/`statusMarker`/`totalTokens` (`workflow-status.ts:123-219`). The viewer cannot import that tool (it reaches into a live `WorkflowEngine`); it must reduce the on-disk feed independently but to a structurally equivalent model. There is NO existing feed reader anywhere in the repo — this task is the first.
 

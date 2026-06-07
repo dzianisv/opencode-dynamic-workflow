@@ -20,6 +20,14 @@
  */
 
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import {
+	formatDuration,
+	formatTokens,
+	phaseMarker,
+	shortModel,
+	statusMarker,
+	totalTokens,
+} from "../../tui/format";
 import type {
 	AgentSummary,
 	RunHandle,
@@ -32,6 +40,11 @@ import type {
 	SessionStatsSnapshot,
 	SessionTokenSnapshot,
 } from "../session-stats";
+
+// Re-export the CC-tree formatting helpers from their shared home (Task 8.3.1).
+// They moved to `src/tui/format.ts` so the textual tool and the native TUI reducer
+// format identically; the names stay importable from here for existing consumers.
+export { formatDuration, formatTokens } from "../../tui/format";
 
 /**
  * The engine's live per-session stats lookup, narrowed to the tool's needs (Task
@@ -110,92 +123,6 @@ function timeout(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
-}
-
-/**
- * Format a token total the way CC's `/workflows` tree shows it — ONE human number
- * (Task 8.1.5). Below 1k → the bare integer (`999`); 1k–1M → one decimal of
- * thousands (`112_700 → "112.7k"`); ≥1M → one decimal of millions (`1_234_567 →
- * "1.2M"`). Negative/non-finite inputs clamp to `0` (a display path never shows
- * `NaN`). The input is the SUM of every token field — input + output + reasoning
- * + cache.read + cache.write — so it mirrors the single number CC prints.
- */
-export function formatTokens(total: number): string {
-	if (!Number.isFinite(total) || total <= 0) {
-		return "0";
-	}
-	if (total < 1000) {
-		return String(Math.round(total));
-	}
-	if (total < 1_000_000) {
-		return `${(total / 1000).toFixed(1)}k`;
-	}
-	return `${(total / 1_000_000).toFixed(1)}M`;
-}
-
-/**
- * Format a duration the way CC's tree shows it — spaced h/m/s with leading zero
- * units dropped (Task 8.1.5): `428_000ms → "7m 8s"`, `8_000 → "8s"`, `120_000 →
- * "2m"`, `3_661_000 → "1h 1m 1s"`. This is intentionally DISTINCT from
- * {@link humanizeDuration} (the compact `7m8s`/`1h03m` band the header and live
- * title use); the agent tree mirrors CC's spaced form. Floors to whole seconds;
- * negative/non-finite inputs clamp to `0s`.
- */
-export function formatDuration(ms: number): string {
-	if (!Number.isFinite(ms) || ms <= 0) {
-		return "0s";
-	}
-	const totalSeconds = Math.floor(ms / 1000);
-	const hours = Math.floor(totalSeconds / 3600);
-	const minutes = Math.floor((totalSeconds % 3600) / 60);
-	const seconds = totalSeconds % 60;
-	const parts: string[] = [];
-	if (hours > 0) {
-		parts.push(`${hours}h`);
-	}
-	if (minutes > 0) {
-		parts.push(`${minutes}m`);
-	}
-	// Show seconds unless a larger unit already carries the value (e.g. `2m`, `1h`).
-	if (seconds > 0 || parts.length === 0) {
-		parts.push(`${seconds}s`);
-	}
-	return parts.join(" ");
-}
-
-/** Sum every token field into the one number {@link formatTokens} renders. */
-function totalTokens(t: SessionTokenSnapshot): number {
-	return t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite;
-}
-
-/**
- * Strip the provider prefix from a model id for the CC-style short form (Task
- * 8.1.5): `anthropic/claude-opus-4-8 → "opus-4-8"`. CC drops the provider AND the
- * vendor's `claude-`/`gpt-`-style family prefix, keeping the human-recognizable
- * tail. We drop the provider (everything up to and including the last `/`) and a
- * leading `claude-` if present; everything else passes through verbatim.
- */
-function shortModel(model: string): string {
-	const afterSlash = model.slice(model.lastIndexOf("/") + 1);
-	return afterSlash.startsWith("claude-")
-		? afterSlash.slice("claude-".length)
-		: afterSlash;
-}
-
-/** The CC-style per-status marker for an agent row and phase header. */
-const MARK_DONE = "✓";
-const MARK_FAIL = "✗";
-const MARK_RUNNING = "…";
-
-/** Map an agent's status word onto its row marker. `undefined` → still running. */
-function statusMarker(status: string | undefined): string {
-	if (status === undefined) {
-		return MARK_RUNNING;
-	}
-	if (status === "completed" || status === "cached") {
-		return MARK_DONE;
-	}
-	return MARK_FAIL;
 }
 
 /**
@@ -529,21 +456,6 @@ function renderAgentRow(row: AgentRow): string[] {
 		);
 	}
 	return lines;
-}
-
-/** The phase-header marker: ✗ if any failed, … if any running, ✓ otherwise (Task 8.1.5). */
-function phaseMarker(rows: AgentRow[]): string {
-	const anyFailed = rows.some(
-		(r) =>
-			r.status !== undefined &&
-			r.status !== "completed" &&
-			r.status !== "cached",
-	);
-	if (anyFailed) {
-		return MARK_FAIL;
-	}
-	const anyRunning = rows.some((r) => r.status === undefined);
-	return anyRunning ? MARK_RUNNING : MARK_DONE;
 }
 
 /**
