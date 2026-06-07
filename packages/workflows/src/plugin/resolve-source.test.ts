@@ -68,4 +68,15 @@ describe("createSourceResolver — scriptPath ref", () => {
 		const resolve = createSourceResolver({ directory: DIR, fs });
 		await expect(resolve({ scriptPath: "nope.js" })).rejects.toThrow();
 	});
+
+	test("absolute { scriptPath } outside the project dir resolves verbatim", async () => {
+		// The `workflow` tool hands the model the persisted ABSOLUTE script path for
+		// the iterate/resume loop. An absolute path must be read as-is, NOT re-rooted
+		// at the project directory.
+		const abs =
+			"/Users/x/.local/share/opencode-drawers/workflow-scripts/wf_abc.js";
+		const fs = makeFs({ [abs]: "ABS SOURCE" });
+		const resolve = createSourceResolver({ directory: DIR, fs });
+		await expect(resolve({ scriptPath: abs })).resolves.toBe("ABS SOURCE");
+	});
 });

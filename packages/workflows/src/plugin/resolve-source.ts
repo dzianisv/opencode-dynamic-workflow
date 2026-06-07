@@ -77,7 +77,12 @@ export function createSourceResolver(
 		if (typeof nameOrRef === "string") {
 			return loadSavedWorkflow(fs, wfDir, nameOrRef);
 		}
-		const abs = joinPath(directory, nameOrRef.scriptPath);
+		// An absolute scriptPath (e.g. the persisted path the `workflow` tool hands
+		// back for the iterate/resume loop) is used verbatim; relative paths root at
+		// the project directory.
+		const abs = nameOrRef.scriptPath.startsWith("/")
+			? nameOrRef.scriptPath
+			: joinPath(directory, nameOrRef.scriptPath);
 		try {
 			return await fs.readFile(abs, "utf-8");
 		} catch (err) {
