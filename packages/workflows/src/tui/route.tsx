@@ -42,7 +42,11 @@ import {
 	type PhaseView,
 	type RunViewState,
 } from "./reducer";
+import { type RunsFs, resolveRunId } from "./runs";
 import { createFeedTailer } from "./tailer";
+
+/** The real readdir/stat seam the route hands {@link resolveRunId}. */
+const runsFs: RunsFs = { readdir, stat };
 
 const FEED_SUFFIX = ".jsonl";
 
@@ -57,43 +61,6 @@ export interface WorkflowsRouteProps {
 	controlDir: string;
 	/** Route params; `runId` selects the feed file (else most-recently-modified). */
 	params?: Record<string, unknown>;
-}
-
-/**
- * Resolve which feed file to open: the explicit `runId` param when present, else the
- * most-recently-modified `<runId>.jsonl` in the feed dir (a glance defaults to the
- * freshest run, per the open-command contract). A missing/empty dir yields
- * `undefined` — the route renders an empty state and the tailer waits for a file.
- */
-async function resolveRunId(
-	feedDir: string,
-	explicit: unknown,
-): Promise<string | undefined> {
-	if (typeof explicit === "string" && explicit.length > 0) {
-		return explicit;
-	}
-	let names: string[];
-	try {
-		names = await readdir(feedDir);
-	} catch {
-		return undefined;
-	}
-	let newest: { runId: string; mtimeMs: number } | undefined;
-	for (const name of names) {
-		if (!name.endsWith(FEED_SUFFIX)) {
-			continue;
-		}
-		try {
-			const info = await stat(join(feedDir, name));
-			const mtimeMs = info.mtimeMs;
-			if (newest === undefined || mtimeMs > newest.mtimeMs) {
-				newest = { runId: name.slice(0, -FEED_SUFFIX.length), mtimeMs };
-			}
-		} catch {
-			// A file vanishing mid-scan is harmless — skip it.
-		}
-	}
-	return newest?.runId;
 }
 
 /** Build one CC-style agent row string (marker + label + model + stats). */
@@ -152,11 +119,21 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 
 	let tailer: ReturnType<typeof createFeedTailer> | undefined;
 	let disposeLayer: (() => void) | undefined;
+	// Set in onCleanup. The mount IIFE awaits an async dir scan before it can assign
+	// and start the tailer; if the route unmounts inside that window, onCleanup runs
+	// with `tailer` still undefined (a no-op) and the IIFE would otherwise resume and
+	// arm a watcher nobody stops. The flag lets the IIFE bail/stop after the await.
+	let disposed = false;
 
 	onMount(() => {
 		void (async () => {
-			const id = await resolveRunId(props.feedDir, props.params?.runId);
-			if (id === undefined) {
+			const id = await resolveRunId(
+				props.feedDir,
+				props.params?.runId,
+				runsFs,
+				join,
+			);
+			if (id === undefined || disposed) {
 				return;
 			}
 			setRunId(id);
@@ -168,6 +145,12 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				},
 			});
 			await tailer.start();
+			// The route may have unmounted during start()'s initial read — if so,
+			// onCleanup already ran (when `tailer` was undefined) and will never call
+			// stop(), so stop the freshly-armed tailer here.
+			if (disposed) {
+				tailer.stop();
+			}
 		})();
 
 		disposeLayer = props.api.keymap.registerLayer({
@@ -215,6 +198,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 	});
 
 	onCleanup(() => {
+		disposed = true;
 		tailer?.stop();
 		disposeLayer?.();
 	});
@@ -267,13 +251,29 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		);
 	}
 
-	/** `x` writes the cancel sentinel for the open run (the exact 8.2 external touch). */
+	/**
+	 * `x` writes the cancel sentinel for the open run (the exact 8.2 external touch).
+	 * A failed sentinel write (read-only mount, permission denial, disk full) is
+	 * surfaced as an error toast and never allowed to become an unhandled rejection —
+	 * the user must know the cancel did not land, mirroring the tailer's `onError`
+	 * fencing and the engine's "an fs failure must never break a run" stance.
+	 */
 	async function cancelSelected(): Promise<void> {
 		const id = runId();
 		if (id === undefined) {
 			return;
 		}
-		await writeCancelSentinel({ controlDir: props.controlDir, runId: id });
+		try {
+			await writeCancelSentinel({ controlDir: props.controlDir, runId: id });
+		} catch (err) {
+			props.api.ui.toast({
+				variant: "error",
+				title: "Cancel failed",
+				message: `Could not write the cancel sentinel for ${id}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			});
+		}
 	}
 
 	return (

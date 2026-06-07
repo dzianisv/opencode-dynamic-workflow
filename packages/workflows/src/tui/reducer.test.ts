@@ -219,6 +219,82 @@ describe("createRunStateReducer — full multi-phase feed", () => {
 	});
 });
 
+describe("createRunStateReducer — state() yields fresh AgentView snapshots", () => {
+	// The route renders agents through Solid's <For>, which memoizes per item
+	// REFERENCE. If state() reused the same AgentView object across calls, an agent
+	// whose stats/status changed in place would keep its object identity and the row
+	// would freeze (the Epic's live-update headline). state() must return a NEW
+	// AgentView object on each call so identity changes drive a re-render.
+	test("a re-read after an in-place mutation returns a new AgentView identity with the new values", () => {
+		const reducer = createRunStateReducer();
+		reducer.apply({
+			type: "run:start",
+			runId: "wf_live",
+			parentSessionID: "ses_p",
+			at: 1,
+		});
+		reducer.apply({
+			type: "agent:start",
+			label: "impl",
+			phase: "build",
+			at: 10,
+		});
+		reducer.apply({
+			type: "agent:launched",
+			label: "impl",
+			phase: "build",
+			sessionID: "ses_impl",
+			model: "anthropic/claude-opus-4-8",
+			at: 20,
+		});
+
+		const before = reducer.state().phases[0]?.agents[0];
+		expect(before?.status).toBeUndefined();
+		expect(before?.tokens).toBeUndefined();
+
+		// A live stats line mutates the occurrence in place internally.
+		reducer.apply({
+			type: "agent:stats",
+			label: "impl",
+			sessionID: "ses_impl",
+			tokens: {
+				input: 40,
+				output: 8,
+				reasoning: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			toolCalls: 2,
+			lastTools: ["read(z.ts)"],
+			at: 30,
+		});
+
+		const after = reducer.state().phases[0]?.agents[0];
+		// Identity must change so <For> re-renders the row.
+		expect(after).not.toBe(before);
+		// And the snapshot must carry the new live values.
+		expect(after?.tokens).toBe(48);
+		expect(after?.toolCalls).toBe(2);
+		// The earlier snapshot stays frozen (it is a copy, not the live object).
+		expect(before?.tokens).toBeUndefined();
+	});
+
+	test("each state() call returns distinct AgentView objects even with no change", () => {
+		const reducer = createRunStateReducer();
+		reducer.apply({
+			type: "run:start",
+			runId: "wf_id",
+			parentSessionID: "ses_p",
+			at: 1,
+		});
+		reducer.apply({ type: "agent:start", label: "a", phase: "p", at: 2 });
+		const first = reducer.state().phases[0]?.agents[0];
+		const second = reducer.state().phases[0]?.agents[0];
+		expect(first).not.toBe(second);
+		expect(first).toEqual(second);
+	});
+});
+
 describe("createRunStateReducer — concurrent same-label agents", () => {
 	const tokens = (input: number) => ({
 		input,
@@ -323,6 +399,78 @@ describe("createRunStateReducer — cancel-requested then terminal", () => {
 	});
 });
 
+describe("createRunStateReducer — failure path (✗ marker + error terminal)", () => {
+	// The reducer is the core of a live-observability viewer; surfacing failures is its
+	// job. A phase with one failed and one completed sibling must read ✗ (any-failed
+	// dominates), the failed occurrence keeps status "error", the failure counts as a
+	// terminal occurrence in done, and a run:end status "error" settles the run "error".
+	test("a failed agent among a completed sibling marks the phase ✗ and the run error", () => {
+		const tokens = (input: number) => ({
+			input,
+			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		const feed: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_err", parentSessionID: "ses_p", at: 1 },
+			{ type: "agent:start", label: "ok", phase: "build", at: 10 },
+			{
+				type: "agent:launched",
+				label: "ok",
+				phase: "build",
+				sessionID: "ses_ok",
+				model: "anthropic/claude-opus-4-8",
+				at: 11,
+			},
+			{ type: "agent:start", label: "boom", phase: "build", at: 12 },
+			{
+				type: "agent:launched",
+				label: "boom",
+				phase: "build",
+				sessionID: "ses_boom",
+				model: "anthropic/claude-opus-4-8",
+				at: 13,
+			},
+			{
+				type: "agent:end",
+				label: "ok",
+				status: "completed",
+				sessionID: "ses_ok",
+				durationMs: 50,
+				tokens: tokens(30),
+				toolCalls: 1,
+				at: 60,
+			} as FeedEvent,
+			{
+				type: "agent:end",
+				label: "boom",
+				status: "error",
+				sessionID: "ses_boom",
+				note: "boom failed",
+				durationMs: 20,
+				at: 70,
+			} as FeedEvent,
+			{ type: "run:end", status: "error", at: 100 },
+		];
+		const s = reduce(feed);
+		expect(s.status).toBe("error");
+		expect(s.endedAt).toBe(100);
+		const build = s.phases[0];
+		expect(build?.name).toBe("build");
+		// Both occurrences are terminal (one ok, one error) → done counts both.
+		expect(build?.done).toBe(2);
+		expect(build?.total).toBe(2);
+		// Any-failed dominates the phase marker even with a completed sibling.
+		expect(build?.marker).toBe("✗");
+		const boom = build?.agents.find((a) => a.label === "boom");
+		expect(boom?.status).toBe("error");
+		expect(boom?.note).toBe("boom failed");
+		const ok = build?.agents.find((a) => a.label === "ok");
+		expect(ok?.status).toBe("completed");
+	});
+});
+
 describe("summarize — sidebar one-line run summary (Task 8.3.4)", () => {
 	const tokens = (input: number) => ({
 		input,
@@ -375,26 +523,27 @@ describe("summarize — sidebar one-line run summary (Task 8.3.4)", () => {
 		},
 	];
 
-	test("aggregates active/total agents and running status for an in-flight run", () => {
+	test("aggregates done/total agents and running status for an in-flight run", () => {
 		const state = reduce(inflightFeed);
 		// `now` is supplied by the caller (the reducer is clock-free): 5000 - 1000.
 		const summary = summarize(state, 5000);
 		expect(summary.runId).toBe("wf_summ");
 		expect(summary.status).toBe("running");
 		expect(summary.totalAgents).toBe(3);
-		// One of three agents has settled (`impl`); two are still running.
-		expect(summary.activeAgents).toBe(2);
+		// One of three agents has settled (`impl`); the leading number is the DONE count
+		// (CC's `done/total` parity), so 1 of 3 finished.
+		expect(summary.doneAgents).toBe(1);
 		expect(summary.elapsedMs).toBe(4000);
 	});
 
-	test("interposes cancelling and still counts active agents", () => {
+	test("interposes cancelling and still counts done agents", () => {
 		const state = reduce([
 			...inflightFeed,
 			{ type: "run:cancel-requested", runId: "wf_summ", at: 2000 },
 		]);
 		const summary = summarize(state, 5000);
 		expect(summary.status).toBe("cancelling");
-		expect(summary.activeAgents).toBe(2);
+		expect(summary.doneAgents).toBe(1);
 	});
 
 	test("summarizes a settled run with terminal status and feed-derived elapsed", () => {
@@ -422,7 +571,7 @@ describe("summarize — sidebar one-line run summary (Task 8.3.4)", () => {
 		// A settled run ignores `now` and uses endedAt - startedAt (1500 - 1000).
 		const summary = summarize(state, 999_999);
 		expect(summary.status).toBe("completed");
-		expect(summary.activeAgents).toBe(0);
+		expect(summary.doneAgents).toBe(3);
 		expect(summary.totalAgents).toBe(3);
 		expect(summary.elapsedMs).toBe(500);
 	});
@@ -431,7 +580,7 @@ describe("summarize — sidebar one-line run summary (Task 8.3.4)", () => {
 		const summary = summarize(reduce([]), 5000);
 		expect(summary.runId).toBeUndefined();
 		expect(summary.totalAgents).toBe(0);
-		expect(summary.activeAgents).toBe(0);
+		expect(summary.doneAgents).toBe(0);
 		expect(summary.elapsedMs).toBe(0);
 	});
 });

@@ -130,12 +130,18 @@ const tui: TuiPlugin = async (api) => {
 					// sidebar, Task 8.3.4); otherwise the route defaults to the most-
 					// recently-modified feed file. `keybind`: open via the command palette
 					// (`/workflows`); the route then owns `j/k/enter/esc/x` while focused.
+					// Capture the originating route as `returnRoute` so the route's `esc`
+					// restores the caller's screen instead of always dumping to `home`
+					// (mirrors opencode's diff-viewer open command).
 					const current = api.route.current;
 					const params =
 						"params" in current
 							? (current.params as Record<string, unknown> | undefined)
 							: undefined;
-					api.route.navigate(ROUTE_WORKFLOWS, { runId: params?.runId });
+					api.route.navigate(ROUTE_WORKFLOWS, {
+						runId: params?.runId,
+						returnRoute: current,
+					});
 					api.ui.dialog.clear();
 				},
 			},

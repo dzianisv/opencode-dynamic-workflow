@@ -140,14 +140,15 @@ export interface RunStateReducer {
 
 /**
  * The one-line glance the `sidebar_content` slot renders per active run (Task
- * 8.3.4). `activeAgents`/`totalAgents` aggregate the phase done/total off a
- * {@link RunViewState}; `status` is the run's top-level status; `elapsedMs` is the
- * run's wall-clock age.
+ * 8.3.4). `doneAgents`/`totalAgents` aggregate the phase done/total off a
+ * {@link RunViewState} — the leading number is the COMPLETED count, matching CC's
+ * `34/35 agents` parity convention (34 of 35 finished). `status` is the run's
+ * top-level status; `elapsedMs` is the run's wall-clock age.
  */
 export interface RunSummary {
 	runId?: string;
-	/** Occurrences still running (no `agent:end` yet) across all phases. */
-	activeAgents: number;
+	/** Terminal occurrences (an `agent:end` seen) across all phases — CC's leading number. */
+	doneAgents: number;
 	/** Total agent occurrences across all phases. */
 	totalAgents: number;
 	/** Run age in ms: settled → `endedAt - startedAt`; live → `now - startedAt`. */
@@ -157,20 +158,22 @@ export interface RunSummary {
 
 /**
  * Collapse a {@link RunViewState} into the sidebar's one-line {@link RunSummary}
- * (Task 8.3.4). Sums each phase's `done`/`total` into `activeAgents` (running) and
- * `totalAgents`, and derives `elapsedMs` from the run stamps: a settled run uses
- * its feed-stamped `endedAt - startedAt` (clock-free, stable after a restart); a
- * live run uses the caller-supplied `now - startedAt` (the reducer holds NO clock,
- * so the sidebar passes `Date.now()`). A run with no `startedAt` stamp (an empty or
+ * (Task 8.3.4). Sums each phase's `done`/`total` into `doneAgents` (terminal) and
+ * `totalAgents` — `doneAgents` is the COMPLETED count so the sidebar renders the
+ * CC-style `done/total` glance (the leading number is "how many finished", e.g.
+ * `34/35`). `elapsedMs` derives from the run stamps: a settled run uses its
+ * feed-stamped `endedAt - startedAt` (clock-free, stable after a restart); a live
+ * run uses the caller-supplied `now - startedAt` (the reducer holds NO clock, so the
+ * sidebar passes `Date.now()`). A run with no `startedAt` stamp (an empty or
  * not-yet-started feed) has `elapsedMs: 0`; negatives clamp to 0 so a glance never
  * shows a backwards duration.
  */
 export function summarize(state: RunViewState, now: number): RunSummary {
-	let activeAgents = 0;
+	let doneAgents = 0;
 	let totalAgents = 0;
 	for (const phase of state.phases) {
 		totalAgents += phase.total;
-		activeAgents += phase.total - phase.done;
+		doneAgents += phase.done;
 	}
 	let elapsedMs = 0;
 	if (state.startedAt !== undefined) {
@@ -179,7 +182,7 @@ export function summarize(state: RunViewState, now: number): RunSummary {
 	}
 	return {
 		...(state.runId !== undefined ? { runId: state.runId } : {}),
-		activeAgents,
+		doneAgents,
 		totalAgents,
 		elapsedMs,
 		status: state.status,
@@ -356,6 +359,11 @@ export function createRunStateReducer(): RunStateReducer {
 	function state(): RunViewState {
 		// Group by phase in first-appearance order, deriving each phase's marker and
 		// done/total off the live occurrences (same derivation as the status tool).
+		// Each row is SHALLOW-COPIED into the group: the reducer mutates occurrences in
+		// place internally, but `state()` must expose immutable snapshots so the route's
+		// <For> (which memoizes per item REFERENCE) re-renders a row whose stats/status
+		// changed — a stable identity would freeze the live row. This mirrors how the
+		// PhaseView objects below are rebuilt fresh on every call.
 		const order: string[] = [];
 		const groups = new Map<string, AgentView[]>();
 		for (const row of agents) {
@@ -366,7 +374,7 @@ export function createRunStateReducer(): RunStateReducer {
 				groups.set(phase, group);
 				order.push(phase);
 			}
-			group.push(row);
+			group.push({ ...row });
 		}
 		const phases: PhaseView[] = order.map((name) => {
 			const group = groups.get(name) ?? [];

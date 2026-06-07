@@ -22,7 +22,6 @@
  */
 
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
 	createResource,
@@ -33,80 +32,17 @@ import {
 	Show,
 } from "solid-js";
 import { formatDuration } from "./format";
-import {
-	createRunStateReducer,
-	parseFeedLine,
-	type RunSummary,
-	summarize,
-} from "./reducer";
-
-/** Feed-file suffix — `<dataDir>/workflow-feed/<runId>.jsonl`. */
-const FEED_SUFFIX = ".jsonl";
+import type { RunSummary } from "./reducer";
+import { activeRuns, type SidebarFs } from "./sidebar-data";
 
 /** Coarse rescan cadence — the sidebar is a glance, not a live ticker. */
 const POLL_MS = 1000;
 
-/** A run is shown in the sidebar while it has not reached a terminal `run:end`. */
-function isActive(status: RunSummary["status"]): boolean {
-	return status === "running" || status === "cancelling";
-}
-
-/**
- * Read one whole feed file and fold it through a fresh reducer into a
- * {@link RunSummary}. A read failure (the file vanished mid-scan, a permission
- * hiccup) yields `undefined` and is dropped by the caller — a sidebar glance must
- * never throw. The file is read in full each tick: a glance over settled-vs-live is
- * cheap, and byte-offset tailing is the route's job, not the sidebar's.
- */
-async function summarizeFeedFile(
-	path: string,
-	now: number,
-): Promise<RunSummary | undefined> {
-	let text: string;
-	try {
-		text = await readFile(path, "utf-8");
-	} catch {
-		return undefined;
-	}
-	const reducer = createRunStateReducer();
-	for (const line of text.split("\n")) {
-		if (line.length === 0) {
-			continue;
-		}
-		const event = parseFeedLine(line);
-		if (event !== undefined) {
-			reducer.apply(event);
-		}
-	}
-	return summarize(reducer.state(), now);
-}
-
-/**
- * Scan the feed dir, summarize every `<runId>.jsonl`, and keep only the active
- * runs, newest-elapsed first (the longest-running glance sits on top). A missing
- * dir (no run has ever produced a feed) yields an empty list — never an error.
- */
-async function activeRuns(feedDir: string): Promise<RunSummary[]> {
-	let names: string[];
-	try {
-		names = await readdir(feedDir);
-	} catch {
-		return [];
-	}
-	const now = Date.now();
-	const summaries: RunSummary[] = [];
-	for (const name of names) {
-		if (!name.endsWith(FEED_SUFFIX)) {
-			continue;
-		}
-		const summary = await summarizeFeedFile(join(feedDir, name), now);
-		if (summary !== undefined && isActive(summary.status)) {
-			summaries.push(summary);
-		}
-	}
-	summaries.sort((a, b) => b.elapsedMs - a.elapsedMs);
-	return summaries;
-}
+/** The real readdir/readFile seam handed to the pure sidebar data layer. */
+const sidebarFs: SidebarFs = {
+	readdir,
+	readFile: (path) => readFile(path, "utf-8"),
+};
 
 /** Shorten a run id for the one-line glance (the tail is the entropy CC shows). */
 function shortRunId(runId: string | undefined): string {
@@ -129,7 +65,8 @@ export interface SidebarRunsProps {
 
 /**
  * The slot body: a polled list of active runs, invisible when none are live. Each
- * line is `<marker> <short-runId>  <active>/<total> agents · <elapsed>`; selecting
+ * line is `<marker> <short-runId>  <done>/<total> agents · <elapsed>` (CC's
+ * `done/total` parity — the leading number is how many agents finished); selecting
  * one navigates into the `workflows` route with that `runId`.
  */
 export default function SidebarRuns(props: SidebarRunsProps) {
@@ -150,16 +87,23 @@ export default function SidebarRuns(props: SidebarRunsProps) {
 		}
 	});
 
-	const [runs] = createResource(tick, () => activeRuns(props.feedDir), {
-		initialValue: [],
-	});
+	const [runs] = createResource(
+		tick,
+		() => activeRuns(props.feedDir, sidebarFs, Date.now()),
+		{ initialValue: [] },
+	);
 	const active = () => runs() ?? [];
 
 	const open = (runId: string | undefined): void => {
 		if (runId === undefined) {
 			return;
 		}
-		props.api.route.navigate("workflows", { runId });
+		// Thread the originating route as `returnRoute` so the route's `esc` restores
+		// the session the user opened the viewer from (mirrors the open command).
+		props.api.route.navigate("workflows", {
+			runId,
+			returnRoute: props.api.route.current,
+		});
 	};
 
 	return (
@@ -173,7 +117,7 @@ export default function SidebarRuns(props: SidebarRunsProps) {
 						// biome-ignore lint/a11y/noStaticElementInteractions: `text` is an opentui terminal-renderer element, not a DOM node — there is no accessibility tree, so the HTML-oriented a11y rule is a false positive (mirrors opencode's own `todo.tsx`/`diff-viewer.tsx` mouse handlers on these elements).
 						<text fg={theme().textMuted} onMouseDown={() => open(run.runId)}>
 							{summaryMarker(run.status)} {shortRunId(run.runId)}{" "}
-							{run.activeAgents}/{run.totalAgents} agents ·{" "}
+							{run.doneAgents}/{run.totalAgents} agents ·{" "}
 							{formatDuration(run.elapsedMs)}
 						</text>
 					)}

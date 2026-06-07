@@ -507,7 +507,7 @@ Beyond the textual `workflow_status` tool, the package ships a second plugin sur
 
 It contributes two things to the TUI:
 
-- A **`sidebar_content` slot** — a passive one-line glance per active run (`… <run-id>  <active>/<total> agents · <elapsed>`), invisible when no run is live. Click a run (or open the viewer from the palette) to jump into the full-screen route for that run.
+- A **`sidebar_content` slot** — a passive one-line glance per active run (`… <run-id>  <done>/<total> agents · <elapsed>`, the CC-style `done/total` where the leading number is how many agents finished), invisible when no run is live. Click a run (or open the viewer from the palette) to jump into the full-screen route for that run.
 - A **full-screen `workflows` route** — three panes (Phases | Agents | Detail). Open it from the command palette (`/workflows`). In-route keys: `j/k` move the selection within the focused pane, `enter` drills Phases → Agents → Detail, `esc` backs out one pane then closes the route, and `x` writes the cancel sentinel for the open run (the exact external touch the engine's control watcher consumes — the run settles `cancelled`).
 
 ### Installing the viewer surface
@@ -529,7 +529,7 @@ The pure reduction/summary logic is unit-tested under `bun test`, but live rende
 
 1. **Install both surfaces.** Point your `opencode.json` at `opencode-drawer-workflows` (or the dev `file://` form) and launch OpenCode's TUI against the pinned opencode `1.16.2`.
 2. **Launch a multi-phase workflow.** Run a script with at least two phases and a handful of agents (the canonical review workflow in [Example 3](#example-3--the-canonical-review-workflow-pipeline--adversarial-verify-with-a-sub-workflow) works well). The `workflow` tool returns a `run_id` immediately.
-3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s`, updating as agents settle.
+3. **Watch the sidebar summarize it.** Within ~1s the `sidebar_content` slot shows a line like `… <run-id>  3/5 agents · 1m 12s` (3 of 5 agents finished), the count climbing as agents settle.
 4. **Open the route.** Run `/workflows` from the command palette (or click the sidebar line). The full-screen Phases | Agents | Detail view opens on that run.
 5. **See it update live.** As the engine appends to the feed, the Phases counters, the per-agent CC-style rows (`✓ impl  opus-4-8  112.7k tok · 51 tools · 7m 8s`), and the Detail pane (last tools, note, token breakdown, sessionID) update in real time. Navigate with `j/k/enter/esc`.
 6. **Cancel through the sentinel.** Press `x`. The view flips to `cancelling` (the feed's `run:cancel-requested` line), the engine's control watcher consumes the sentinel, the children stop, and the run settles `cancelled`.

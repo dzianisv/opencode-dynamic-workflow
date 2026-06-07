@@ -40,7 +40,7 @@ function agentLine(label: string, at: number): string {
  * file appear.
  */
 function makeFeedFile() {
-	let buf = "";
+	let buf = Buffer.alloc(0);
 	let present = false;
 	let watchListener: (() => void) | undefined;
 	const calls = { stat: 0, read: 0, watchClosed: 0 };
@@ -53,7 +53,7 @@ function makeFeedFile() {
 				err.code = "ENOENT";
 				throw err;
 			}
-			return { size: Buffer.byteLength(buf, "utf-8") };
+			return { size: buf.length };
 		},
 		read: async (path: string, offset: number, length: number) => {
 			calls.read += 1;
@@ -62,9 +62,9 @@ function makeFeedFile() {
 				err.code = "ENOENT";
 				throw err;
 			}
-			return Buffer.from(buf, "utf-8")
-				.subarray(offset, offset + length)
-				.toString("utf-8");
+			// Return RAW bytes (the tailer owns decoding so it can hold a partial
+			// multibyte char as bytes across a read boundary).
+			return buf.subarray(offset, offset + length);
 		},
 	};
 
@@ -85,10 +85,12 @@ function makeFeedFile() {
 		fs,
 		watchFn,
 		calls,
-		/** Append a raw chunk (may end mid-line) and make the file present. */
-		grow(chunk: string): void {
+		/** Append a raw chunk (string or exact bytes, may end mid-line) and make the file present. */
+		grow(chunk: string | Uint8Array): void {
 			present = true;
-			buf += chunk;
+			const bytes =
+				typeof chunk === "string" ? Buffer.from(chunk, "utf-8") : chunk;
+			buf = Buffer.concat([buf, bytes]);
 		},
 		hasWatcher(): boolean {
 			return watchListener !== undefined;
@@ -135,6 +137,43 @@ describe("createFeedTailer — line buffering", () => {
 			"agent:start",
 			"agent:start",
 		]);
+		await tailer.stop();
+	});
+});
+
+describe("createFeedTailer — multibyte read boundary", () => {
+	test("a line split mid-multibyte-character across two reads emits intact", async () => {
+		const file = makeFeedFile();
+		const { events, onEvent } = collector();
+		const tailer = createFeedTailer({
+			path: PATH,
+			onEvent,
+			watchFn: file.watchFn,
+			statFn: file.fs.stat,
+			readFn: file.fs.read,
+		});
+
+		// An agent label carrying a 3-byte (`✓`), 4-byte (`🚀`), and 2-byte (`é`) char.
+		const event: FeedEvent = { type: "agent:start", label: "✓ 🚀 café", at: 2 };
+		const line = `${JSON.stringify(event)}\n`;
+		const bytes = Buffer.from(line, "utf-8");
+
+		// Cut the line 1 byte INTO the 3-byte `✓` (the first multibyte char): the prior
+		// `partial`-string code re-encoded the decoded U+FFFD to 3 bytes and overshot the
+		// offset, dropping the rest of the char and the next line. The byte-buffered tail
+		// must reassemble the char and emit the label verbatim.
+		const cut = bytes.indexOf(Buffer.from("✓", "utf-8")[0] ?? 0) + 1;
+
+		file.grow(bytes.subarray(0, cut));
+		await tailer.start();
+		// The partial multibyte char is held — nothing parses yet.
+		expect(events).toEqual([]);
+
+		file.grow(bytes.subarray(cut));
+		await tailer.tick();
+
+		expect(events).toHaveLength(1);
+		expect(events[0]).toEqual(event);
 		await tailer.stop();
 	});
 });

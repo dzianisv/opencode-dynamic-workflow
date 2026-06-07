@@ -33,6 +33,11 @@ import { open, stat } from "node:fs/promises";
 import type { FeedEvent } from "../plugin/feed";
 import { parseFeedLine } from "./reducer";
 
+/** The newline byte (`\n`) feed lines are delimited by. */
+const NEWLINE = 0x0a;
+/** A shared zero-length tail, used while no partial bytes are held. */
+const EMPTY = new Uint8Array(0);
+
 /** A live filesystem watch handle — only `close()` is used. */
 export interface TailerWatcher {
 	close(): void;
@@ -42,8 +47,13 @@ export interface TailerWatcher {
 export interface TailerFs {
 	/** Current byte size of the file; rejects (ENOENT) when the file is absent. */
 	stat(path: string): Promise<{ size: number }>;
-	/** Read `[offset, offset + length)` bytes of the file decoded as UTF-8. */
-	read(path: string, offset: number, length: number): Promise<string>;
+	/**
+	 * Read `[offset, offset + length)` and return the RAW bytes actually read (the
+	 * `subarray(0, bytesRead)`). The tailer — not the reader — owns UTF-8 decoding so
+	 * a multibyte character split across a read boundary is held as bytes and never
+	 * decoded mid-sequence (decoding here would emit U+FFFD and desync the offset).
+	 */
+	read(path: string, offset: number, length: number): Promise<Uint8Array>;
 }
 
 export interface FeedTailerOptions {
@@ -61,8 +71,11 @@ export interface FeedTailerOptions {
 	watchFn?(path: string, listener: () => void): TailerWatcher;
 	/** Byte size of the file. Defaults to `node:fs/promises`' `stat`. */
 	statFn?(path: string): Promise<{ size: number }>;
-	/** Read a byte range as UTF-8. Defaults to a `node:fs/promises` open/read/close. */
-	readFn?(path: string, offset: number, length: number): Promise<string>;
+	/**
+	 * Read a byte range and return the RAW bytes read (NOT decoded — see {@link TailerFs.read}).
+	 * Defaults to a `node:fs/promises` open/read/close.
+	 */
+	readFn?(path: string, offset: number, length: number): Promise<Uint8Array>;
 	/** Poll-fallback cadence in ms (default 250). */
 	pollMs?: number;
 }
@@ -79,17 +92,21 @@ export interface FeedTailer {
 	stop(): void;
 }
 
-/** Default reader: open, read `[offset, offset + length)` into a buffer, close. */
+/**
+ * Default reader: open, read `[offset, offset + length)` into a buffer, close, and
+ * return the RAW bytes read. The tailer decodes complete lines itself, so this never
+ * decodes — a partial multibyte char at the tail stays as bytes until completed.
+ */
 async function defaultRead(
 	path: string,
 	offset: number,
 	length: number,
-): Promise<string> {
+): Promise<Uint8Array> {
 	const handle = await open(path, "r");
 	try {
 		const buffer = Buffer.allocUnsafe(length);
 		const { bytesRead } = await handle.read(buffer, 0, length, offset);
-		return buffer.subarray(0, bytesRead).toString("utf-8");
+		return buffer.subarray(0, bytesRead);
 	} finally {
 		await handle.close();
 	}
@@ -120,9 +137,11 @@ export function createFeedTailer(opts: FeedTailerOptions): FeedTailer {
 
 	// Byte offset of the next unread byte; reads only ever advance it forward.
 	let offset = 0;
-	// Trailing bytes after the last "\n" — a not-yet-flushed partial line held back
+	// Trailing BYTES after the last "\n" — a not-yet-flushed partial line held back
 	// until a later read completes it (append-only writes guarantee this is a tail).
-	let partial = "";
+	// Held as bytes, never a decoded string, so a multibyte character split across a
+	// read boundary is reassembled before decode rather than corrupted into U+FFFD.
+	let partial: Uint8Array = EMPTY;
 	let stopped = false;
 	let watcher: TailerWatcher | undefined;
 	let pollHandle: unknown;
@@ -133,14 +152,31 @@ export function createFeedTailer(opts: FeedTailerOptions): FeedTailer {
 	let inFlight = false;
 	let rerun = false;
 
-	/** Split a freshly read chunk on "\n", emit complete lines, buffer the tail. */
-	function consume(chunk: string): void {
-		const text = partial + chunk;
-		const lines = text.split("\n");
-		// The last element is the bytes after the final "\n" — a partial line if the
-		// chunk did not end on a newline (held back), or "" if it did (nothing to hold).
-		partial = lines.pop() ?? "";
-		for (const line of lines) {
+	/**
+	 * Append freshly read BYTES to the held partial, decode only up to the last "\n"
+	 * (so no incomplete multibyte char is ever decoded), emit the complete lines, and
+	 * carry the trailing bytes after the last "\n" as the next partial.
+	 */
+	function consume(chunk: Uint8Array): void {
+		const combined =
+			partial.length === 0 ? chunk : Buffer.concat([partial, chunk]);
+		const lastNewline = combined.lastIndexOf(NEWLINE);
+		if (lastNewline === -1) {
+			// No complete line yet — hold everything as the partial tail.
+			partial = combined;
+			return;
+		}
+		// Decode only `[0, lastNewline]` (complete lines); carry the rest as bytes.
+		const complete = Buffer.from(
+			combined.buffer,
+			combined.byteOffset,
+			lastNewline + 1,
+		).toString("utf-8");
+		partial =
+			lastNewline + 1 < combined.length
+				? combined.subarray(lastNewline + 1)
+				: EMPTY;
+		for (const line of complete.split("\n")) {
 			if (line.length === 0) {
 				continue;
 			}
@@ -169,7 +205,7 @@ export function createFeedTailer(opts: FeedTailerOptions): FeedTailer {
 			return;
 		}
 		const length = size - offset;
-		let chunk: string;
+		let chunk: Uint8Array;
 		try {
 			chunk = await readFn(opts.path, offset, length);
 		} catch (err) {
@@ -178,7 +214,9 @@ export function createFeedTailer(opts: FeedTailerOptions): FeedTailer {
 			}
 			return;
 		}
-		offset += Buffer.byteLength(chunk, "utf-8");
+		// Advance by the bytes ACTUALLY read — never by re-encoding decoded text, which
+		// overshoots on a multibyte boundary (a split char re-encodes to U+FFFD's 3 bytes).
+		offset += chunk.byteLength;
 		consume(chunk);
 	}
 
