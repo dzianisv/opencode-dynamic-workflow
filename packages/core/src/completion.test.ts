@@ -63,8 +63,29 @@ function makeClock(start = 1000): Clock & { set: (t: number) => void } {
 }
 
 interface MessageEntry {
-	info: { role: "user" | "assistant" };
+	info: { role: "user" | "assistant"; time: { created: number } };
 	parts: Array<{ type: string; text?: string }>;
+}
+
+/** Build a single-assistant-message transcript whose text was created at `created`. */
+function assistantText(text: string, created: number): MessageEntry[] {
+	return [
+		{
+			info: { role: "assistant", time: { created } },
+			parts: [{ type: "text", text }],
+		},
+	];
+}
+
+/**
+ * Read a task's status WITHOUT TS narrowing it to the last literal assigned in
+ * the test body. The gate mutates `task.status` through a closure the compiler
+ * can't see (same reason session-runner.ts exposes `statusOf`), so a test that
+ * manually flips status back to "running" then asserts a later "completed" needs
+ * an opaque read or the second assertion is a compile error.
+ */
+function statusOf(task: BgTask): TaskStatus {
+	return task.status;
 }
 
 /**
@@ -98,11 +119,12 @@ function makeSdk() {
 	};
 }
 
-const VALID_OUTPUT: MessageEntry[] = [
-	{ info: { role: "assistant" }, parts: [{ type: "text", text: "done" }] },
-];
+const VALID_OUTPUT: MessageEntry[] = assistantText("done", 1000);
 const EMPTY_OUTPUT: MessageEntry[] = [
-	{ info: { role: "assistant" }, parts: [{ type: "text", text: "" }] },
+	{
+		info: { role: "assistant", time: { created: 1000 } },
+		parts: [{ type: "text", text: "" }],
+	},
 ];
 
 interface Harness {
@@ -593,5 +615,74 @@ describe("RACE: slot accounting back to baseline", () => {
 		} as never);
 		await flush();
 		expect(h.freed).toEqual([h.task.id]);
+	});
+});
+
+// ===========================================================================
+// TURN WATERMARK (Task 6.1.1): a resumed turn must not be completed by the
+// PREVIOUS turn's valid output sitting in the transcript. The poll's quiet-
+// session branch validates output created AFTER the turn was dispatched.
+// ===========================================================================
+
+describe("turn watermark — stale previous-turn output must not complete a resumed turn", () => {
+	test("resume → silent gap → poll sees only pre-watermark output → stays running; post-watermark output → completes", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.gate.start();
+
+		// --- turn 1: launch dispatch, valid output created at the dispatch moment. ---
+		h.gate.markTurnDispatched(h.task); // launch stamps the watermark too
+		h.sdk.setMessages("ses_child", assistantText("turn1 result", 1000));
+		h.clock.set(1000 + 6000); // session quiet, grace elapsed
+		h.timers.tick();
+		await flush();
+		expect(h.task.status).toBe("completed");
+
+		// --- resume: same session re-prompted at t=20000. The transcript STILL holds
+		//     turn 1's valid output (created at 1000, before the new turn). ---
+		h.task.status = "running";
+		h.task.completedAt = undefined;
+		h.task.startedAt = 20000;
+		h.clock.set(20000);
+		h.gate.resetForResume(h.task); // resume seam: evict cache + restart clock
+		h.gate.markTurnDispatched(h.task); // resume dispatch stamps the new watermark
+
+		// silent first-token gap: no events flow. The poll wakes on the quiet session
+		// and sees ONLY the stale turn-1 output (created 1000 < watermark 20000).
+		h.clock.set(20000 + 6000);
+		h.timers.tick();
+		await flush();
+		// THE BUG: today the poll completes the task here off stale output. It must NOT.
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(1); // still only turn 1's completion
+
+		// --- the resumed turn finally produces its OWN output (created after dispatch). ---
+		h.sdk.setMessages("ses_child", assistantText("turn2 result", 26500));
+		h.clock.set(20000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(2);
+	});
+
+	test("idle path also honors the watermark: idle with only stale output does not complete", async () => {
+		const h = makeHarness({ minIdleMs: 5000 });
+		h.gate.markTurnDispatched(h.task); // turn 1 at startedAt=1000
+
+		// resume to a new turn at t=20000; transcript holds only the stale turn-1 output.
+		h.task.startedAt = 20000;
+		h.clock.set(20000);
+		h.gate.resetForResume(h.task);
+		h.gate.markTurnDispatched(h.task);
+		h.sdk.setMessages("ses_child", assistantText("turn1 result", 1000));
+
+		// idle after grace, but the only output predates the watermark → no completion.
+		h.clock.set(20000 + 6000);
+		await h.gate.handleEvent({
+			type: "session.idle",
+			properties: { sessionID: "ses_child" },
+		} as never);
+		await flush();
+		expect(h.task.status).toBe("running");
+		expect(h.completes).toHaveLength(0);
 	});
 });

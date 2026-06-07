@@ -340,6 +340,11 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			...(contextParts ?? []),
 			{ type: "text", text: prompt },
 		];
+		// Stamp the turn watermark at the dispatch moment so the gate only accepts
+		// output created by THIS turn (Task 6.1.1). Single site → covers launch's
+		// first prompt and resume's re-prompt uniformly; on resume it runs after
+		// resetForResume, so the previous turn's cache/watermark are already cleared.
+		gate.markTurnDispatched(task);
 		client.session
 			.promptAsync({
 				path: { id: sessionID },

@@ -732,7 +732,7 @@ interface PartEntry {
 	state?: { status: string; output?: string; error?: string };
 }
 interface MessageEntry {
-	info: { role: "user" | "assistant" };
+	info: { role: "user" | "assistant"; time: { created: number } };
 	parts: PartEntry[];
 }
 
@@ -972,7 +972,10 @@ describe("createSessionRunner — resume", () => {
 		// --- first lifecycle: launch → idle → completed ---
 		h.setNextCreateId("ses_x");
 		h.setMessages("ses_x", [
-			{ info: { role: "assistant" }, parts: [{ type: "text", text: "turn1" }] },
+			{
+				info: { role: "assistant", time: { created: 1000 } },
+				parts: [{ type: "text", text: "turn1" }],
+			},
 		]);
 		const launched = runner.launch(baseReq({ model }));
 		await flush();
@@ -1010,7 +1013,10 @@ describe("createSessionRunner — resume", () => {
 
 		// --- second lifecycle completes via idle ---
 		h.setMessages("ses_x", [
-			{ info: { role: "assistant" }, parts: [{ type: "text", text: "turn2" }] },
+			{
+				info: { role: "assistant", time: { created: 9000 } },
+				parts: [{ type: "text", text: "turn2" }],
+			},
 		]);
 		await completeViaIdle(runner, timers, clock, "ses_x", resumeAt, MIN_IDLE);
 		expect(runner.list()[0]?.status).toBe("completed");
@@ -1064,7 +1070,10 @@ describe("createSessionRunner — resume", () => {
 		// turn 1: launch + complete.
 		h.setNextCreateId("ses_z");
 		h.setMessages("ses_z", [
-			{ info: { role: "assistant" }, parts: [{ type: "text", text: "old" }] },
+			{
+				info: { role: "assistant", time: { created: 1000 } },
+				parts: [{ type: "text", text: "old" }],
+			},
 		]);
 		clock.set(1000);
 		const launched = runner.launch(baseReq({ model }));
@@ -1114,9 +1123,12 @@ describe("createSessionRunner — readOutput", () => {
 		expect(task.status).toBe("running");
 
 		h.setMessages("ses_r", [
-			{ info: { role: "user" }, parts: [{ type: "text", text: "hi" }] },
 			{
-				info: { role: "assistant" },
+				info: { role: "user", time: { created: 1000 } },
+				parts: [{ type: "text", text: "hi" }],
+			},
+			{
+				info: { role: "assistant", time: { created: 1000 } },
 				parts: [
 					{ type: "text", text: "partial " },
 					{ type: "text", text: "answer" },
@@ -1142,14 +1154,14 @@ describe("createSessionRunner — readOutput", () => {
 		const longErr = `${"A".repeat(3000)}ERROR boom ${"B".repeat(3000)}`; // matches /error/i
 		h.setMessages("ses_f", [
 			{
-				info: { role: "user" },
+				info: { role: "user", time: { created: 1000 } },
 				parts: [
 					{ type: "text", text: "real" },
 					{ type: "text", text: "SYNTH", synthetic: true },
 				],
 			},
 			{
-				info: { role: "assistant" },
+				info: { role: "assistant", time: { created: 1000 } },
 				parts: [
 					{ type: "text", text: "answer" },
 					{
@@ -1273,7 +1285,10 @@ describe("createSessionRunner — slot accounting baseline", () => {
 		// launch + complete via idle
 		h.setNextCreateId("ses_2");
 		h.setMessages("ses_2", [
-			{ info: { role: "assistant" }, parts: [{ type: "text", text: "ok" }] },
+			{
+				info: { role: "assistant", time: { created: 2000 } },
+				parts: [{ type: "text", text: "ok" }],
+			},
 		]);
 		clock.set(2000);
 		const b = runner.launch(baseReq({ model }));
@@ -1282,11 +1297,18 @@ describe("createSessionRunner — slot accounting baseline", () => {
 		await completeViaIdle(runner, timers, clock, "ses_2", 2000, 5000);
 		expect(concurrency.runningCount(model)).toBe(0);
 
-		// resume + complete via idle
+		// resume + complete via idle. The resumed turn produces its OWN output
+		// (created at the resume dispatch time); the prior "ok" is now stale.
 		h.freshPrompt();
 		clock.set(50000);
 		await runner.resume(bt.id, "again");
 		expect(concurrency.runningCount(model)).toBe(1);
+		h.setMessages("ses_2", [
+			{
+				info: { role: "assistant", time: { created: 50000 } },
+				parts: [{ type: "text", text: "ok again" }],
+			},
+		]);
 		await completeViaIdle(runner, timers, clock, "ses_2", 50000, 5000);
 		expect(concurrency.runningCount(model)).toBe(0);
 	});
@@ -1324,7 +1346,10 @@ describe("createSessionRunner — restart recovery", () => {
 		const persisted: BgTask[] = [];
 
 		h.setMessages("ses_alive", [
-			{ info: { role: "assistant" }, parts: [{ type: "text", text: "done" }] },
+			{
+				info: { role: "assistant", time: { created: 1500 } },
+				parts: [{ type: "text", text: "done" }],
+			},
 		]);
 
 		const runner = createSessionRunner({
@@ -1445,7 +1470,7 @@ describe("createSessionRunner — restart recovery", () => {
 		const concurrency = new ConcurrencyManager();
 		h.setMessages("ses_term", [
 			{
-				info: { role: "assistant" },
+				info: { role: "assistant", time: { created: 1000 } },
 				parts: [{ type: "text", text: "final answer" }],
 			},
 		]);
