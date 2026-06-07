@@ -212,6 +212,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ key: "h", cmd: "workflows.focusTree" },
 				{ key: "escape", cmd: "workflows.back" },
 				{ key: "x", cmd: "workflows.cancel" },
+				{ key: "s", cmd: "workflows.cancel" },
 			],
 		});
 	});
@@ -412,6 +413,14 @@ function AgentDetail(props: {
 				<text fg={t.textMuted}>
 					{formatDuration(props.agent.durationMs ?? 0)}
 				</text>
+			</Show>
+			<Show when={props.agent.prompt}>
+				{(prompt) => (
+					<box flexDirection="column" paddingTop={1}>
+						<text fg={t.border}>── prompt</text>
+						<text fg={t.textMuted}>{prompt()}</text>
+					</box>
+				)}
 			</Show>
 			<Show when={props.agent.lastTools && props.agent.lastTools.length > 0}>
 				<For each={props.agent.lastTools ?? []}>

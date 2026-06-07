@@ -94,6 +94,8 @@ export interface AgentView {
 	status?: string;
 	model?: string;
 	agentType?: string;
+	/** Truncated user-prompt preview from `agent:start` (for the Detail pane). */
+	prompt?: string;
 	/** Total tokens (already summed); absent on cached / un-tracked agents. */
 	tokens?: number;
 	toolCalls?: number;
@@ -229,6 +231,7 @@ export function createRunStateReducer(): RunStateReducer {
 			label: e.label,
 			startedAt: e.at,
 			...(e.phase !== undefined ? { phase: e.phase } : {}),
+			...(e.promptPreview !== undefined ? { prompt: e.promptPreview } : {}),
 		};
 		agents.push(row);
 		enqueue(e.label, agents.length - 1);

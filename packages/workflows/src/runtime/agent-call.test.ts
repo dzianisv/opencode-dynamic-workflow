@@ -270,6 +270,45 @@ describe("createAgentPrimitive — result mapping", () => {
 	});
 });
 
+describe("createAgentPrimitive — prompt preview on agent:start", () => {
+	test("agent:start carries the prompt as promptPreview (live path)", async () => {
+		const { agent, events } = harness();
+		await agent("explain the repo structure");
+		const start = events.find((e) => e.type === "agent:start");
+		expect(start).toBeDefined();
+		expect(
+			(start as Extract<ProgressEvent, { type: "agent:start" }>).promptPreview,
+		).toBe("explain the repo structure");
+	});
+
+	test("a long prompt is truncated with an ellipsis", async () => {
+		const { agent, events } = harness();
+		const long = "x".repeat(5000);
+		await agent(long);
+		const start = events.find((e) => e.type === "agent:start") as Extract<
+			ProgressEvent,
+			{ type: "agent:start" }
+		>;
+		expect(start.promptPreview).toBeDefined();
+		const preview = start.promptPreview as string;
+		// Capped well under the raw length, and marked as truncated.
+		expect(preview.length).toBeLessThan(long.length);
+		expect(preview.endsWith("…")).toBe(true);
+	});
+
+	test("the preview reflects the USER prompt, not the schema-suffixed launch prompt", async () => {
+		const { agent, events } = harness();
+		await agent("classify this", {
+			schema: { type: "object", properties: {}, additionalProperties: true },
+		});
+		const start = events.find((e) => e.type === "agent:start") as Extract<
+			ProgressEvent,
+			{ type: "agent:start" }
+		>;
+		expect(start.promptPreview).toBe("classify this");
+	});
+});
+
 describe("createAgentPrimitive — caps and budget throw", () => {
 	test("the 1001st call throws AgentCapError", async () => {
 		const { agent } = harness({ counters: { agents: 1000 } });
@@ -560,6 +599,8 @@ describe("createAgentPrimitive — progress events", () => {
 			type: "agent:start",
 			label: "my-label",
 			phase: "Analyze",
+			// promptPreview is now carried for the viewer's Detail (Task 8.3.x).
+			promptPreview: "prompt text",
 		});
 		expect(end).toEqual({
 			type: "agent:end",
@@ -580,6 +621,7 @@ describe("createAgentPrimitive — progress events", () => {
 			type: "agent:start",
 			label: "x".repeat(60),
 			phase: undefined,
+			promptPreview: "x".repeat(100),
 		});
 	});
 
