@@ -23,7 +23,7 @@
 | 3 | Workflow runtime executes spec-conformant scripts (`agent`/`pipeline`/`parallel`/`phase`/`log`/`args`) with caps, against the Phase 1 engine | 3.1, 3.2, 3.3 | Complete |
 | 4 | `opencode-drawer-workflows` plugin: journal-backed deterministic resume, budget, sub-workflows, structured output; canonical review workflow runs e2e | 4.1, 4.2, 4.3 | Complete |
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
-| 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | 6.1 Detailed / rest Epic-level |
+| 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | Complete |
 
 ## Design decisions (binding across phases)
 
@@ -936,7 +936,7 @@ interface SessionRunner {
 
 #### Task 6.3.1: Core wake notifier
 
-- [ ] Done
+- [x] Done
 
 **Context:** Terminal notices flow through core's notification queue (toast via `onNotify`; passive drain via `createChatMessageHook` — now wrapped by the workflows digest hook). Typed SDK surface for wake: `client.session.status()` is the GLOBAL `/session/status` map `{ [sessionID]: SessionStatus }`, `SessionStatus = idle | retry | busy` (`docs/sdk-surface-audit.md` row f — no per-session path); `client.session.promptAsync` is already used for child dispatch (`session-runner.ts:343`).
 
@@ -952,7 +952,7 @@ interface SessionRunner {
 
 #### Task 6.3.2: Wire wake into both plugins
 
-- [ ] Done
+- [x] Done
 
 **Context:** Workflows: terminal transitions invoke the engine's `onNotify` seam (`packages/workflows/src/plugin/engine.ts` — currently toast-only via `plugin/index.ts:68-70`). Background-agents: `packages/background-agents/src/index.ts` wires its queue + toast similarly. Both already share core's queue semantics.
 
@@ -969,7 +969,7 @@ interface SessionRunner {
 
 #### Task 6.3.3: Documentation truth update
 
-- [ ] Done
+- [x] Done
 
 **Context:** `packages/background-agents/README.md` documents the passive model ("why no active wake") — now false. `packages/workflows/README.md` describes completion notification passively.
 
