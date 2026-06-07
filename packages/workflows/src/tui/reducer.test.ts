@@ -100,6 +100,48 @@ describe("parseFeedLine", () => {
 	});
 });
 
+describe("createRunStateReducer — prompt preview", () => {
+	test("agent:start promptPreview lands on the agent's prompt", () => {
+		const state = reduce([
+			{
+				type: "run:start",
+				runId: "wf_p",
+				parentSessionID: "ses_parent",
+				at: 1,
+			},
+			{
+				type: "agent:start",
+				label: "survey",
+				phase: "Survey",
+				promptPreview: "survey the repo and report",
+				at: 2,
+			},
+			{
+				type: "agent:launched",
+				label: "survey",
+				phase: "Survey",
+				sessionID: "ses_a",
+				at: 3,
+			},
+		]);
+		const agent = state.phases[0]?.agents[0];
+		expect(agent?.prompt).toBe("survey the repo and report");
+	});
+
+	test("an agent:start without promptPreview leaves prompt undefined", () => {
+		const state = reduce([
+			{
+				type: "run:start",
+				runId: "wf_p",
+				parentSessionID: "ses_parent",
+				at: 1,
+			},
+			{ type: "agent:start", label: "x", phase: "P", at: 2 },
+		]);
+		expect(state.phases[0]?.agents[0]?.prompt).toBeUndefined();
+	});
+});
+
 describe("createRunStateReducer — full multi-phase feed", () => {
 	const tokens = (over: Partial<Record<string, number>> = {}) => ({
 		input: 0,

@@ -55,6 +55,13 @@ export type ProgressEvent =
 			type: "agent:start";
 			label: string;
 			phase?: string;
+			/**
+			 * A truncated preview of the USER prompt for this call (Task 8.3.x), shown
+			 * in the TUI viewer's Detail pane. The original `agent()` argument — NOT the
+			 * schema-suffixed launch prompt — capped to keep feed lines bounded. Present
+			 * on every path (cached included); the runtime stays clock-free.
+			 */
+			promptPreview?: string;
 	  }
 	| {
 			/**

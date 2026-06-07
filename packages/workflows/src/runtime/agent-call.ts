@@ -42,6 +42,16 @@ const AGENT_LIFETIME_CAP = 1_000;
 const DEFAULT_AWAIT_TIMEOUT_MS = 1_800_000;
 /** Label fallback length when no `opts.label` is given. */
 const LABEL_PREFIX_LEN = 60;
+
+/** Max chars of the user prompt carried into `agent:start` for the viewer's Detail. */
+const PROMPT_PREVIEW_MAX = 2000;
+
+/** A truncated, ellipsis-marked preview of the user prompt for `agent:start`. */
+function promptPreviewOf(prompt: string): string {
+	return prompt.length > PROMPT_PREVIEW_MAX
+		? `${prompt.slice(0, PROMPT_PREVIEW_MAX)}…`
+		: prompt;
+}
 /** Cap on captured raw final text in a diagnostic (Task 7.2.1). */
 const RAW_TEXT_CAP = 20_000;
 /** Marker appended when raw-text capture is truncated. */
@@ -259,7 +269,12 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				throw new AgentCapError();
 			}
 			counters.agents += 1;
-			emit({ type: "agent:start", label, phase });
+			emit({
+				type: "agent:start",
+				label,
+				phase,
+				promptPreview: promptPreviewOf(prompt),
+			});
 			emit({ type: "agent:end", label, status: "cached" });
 			// Re-record the cached hit into the NEW journal under the CURRENT call
 			// index so a resumed run's journal is fully self-contained and densely
@@ -312,7 +327,12 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		let endNote: string | undefined;
 		try {
 			// 6. Announce the start once the slot is held.
-			emit({ type: "agent:start", label, phase });
+			emit({
+				type: "agent:start",
+				label,
+				phase,
+				promptPreview: promptPreviewOf(prompt),
+			});
 
 			// 7. Launch the subagent. For structured output, register the compiled
 			// schema against the child sessionID the instant it exists (synchronous
