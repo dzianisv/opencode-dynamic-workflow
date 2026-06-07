@@ -54,15 +54,20 @@ import type {
 	AgentDiagnostic,
 	BudgetView,
 	JournalEntry,
-	StampedProgressEvent,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
-import { createFeedWriter, type FeedFs, type FeedWriter } from "./feed";
+import {
+	createFeedWriter,
+	type EnrichedProgressEvent,
+	type FeedFs,
+	type FeedWriter,
+} from "./feed";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
+	type SessionTokenSnapshot,
 } from "./session-stats";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
@@ -75,6 +80,48 @@ export interface EngineLogger {
 
 /** Terminal-or-live status of a workflow run. */
 export type RunStatus = "running" | "completed" | "error" | "cancelled";
+
+/**
+ * The per-agent rollup persisted on a {@link RunRecord} (Task 8.1.4). One entry
+ * per `agent:end` the engine sees, accumulated at the choke point so a finished
+ * run reconstructs CC's per-agent table (`model · tokens · tools · duration`)
+ * from the record ALONE — no feed re-parsing. Cached entries (no session) carry
+ * only `label`/`phase`/`status`; launched-and-ended entries carry the full stats.
+ */
+export interface AgentSummary {
+	label: string;
+	phase?: string;
+	/** The child sessionID, present only for launched (non-cached) agents. */
+	sessionID?: string;
+	/** Resolved model, when one was known at launch. */
+	model?: string;
+	/** Resolved subagent type, when one was known at launch. */
+	agentType?: string;
+	/** The `agent:end` status word (`completed`/`error`/`cancelled`/`cached`/…). */
+	status: string;
+	/** The collector's final token snapshot — absent on cached entries. */
+	tokens?: SessionTokenSnapshot;
+	/** Terminal tool-call count — absent on cached entries. */
+	toolCalls?: number;
+	/** `agent:end.at − agent:launched.at` — absent on cached entries. */
+	durationMs?: number;
+	/** The degrade note (Task 7.2.1), when the call collapsed to null/empty. */
+	note?: string;
+}
+
+/**
+ * The launch metadata the choke point holds per live session (Task 8.1.4),
+ * captured from `agent:launched` and consumed at the matching `agent:end` to
+ * compute the duration and stamp model/agentType. Dropped at the agent's end.
+ */
+interface LaunchMeta {
+	label: string;
+	phase?: string;
+	model?: string;
+	agentType?: string;
+	/** The engine-stamped `at` of the `agent:launched` event. */
+	launchedAt: number;
+}
 
 /**
  * The persisted record of one workflow run. Stored through {@link createTaskStore},
@@ -107,6 +154,13 @@ export interface RunRecord {
 	 * Absent when the run had no degraded calls.
 	 */
 	diagnostics?: AgentDiagnostic[];
+	/**
+	 * Per-agent rollup (Task 8.1.4): one {@link AgentSummary} per `agent:end` the
+	 * run produced, accumulated at the engine choke point and persisted at every
+	 * settle site (success, error, cancel) so the record alone reconstructs CC's
+	 * per-agent table post-hoc. Absent when the run launched no agents.
+	 */
+	agents?: AgentSummary[];
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -116,9 +170,11 @@ export interface RunHandle {
 	/**
 	 * Engine-stamped progress (Task 6.2.1): the runtime emits clock-free
 	 * {@link ProgressEvent}s, the engine stamps each with `at = clock.now()` at its
-	 * onProgress boundary. `workflow_status` reads `at` for per-agent elapsed.
+	 * onProgress boundary. `workflow_status` reads `at` for per-agent elapsed. Live
+	 * `agent:end` events are widened to {@link EnrichedProgressEvent} at the choke
+	 * point (Task 8.1.4) — the same enrichment the feed file carries.
 	 */
-	progress: StampedProgressEvent[];
+	progress: EnrichedProgressEvent[];
 	/**
 	 * A live wall-clock view for elapsed rendering (Task 6.2.1). The engine sets it
 	 * to its injected `clock.now` for LIVE runs only — recovered runs (flipped to a
@@ -709,6 +765,37 @@ export function createWorkflowEngine(
 		// record at settle so a finished run is debuggable without SQLite.
 		const diagnostics: AgentDiagnostic[] = [];
 
+		// Task 8.1.4 per-run choke-point state (dropped when this closure settles):
+		//   - launchMeta: the launched session's label/phase/model/agentType + the
+		//     stamped launch time, keyed by sessionID, consumed at agent:end to
+		//     compute durationMs and stamp model/agentType;
+		//   - startQueue: a FIFO of pending agent:start phases (label-matched) so a
+		//     CACHED end (no sessionID, no agent:launched) recovers its phase — the
+		//     cached path emits start+end synchronously and back-to-back.
+		// The AgentSummary rollup accumulates directly onto `record.agents` (lazily
+		// created) so it is reachable from BOTH the in-closure settle sites AND
+		// stopRun, and persists for free wherever settleRecord saves the record.
+		const launchMeta = new Map<string, LaunchMeta>();
+		const startQueue: Array<{ label: string; phase?: string }> = [];
+
+		/** Pull (and remove) the first pending start matching a label, for its phase. */
+		const claimStartPhase = (label: string): string | undefined => {
+			const i = startQueue.findIndex((s) => s.label === label);
+			if (i === -1) {
+				return undefined;
+			}
+			const [claimed] = startQueue.splice(i, 1);
+			return claimed?.phase;
+		};
+
+		/** Append a per-agent summary onto the record (Task 8.1.4), lazily creating it. */
+		const rollupAgent = (summary: AgentSummary): void => {
+			if (record.agents === undefined) {
+				record.agents = [];
+			}
+			record.agents.push(summary);
+		};
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
@@ -720,13 +807,21 @@ export function createWorkflowEngine(
 			...(budget !== undefined ? { budget } : {}),
 			onProgress: (e) => {
 				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
-				// the timestamp comes from the engine's injected clock here.
-				const stamped = { ...e, at: clock.now() };
-				// Bind/unbind the session-stats collector at the choke point (Task
-				// 8.1.3): a launched session starts being tracked the instant it exists,
-				// and stops at its end. The stats themselves are harvested from the SDK
-				// event stream (see handleEvent), not from these lifecycle events.
-				if (e.type === "agent:launched") {
+				// the timestamp comes from the engine's injected clock here. A LIVE
+				// agent:end is then WIDENED into an enriched event (Task 8.1.4) so the
+				// feed file and handle.progress carry one identical truth; every other
+				// event rides through as the plain stamped event.
+				const at = clock.now();
+				let out: EnrichedProgressEvent = { ...e, at };
+				if (e.type === "agent:start") {
+					// Remember the phase so a later cached end can recover it (the cached
+					// path never emits agent:launched and its end carries no sessionID).
+					startQueue.push({ label: e.label, phase: e.phase });
+				} else if (e.type === "agent:launched") {
+					// Bind the session-stats collector at the choke point (Task 8.1.3): a
+					// launched session starts being tracked the instant it exists. The
+					// stats themselves are harvested from the SDK event stream (see
+					// handleEvent), not from these lifecycle events.
 					stats.register(e.sessionID, { runId, label: e.label });
 					statsBindings.set(e.sessionID, {
 						runId,
@@ -735,14 +830,71 @@ export function createWorkflowEngine(
 						// emits immediately (no initial throttle penalty).
 						lastEmittedAt: Number.NEGATIVE_INFINITY,
 					});
+					// Capture launch meta for the matching agent:end (Task 8.1.4); the
+					// launched start is now live, so drop it from the cached-start queue.
+					launchMeta.set(e.sessionID, {
+						label: e.label,
+						phase: e.phase,
+						model: e.model,
+						agentType: e.agentType,
+						launchedAt: at,
+					});
+					claimStartPhase(e.label);
 				} else if (e.type === "agent:end" && e.sessionID !== undefined) {
+					// A LIVE agent ended: enrich the stamped end with the collector's
+					// final snapshot + the launch-derived duration/model/agentType BEFORE
+					// it is pushed/appended, then drop the per-session tracking. The
+					// snapshot MUST be read before unregister clears the collector state.
+					const meta = launchMeta.get(e.sessionID);
+					const snap = stats.snapshot(e.sessionID);
+					const durationMs =
+						meta !== undefined ? at - meta.launchedAt : undefined;
+					out = {
+						...e,
+						at,
+						...(durationMs !== undefined ? { durationMs } : {}),
+						...(snap !== undefined
+							? { tokens: snap.tokens, toolCalls: snap.toolCalls }
+							: {}),
+						...(meta?.model !== undefined ? { model: meta.model } : {}),
+						...(meta?.agentType !== undefined
+							? { agentType: meta.agentType }
+							: {}),
+					};
+					rollupAgent({
+						label: e.label,
+						...(meta?.phase !== undefined ? { phase: meta.phase } : {}),
+						sessionID: e.sessionID,
+						...(meta?.model !== undefined ? { model: meta.model } : {}),
+						...(meta?.agentType !== undefined
+							? { agentType: meta.agentType }
+							: {}),
+						status: e.status,
+						...(snap !== undefined
+							? { tokens: snap.tokens, toolCalls: snap.toolCalls }
+							: {}),
+						...(durationMs !== undefined ? { durationMs } : {}),
+						...(e.note !== undefined ? { note: e.note } : {}),
+					});
 					stats.unregister(e.sessionID);
 					statsBindings.delete(e.sessionID);
+					launchMeta.delete(e.sessionID);
+				} else if (e.type === "agent:end") {
+					// A CACHED agent ended (no sessionID): the stamped end rides through
+					// untouched, and a stats-free summary carrying only label/phase/status
+					// rolls up (the phase recovered from the matching pending start).
+					const phase = claimStartPhase(e.label);
+					rollupAgent({
+						label: e.label,
+						...(phase !== undefined ? { phase } : {}),
+						status: e.status,
+						...(e.note !== undefined ? { note: e.note } : {}),
+					});
 				}
-				handle.progress.push(stamped);
+				handle.progress.push(out);
 				// Mirror onto the live feed (Task 8.1.2): one source of truth for the
 				// status tool (handle.progress) and the TUI viewer (the feed file).
-				feed.append(stamped);
+				feed.append(out);
 				logger?.debug("workflow progress", { runId, event: e });
 			},
 			// Task 7.2.1: collect typed diagnostics for null/empty agent calls.

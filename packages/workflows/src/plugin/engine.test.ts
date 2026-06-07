@@ -1893,3 +1893,243 @@ describe("createWorkflowEngine — session stats → agent:stats feed (Task 8.1.
 		await engine.dispose();
 	});
 });
+
+// ---- Task 8.1.4: enriched agent:end + per-agent rollup on the RunRecord -----
+
+describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8.1.4)", () => {
+	test("a live agent:end is enriched with durationMs/tokens/toolCalls/model/agentType in BOTH the feed and handle.progress, and rolled up onto RunRecord.agents", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0001"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker", phase: "Impl", model: "anthropic/claude-opus-4-8", agentType: "reviewer" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		// agent:launched fires through the choke at this clock instant.
+		await flush();
+		const child = sessions[0] as string;
+		const launchedAt = mclock.now();
+
+		// Feed token + tool stats for the child before it ends, so the collector's
+		// final snapshot is non-empty at agent:end time.
+		engine.handleEvent(
+			msgUpdated(child, "msg_1", {
+				input: 200,
+				output: 50,
+				reasoning: 5,
+				cache: { read: 1, write: 2 },
+			}),
+		);
+		engine.handleEvent(toolPart(child, "prt_1", "bash"));
+		engine.handleEvent(toolPart(child, "prt_2", "read"));
+		await flush();
+
+		// Advance the clock so durationMs = end - launchedAt is a known delta, then
+		// drive the child to completion (driveIdle bumps another 6000ms first).
+		bump(1234);
+		await driveIdle(engine, child, bump);
+		const endAt = mclock.now();
+		const expectedDuration = endAt - launchedAt;
+
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// (1) The agent:end line in the feed carries the enrichment.
+		const feed = readFeed(files, "wf_enr0001");
+		const feedEnd = feed.find((l) => l.type === "agent:end");
+		expect(feedEnd).toBeDefined();
+		expect(feedEnd?.sessionID).toBe(child);
+		expect(feedEnd?.durationMs).toBe(expectedDuration);
+		expect(feedEnd?.model).toBe("anthropic/claude-opus-4-8");
+		expect(feedEnd?.agentType).toBe("reviewer");
+		expect(feedEnd?.toolCalls).toBe(2);
+		expect(feedEnd?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		// (2) handle.progress carries the SAME enriched values — one source of truth.
+		const progress = engine.statusOf(handle.runId)?.progress ?? [];
+		const progEnd = progress.find(
+			(e) => (e as { type: string }).type === "agent:end",
+		) as Record<string, unknown> | undefined;
+		expect(progEnd).toBeDefined();
+		expect(progEnd?.durationMs).toBe(expectedDuration);
+		expect(progEnd?.model).toBe("anthropic/claude-opus-4-8");
+		expect(progEnd?.agentType).toBe("reviewer");
+		expect(progEnd?.toolCalls).toBe(2);
+		expect(progEnd?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		// (3) The settled record's agents array matches the enriched end.
+		const agents = engine.statusOf(handle.runId)?.record.agents ?? [];
+		expect(agents).toHaveLength(1);
+		expect(agents[0]).toMatchObject({
+			label: "worker",
+			phase: "Impl",
+			sessionID: child,
+			model: "anthropic/claude-opus-4-8",
+			agentType: "reviewer",
+			status: "completed",
+			toolCalls: 2,
+			durationMs: expectedDuration,
+		});
+		expect(agents[0]?.tokens).toEqual({
+			input: 200,
+			output: 50,
+			reasoning: 5,
+			cacheRead: 1,
+			cacheWrite: 2,
+		});
+
+		await engine.dispose();
+	});
+
+	test("a cached agent:end passes through unenriched and rolls up a stats-free cached entry carrying label/phase/status", async () => {
+		// Resume with a seeded journal: the call replays as cached → agent:start +
+		// agent:end{status:"cached"} with NO sessionID, so the choke leaves it
+		// untouched and the summary carries only label/phase/status.
+		const SCRIPT = `${META}const r = await agent("do work", { label: "cachee", phase: "Review" });\nreturn r;\n`;
+		const key = computeCallKey({
+			prompt: "do work",
+			label: "cachee",
+			phase: "Review",
+		});
+		const seeded: JournalEntry[] = [
+			{ index: 0, key, status: "ok", result: "CACHED" },
+		];
+		const priorRecord = {
+			id: "wf_enrprior",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_enrprior.js`,
+		};
+		const { facade, files } = makeFs({
+			[`${BASE}/workflow-scripts/wf_enrprior.js`]: SCRIPT,
+			[JOURNALS("wf_enrprior")]: jsonl(seeded),
+			[`${BASE}/workflow-runs/wf_enrprior.json`]: JSON.stringify(priorRecord),
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0002"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_enrprior",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// The cached agent:end carries no enrichment fields.
+		const feed = readFeed(files, "wf_enr0002");
+		const feedEnd = feed.find((l) => l.type === "agent:end");
+		expect(feedEnd).toBeDefined();
+		expect(feedEnd?.status).toBe("cached");
+		expect(feedEnd?.sessionID).toBeUndefined();
+		expect(feedEnd?.durationMs).toBeUndefined();
+		expect(feedEnd?.tokens).toBeUndefined();
+		expect(feedEnd?.toolCalls).toBeUndefined();
+
+		// The rolled-up summary carries only label/phase/status (no stats).
+		const agents = engine.statusOf(handle.runId)?.record.agents ?? [];
+		expect(agents).toHaveLength(1);
+		expect(agents[0]).toEqual({
+			label: "cachee",
+			phase: "Review",
+			status: "cached",
+		});
+
+		await engine.dispose();
+	});
+
+	test("a cancelled run persists the partial agents accumulated through the stop", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_enr0003"),
+		});
+		await engine.ready();
+
+		// Two sequential agents: the first completes (enriched end → accumulated),
+		// the second is in flight when the run is stopped. Aborting the run settles
+		// the in-flight agent on a non-completed terminal status, so its end fires
+		// too — the rollup captures BOTH, proving partial agents survive a cancel.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		const launchedAt = mclock.now();
+		bump(500);
+		await driveIdle(engine, first, bump);
+		const firstEndAt = mclock.now();
+
+		// The second agent has launched but never idles; stop it mid-flight.
+		await flush();
+		expect(sessions.length).toBe(2);
+		const second = sessions[1] as string;
+		engine.stopRun(handle.runId);
+		await flush();
+
+		const status = engine.statusOf(handle.runId);
+		expect(status?.record.status).toBe("cancelled");
+
+		const agents = status?.record.agents ?? [];
+		expect(agents).toHaveLength(2);
+		// The first agent completed cleanly before the stop — full enriched summary.
+		expect(agents[0]).toMatchObject({
+			label: "one",
+			phase: "P",
+			sessionID: first,
+			status: "completed",
+			toolCalls: 0,
+			durationMs: firstEndAt - launchedAt,
+		});
+		// The second agent's end fired on the abort with a non-completed status; it is
+		// still rolled up (partial truth), keyed to its own session.
+		expect(agents[1]).toMatchObject({
+			label: "two",
+			phase: "P",
+			sessionID: second,
+			status: "cancelled",
+		});
+
+		await engine.dispose();
+	});
+});

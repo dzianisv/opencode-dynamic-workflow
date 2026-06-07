@@ -24,7 +24,33 @@
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { StampedProgressEvent } from "../runtime/types";
+import type { ProgressEvent, StampedProgressEvent } from "../runtime/types";
+import type { SessionTokenSnapshot } from "./session-stats";
+
+/**
+ * An engine-side enriched `agent:end` (Task 8.1.4) — a stamped progress event
+ * widened at the engine choke point with the per-agent stats the runtime
+ * deliberately never carries (it is clock-free and telemetry-free by design).
+ * Plugin-local: the runtime layer never sees enrichment. Both `handle.progress`
+ * (read by `workflow_status`) and the feed file carry this identical widened
+ * object — one source of truth — so it lives here beside the {@link FeedEvent}
+ * union it joins. Non-end events ride through as plain {@link StampedProgressEvent}.
+ */
+export type EnrichedProgressEvent =
+	| StampedProgressEvent
+	| (Extract<ProgressEvent, { type: "agent:end" }> & {
+			at: number;
+			/** `agent:end.at − agent:launched.at`, from the engine clock. */
+			durationMs?: number;
+			/** The collector's final rolled-up token snapshot. */
+			tokens?: SessionTokenSnapshot;
+			/** Terminal tool-call count from the collector. */
+			toolCalls?: number;
+			/** Resolved model, carried from `agent:launched`. */
+			model?: string;
+			/** Resolved subagent type, carried from `agent:launched`. */
+			agentType?: string;
+	  });
 
 /** A run-lifecycle line bracketing the feed — written once at record creation. */
 export interface RunStartLine {
@@ -72,13 +98,13 @@ export interface AgentStatsLine {
 }
 
 /**
- * One line in the feed file: an engine-stamped progress event, one of the two
- * run-lifecycle lines, or a throttled per-agent stats line. Every member carries
- * `at` (engine wall-clock), so a tail reader can order by emission time without a
- * separate timestamp column.
+ * One line in the feed file: an engine-stamped (and, for live `agent:end`,
+ * enriched) progress event, one of the two run-lifecycle lines, or a throttled
+ * per-agent stats line. Every member carries `at` (engine wall-clock), so a tail
+ * reader can order by emission time without a separate timestamp column.
  */
 export type FeedEvent =
-	| StampedProgressEvent
+	| EnrichedProgressEvent
 	| RunStartLine
 	| RunEndLine
 	| AgentStatsLine;

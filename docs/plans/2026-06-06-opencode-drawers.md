@@ -1173,7 +1173,7 @@ interface SessionRunner {
 
 #### Task 8.1.4: Enriched `agent:end` + per-agent rollup on the RunRecord
 
-- [ ] Done
+- [x] Done
 
 **Context:** the choke point (`engine.ts:632-637`) sees the full event stream in order: `agent:launched` (with `at`) precedes its `agent:end` (same sessionID, Task 8.1.1). The collector (Task 8.1.3) holds final token/tool stats at `agent:end` time. `RunRecord` (`engine.ts:80-105`) carries `diagnostics` since Phase 7 but nothing per-agent — post-hoc `workflow_status` cannot show what CC shows (per-agent model/tokens/tools/duration) without re-parsing the feed.
 
