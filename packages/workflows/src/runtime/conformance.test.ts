@@ -78,9 +78,18 @@ interface PartEntry {
 	state?: { status: string; output?: string; error?: string };
 }
 interface MessageEntry {
-	info: { role: "user" | "assistant" };
+	info: { role: "user" | "assistant"; time: { created: number } };
 	parts: PartEntry[];
 }
+
+/**
+ * Fake message-creation time. The gate's turn watermark (Task 6.1.1) accepts
+ * only output created at/after the current turn's dispatch. These conformance
+ * fakes serve a fixed transcript regardless of fetch time, so they stamp a
+ * created-time guaranteed to sit at/after any dispatch the harness reaches —
+ * i.e. "this-turn output" — keeping completion behavior unchanged.
+ */
+const FAKE_CREATED = Number.MAX_SAFE_INTEGER;
 
 /** A scripted session: the transcript to serve, and an error flag. */
 interface SessionScript {
@@ -169,7 +178,12 @@ function makeScriptedClient() {
 }
 
 function done(text: string): MessageEntry[] {
-	return [{ info: { role: "assistant" }, parts: [{ type: "text", text }] }];
+	return [
+		{
+			info: { role: "assistant", time: { created: FAKE_CREATED } },
+			parts: [{ type: "text", text }],
+		},
+	];
 }
 function defaultDone(): MessageEntry[] {
 	return done("ok");

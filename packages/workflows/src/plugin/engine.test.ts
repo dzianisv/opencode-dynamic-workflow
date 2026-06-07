@@ -799,7 +799,7 @@ function makeCompletingClient(reply = "AGENT_RESULT") {
 				messages: async () => ({
 					data: [
 						{
-							info: { role: "assistant" as const },
+							info: { role: "assistant" as const, time: { created: NOW } },
 							parts: [{ type: "text", text: reply }],
 						},
 					],
@@ -1239,7 +1239,11 @@ function makeBudgetClient(tokens: { output: number; reasoning: number }) {
 				messages: async () => ({
 					data: [
 						{
-							info: { role: "assistant" as const, tokens },
+							info: {
+								role: "assistant" as const,
+								tokens,
+								time: { created: NOW },
+							},
 							parts: [{ type: "text", text: "REPLY" }],
 						},
 					],

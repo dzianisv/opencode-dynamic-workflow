@@ -54,9 +54,16 @@ export interface GatePart {
 	state?: { status: string; output?: string; error?: string };
 }
 
-/** A message as returned by `session.messages` (audit row c), narrowed. */
+/**
+ * A message as returned by `session.messages` (audit row c), narrowed.
+ *
+ * `info.time.created` is the message-creation epoch ms. It is typed on BOTH
+ * `UserMessage` (`time: { created }`) and `AssistantMessage`
+ * (`time: { created; completed? }`) in the SDK `types.gen.d.ts`, so the turn
+ * watermark (Task 6.1.1) can compare against it without any `as any`.
+ */
 export interface GateMessage {
-	info: { role: "user" | "assistant" };
+	info: { role: "user" | "assistant"; time: { created: number } };
 	parts: GatePart[];
 }
 
@@ -133,6 +140,16 @@ export interface CompletionGate {
 	 * to `running` with a fresh `startedAt`, before the new prompt is dispatched.
 	 */
 	resetForResume(task: BgTask): void;
+	/**
+	 * Stamp the turn watermark for a task: the moment its current turn was
+	 * dispatched (`clock.now()`). Output validation accepts only assistant
+	 * messages created at/after this watermark, so a resumed turn (Task 6.1.1)
+	 * is never completed by the PREVIOUS turn's output still in the transcript.
+	 * Call at every dispatch — launch's first prompt AND resume's re-prompt —
+	 * AFTER {@link CompletionGate.resetForResume} on the resume path. Also evicts
+	 * any cached positive for the session so a turn-N cache can't satisfy turn N+1.
+	 */
+	markTurnDispatched(task: BgTask): void;
 	/** Begin the safety poll. Idempotent. */
 	start(): void;
 	dispose(): Promise<void>;
@@ -167,11 +184,19 @@ function sessionErrorMessage(
 	return name ?? "session error";
 }
 
-/** A session has valid output iff ≥1 assistant message has non-empty text/tool parts. */
-function hasValidOutput(messages: GateMessage[]): boolean {
+/**
+ * A session has valid THIS-TURN output iff ≥1 assistant message created at/after
+ * `watermark` has non-empty text/tool parts. The watermark is the current turn's
+ * dispatch time (Task 6.1.1): messages from earlier turns (created before it)
+ * are ignored, so the previous turn's output can't complete a resumed turn.
+ */
+function hasValidOutput(messages: GateMessage[], watermark: number): boolean {
 	for (const m of messages) {
 		if (m.info.role !== "assistant") {
 			continue;
+		}
+		if (m.info.time.created < watermark) {
+			continue; // stale: from a turn dispatched before this one
 		}
 		for (const p of m.parts) {
 			if (p.type === "text" && p.text && p.text.trim().length > 0) {
@@ -214,6 +239,13 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	const validatedSessions = new Set<string>();
 	/** Consecutive `session.get` miss counts per task id. */
 	const getMisses = new Map<string, number>();
+	/**
+	 * Per-task turn watermark (epoch ms): the dispatch moment of the current
+	 * turn. Output validation accepts only assistant messages created at/after
+	 * this value, so a resumed turn is never satisfied by the previous turn's
+	 * output. Absent → fall back to the task's turn boundary (`startedAt`).
+	 */
+	const turnWatermark = new Map<string, number>();
 	/** Pending deferred-idle timers per task id (so dispose can clear them). */
 	const deferTimers = new Map<string, TimerHandle>();
 
@@ -299,6 +331,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		// drop per-task bookkeeping now that it is terminal.
 		lastActivity.delete(task.id);
 		getMisses.delete(task.id);
+		turnWatermark.delete(task.id);
 		const dt = deferTimers.get(task.id);
 		if (dt) {
 			dt.clear();
@@ -330,8 +363,23 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		}
 	}
 
-	/** Validate output for a tracked running session; cache positive results. */
-	async function outputIsValid(sessionID: string): Promise<boolean> {
+	/** The current turn's watermark for a task: its stamped dispatch time, or the
+	 *  turn boundary (`startedAt ?? createdAt`) when no dispatch has been stamped. */
+	function watermarkOf(task: BgTask): number {
+		return turnWatermark.get(task.id) ?? task.startedAt ?? task.createdAt;
+	}
+
+	/**
+	 * Validate THIS-TURN output for a tracked running session; cache positive
+	 * results. Only assistant messages created at/after the task's turn watermark
+	 * count (Task 6.1.1) — stale previous-turn output can't satisfy a resumed turn.
+	 * The cache is per-session and is evicted on resume, so a turn-N positive never
+	 * leaks into turn N+1.
+	 */
+	async function outputIsValid(
+		task: BgTask,
+		sessionID: string,
+	): Promise<boolean> {
 		if (validatedSessions.has(sessionID)) {
 			return true;
 		}
@@ -345,7 +393,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 			});
 			return false;
 		}
-		if (hasValidOutput(messages)) {
+		if (hasValidOutput(messages, watermarkOf(task))) {
 			validatedSessions.add(sessionID);
 			return true;
 		}
@@ -424,7 +472,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		if (live?.status !== "running") {
 			return;
 		}
-		if (await outputIsValid(sessionID)) {
+		if (await outputIsValid(live, sessionID)) {
 			tryComplete(task.id, "completed");
 		}
 		// invalid → do not complete; the model may still be mid-flight. Safety
@@ -522,7 +570,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		}
 
 		// Session exists and is quiet: the fallback for a missed idle event.
-		if (graceElapsed(task) && (await outputIsValid(sessionID))) {
+		if (graceElapsed(task) && (await outputIsValid(task, sessionID))) {
 			tryComplete(task.id, "completed");
 		}
 	}
@@ -583,6 +631,18 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		lastActivity.set(task.id, clock.now());
 	}
 
+	function markTurnDispatched(task: BgTask): void {
+		// Watermark = dispatch moment. Output created before this is a prior turn's
+		// and must not validate this turn (Task 6.1.1). Also evict any cached
+		// positive: a turn-N validation must not satisfy turn N+1 (resume re-uses
+		// the same session id). resetForResume already evicts on the resume path;
+		// stamping here keeps the invariant uniform across launch and resume.
+		turnWatermark.set(task.id, clock.now());
+		if (task.sessionID) {
+			validatedSessions.delete(task.sessionID);
+		}
+	}
+
 	async function dispose(): Promise<void> {
 		disposed = true;
 		pollHandle?.clear();
@@ -606,6 +666,7 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		handleEvent,
 		awaitCompletion,
 		resetForResume,
+		markTurnDispatched,
 		start,
 		dispose,
 	};

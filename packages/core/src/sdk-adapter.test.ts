@@ -36,7 +36,9 @@ function makeFake(overrides: Partial<Record<string, unknown>> = {}): {
 			}),
 			abort: record("abort", { data: true }),
 			messages: record("messages", {
-				data: [{ info: { role: "assistant" }, parts: [] }],
+				data: [
+					{ info: { role: "assistant", time: { created: 1000 } }, parts: [] },
+				],
 			}),
 			get: record("get", { data: { id: "ses_new" } }),
 			...overrides,
@@ -113,7 +115,11 @@ describe("adaptSdkClient", () => {
 			method: "messages",
 			opts: { path: { id: "ses_1" } },
 		});
-		expect(res).toEqual({ data: [{ info: { role: "assistant" }, parts: [] }] });
+		expect(res).toEqual({
+			data: [
+				{ info: { role: "assistant", time: { created: 1000 } }, parts: [] },
+			],
+		});
 	});
 
 	test("messages: null data narrows to { data: undefined }", async () => {
