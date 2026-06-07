@@ -54,7 +54,14 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -574,6 +581,112 @@ async function scenarioE(dataDir: string, beforeCount: number): Promise<void> {
 	);
 }
 
+async function scenarioF(dataDir: string, beforeCount: number): Promise<void> {
+	log("");
+	log(
+		"=== Scenario F: external touch cancels a live run (filesystem sentinel) ===",
+	);
+	// The ONLY scenario that proves the EXTERNAL control channel (Epic 8.2) end-to-end
+	// against a real headless opencode. Scenario B proves the IN-SESSION cancel path
+	// (workflow_stop tool → stopRun in the same turn). Here a process OTHER than the
+	// opencode server — this harness — cancels a live run by touching a filesystem
+	// sentinel under <dataDir>/workflow-control/. PASS iff the engine's poll loop
+	// (≤1s cadence) observes the sentinel inside the live server, cancels the run, and
+	// consumes (unlinks) the sentinel. This is the honest proof that 8.2.2's watcher
+	// fires in a real server, not just in unit tests.
+	//
+	// Reuse Scenario B's `longrun` script — one slow agent — but launch it WITHOUT any
+	// in-session stop: the model calls `workflow` only and replies with the run_id.
+	// The cancel comes exclusively from the external touch below.
+	const longrunScript = [
+		"export const meta = { name: 'longrun', description: 'one long agent' };",
+		"const r = await agent('Count slowly from 1 to 50, one number per line.', { label: 'long' });",
+		"return r;",
+	]
+		.join("\n")
+		.replace(/'/g, "\\'");
+	const prompt =
+		"You have a tool named workflow. It IS available. " +
+		"This is an explicit multi-agent orchestration request (opt-in satisfied). " +
+		"In this single turn, do EXACTLY this and nothing else: " +
+		`(1) call workflow with { "script": "${longrunScript}" }. ` +
+		"(2) Reply with only the run_id it returns. " +
+		"Do NOT call workflow_stop. Do NOT call any other tool. Do not refuse.";
+	// Snapshot the ids already on disk so we identify only F's new run, never a prior
+	// one (same discipline as Scenario D/E).
+	const priorIds = new Set((await readRuns(dataDir)).map((r) => r.id));
+	await runUntilRunAppears(prompt, dataDir, beforeCount);
+
+	// Identify the NEW run while it is still live: poll the store (bounded ~10s, same
+	// sleep/deadline shape as waitForTerminal) for a `running` record whose id is not
+	// in the prior set. Capturing it `running` is what makes this a LIVE-run cancel.
+	const runId = await (async () => {
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			const fresh = (await readRuns(dataDir)).find(
+				(r) => r.status === "running" && !priorIds.has(r.id),
+			);
+			if (fresh) {
+				return fresh.id;
+			}
+			await sleep(500);
+		}
+		throw new Error(
+			"Scenario F: no NEW run reached status 'running' within 10s — could not " +
+				"capture a live run to cancel externally.",
+		);
+	})();
+	log(`  captured live run ${runId} (status running)`);
+
+	// The literal external `touch`: this harness process — NOT the opencode server —
+	// writes the sentinel into the control dir using node:fs/promises. mkdir is
+	// recursive because the control dir is not created until something touches it.
+	const controlDir = join(dataDir, "workflow-control");
+	const sentinelName = `${runId}.cancel`;
+	await mkdir(controlDir, { recursive: true });
+	await writeFile(join(controlDir, sentinelName), "");
+	log(`  external touch: ${join(controlDir, sentinelName)}`);
+
+	// The engine's poll loop must observe the sentinel and cancel the live run.
+	const record = await waitForTerminal(
+		dataDir,
+		(r) => r.id === runId && r.status === "cancelled",
+		30_000,
+	);
+	log(`  run ${record.id} settled 'cancelled' via external sentinel`);
+
+	// The sentinel must be CONSUMED (unlinked) by the watcher. The unlink happens in
+	// the same tick as the cancel, but the file probe races the record settle, so
+	// poll briefly (~5s).
+	const consumed = await (async () => {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			let names: string[];
+			try {
+				names = await readdir(controlDir);
+			} catch {
+				// The control dir vanished entirely — sentinel is gone.
+				return true;
+			}
+			if (!names.includes(sentinelName)) {
+				return true;
+			}
+			await sleep(250);
+		}
+		return false;
+	})();
+	if (!consumed) {
+		throw new Error(
+			`Scenario F: the engine cancelled the run but did NOT consume the sentinel ` +
+				`'${sentinelName}' within 5s — a stale sentinel would re-fire on the next poll.`,
+		);
+	}
+	log(
+		`Scenario F PASS: external touch of ${sentinelName} cancelled live run ${runId} ` +
+			`end-to-end and the watcher consumed the sentinel`,
+	);
+}
+
 async function main(): Promise<void> {
 	log(`opencode binary: ${OPENCODE_BIN}`);
 	log(`model (forced via --model): ${OPENCODE_MODEL}`);
@@ -590,6 +703,8 @@ async function main(): Promise<void> {
 		await scenarioD(dataDir, afterC);
 		const afterD = (await readRuns(dataDir)).length;
 		await scenarioE(dataDir, afterD);
+		const afterE = (await readRuns(dataDir)).length;
+		await scenarioF(dataDir, afterE);
 
 		log("");
 		log("================ PASS ================");
@@ -598,6 +713,7 @@ async function main(): Promise<void> {
 		log("C: resume all-cached, no child relaunch (new process)     ✓");
 		log("D: structured output → validated object returnValue       ✓");
 		log("E: liveness veto over-block guard (long tool turn whole)  ✓");
+		log("F: external touch → live run cancelled, sentinel consumed ✓");
 		log("======================================");
 	} catch (err) {
 		exitCode = 1;

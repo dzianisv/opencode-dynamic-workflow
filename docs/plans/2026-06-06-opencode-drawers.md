@@ -1250,7 +1250,7 @@ interface SessionRunner {
 
 #### Task 8.2.3: Smoke harness Scenario F — external `touch` cancels a live run end-to-end
 
-- [ ] Done
+- [x] Done
 
 **Context:** `run-smoke.ts` (`packages/workflows/test-harness/run-smoke.ts`) drives a REAL headless opencode loading the actual plugin, and observes authoritative persisted state under `$OPENCODE_DRAWERS_DATA_DIR`. Scenario B (`run-smoke.ts:315-339`) already proves the IN-SESSION cancel path (`workflow_stop` tool → `stopRun`); it reuses the `longrun` script (`agent('Count slowly from 1 to 50…')`, `run-smoke.ts:318-324`) and `waitForTerminal(dataDir, r => r.status === "cancelled", 30_000)`. The harness has `readRuns(dataDir)` (`run-smoke.ts:149`) returning records with `id`/`status`, and `runUntilRunAppears` (`run-smoke.ts:198`) to launch a run and confirm a record appeared. What's NOT yet proven end-to-end is the EXTERNAL channel: a process other than the opencode server cancelling via the filesystem sentinel — the only honest proof that 8.2.2's poll loop fires inside a live server, not just in unit tests.
 
