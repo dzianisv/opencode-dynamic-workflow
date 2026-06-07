@@ -279,9 +279,11 @@ describe("createWorkflowEngine — statusOf progress accumulation", () => {
 
 		const status = engine.statusOf(handle.runId);
 		const logs = (status?.progress ?? []).filter((e) => e.type === "log");
+		// Events are engine-stamped at the onProgress boundary (Task 6.2.1): each
+		// carries `at = clock.now()` (the fixed NOW here).
 		expect(logs).toEqual([
-			{ type: "log", message: "step one" },
-			{ type: "log", message: "step two" },
+			{ type: "log", message: "step one", at: NOW },
+			{ type: "log", message: "step two", at: NOW },
 		]);
 
 		await engine.dispose();

@@ -21,6 +21,7 @@
 
 import type { FsFacade } from "@drawers/core";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import { parseScript } from "../../runtime/meta";
 import type { WorkflowEngine } from "../engine";
 
 /** The saved-workflow subdirectory under the project directory. */
@@ -115,6 +116,56 @@ function resolveArgs(raw: unknown): ArgsResult {
 	}
 	// Number/boolean — accept verbatim (a script may legitimately read a scalar).
 	return { ok: true, value: raw };
+}
+
+/**
+ * Build the architecture-echo block for the immediate return (Task 6.2.2).
+ *
+ * This is an HONEST APPROXIMATION, not a DAG: static analysis of arbitrary JS
+ * cannot promise the real execution shape (a primitive may be called in a loop,
+ * behind a branch, or not at all). So the counts are cheap regex hits over the
+ * source, explicitly labeled "detected" call-sites. The journal records the real
+ * shape after execution; this just orients the model at submit time.
+ *
+ * The block carries (when extractable): meta name + phase titles, then a single
+ * detected-primitives line counting `agent(`, `pipeline(`, `parallel(`,
+ * `workflow(` call-sites and noting whether any `schema` appears. Returns `[]`
+ * when no source is in hand (a resume that inherits the prior script) so the
+ * caller emits nothing.
+ */
+function architectureEcho(source: string | undefined): string[] {
+	if (source === undefined) {
+		return [];
+	}
+	const lines: string[] = [];
+
+	// Meta name + phases — parsed leniently; a parse failure just omits this line.
+	try {
+		const { meta } = parseScript(source);
+		const phases = meta.phases?.map((p) => p.title) ?? [];
+		lines.push(
+			phases.length > 0
+				? `Architecture: ${meta.name} — phases: ${phases.join(" → ")}.`
+				: `Architecture: ${meta.name}.`,
+		);
+	} catch {
+		// Unparseable meta → skip the name/phases line; still report detected counts.
+	}
+
+	const count = (re: RegExp): number => source.match(re)?.length ?? 0;
+	// Word-boundary before the name so `subAgent(` / `myPipeline(` do not match.
+	const agents = count(/\bagent\(/g);
+	const pipelines = count(/\bpipeline\(/g);
+	const parallels = count(/\bparallel\(/g);
+	const workflows = count(/\bworkflow\(/g);
+	const hasSchema = /\bschema\b/.test(source);
+
+	lines.push(
+		`Detected call-sites (static approximation, not a DAG): ${agents} agent, ` +
+			`${pipelines} pipeline, ${parallels} parallel, ${workflows} workflow` +
+			`${hasSchema ? "; schema present" : ""}.`,
+	);
+	return lines;
 }
 
 /** Read a saved workflow by name: try <dir>/<name>.js, then .mjs. */
@@ -333,13 +384,17 @@ export function createWorkflowTool(
 				resumeFrom !== undefined
 					? `Resumed workflow ${result.runId} (${result.name}), resumed from ${resumeFrom}.`
 					: `Launched workflow ${result.runId} (${result.name}).`;
-			return [
+			// The run-id-first line + persistence + no-poll guidance stay one line (the
+			// model parses the leading line for the run id). The architecture echo
+			// (Task 6.2.2) follows as its own line(s) — empty on a source-less resume.
+			const head = [
 				launched,
 				`Script persisted at ${result.scriptPath}.`,
 				"It runs in the background — do not poll; you will be notified on " +
 					`completion. Use workflow_status run_id=${result.runId} to inspect ` +
 					"progress or read the result.",
 			].join(" ");
+			return [head, ...architectureEcho(source)].join("\n");
 		},
 	});
 }

@@ -13,9 +13,11 @@
  * registry), and returns the hooks:
  *   - `event` → `engine.handleEvent` so the runner's completion gate sees the
  *     live session.idle / session.error stream the workflow children ride on;
- *   - `chat.message` → drains the per-parent notice queue into the parent's next
- *     message (core's `createChatMessageHook`); fully fenced so a queue/render
- *     failure never kills the prompt;
+ *   - `chat.message` → prepends a one-line digest per LIVE run owned by the parent
+ *     (Task 6.2.4), then drains the per-parent TERMINAL notice queue into the
+ *     parent's next message (core's `createChatMessageHook`, wrapped by
+ *     `createWorkflowChatMessageHook`); fully fenced so a queue/render failure
+ *     never kills the prompt;
  *   - `tool` — the global `structured_output` tool over the engine's shared
  *     registry (so any workflow child can return a schema-conforming result),
  *     plus `workflow` / `workflow_status` / `workflow_stop`: launch a run, inspect
@@ -26,13 +28,10 @@
  * `client.app.log` (structured JSON) — never `console`.
  */
 
-import {
-	adaptSdkClient,
-	createChatMessageHook,
-	createToastNotifier,
-} from "@drawers/core";
+import { adaptSdkClient, createToastNotifier } from "@drawers/core";
 import type { Plugin } from "@opencode-ai/plugin";
 import { createStructuredOutputTool } from "../runtime/structured/tool";
+import { createWorkflowChatMessageHook } from "./digest-hook";
 import { createWorkflowEngine, type EngineLogger } from "./engine";
 import { createWorkflowTool } from "./tools/workflow";
 import { createWorkflowStatusTool } from "./tools/workflow-status";
@@ -84,7 +83,7 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory }) => {
 		event: async ({ event }) => {
 			await engine.handleEvent(event);
 		},
-		"chat.message": createChatMessageHook(engine.queue, logger),
+		"chat.message": createWorkflowChatMessageHook(engine, engine.queue, logger),
 		tool: {
 			structured_output: createStructuredOutputTool(engine.registry),
 			workflow: createWorkflowTool(engine, { directory }),

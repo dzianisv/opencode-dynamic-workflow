@@ -218,6 +218,95 @@ describe("createWorkflowTool — inline script happy path", () => {
 	});
 });
 
+describe("createWorkflowTool — architecture echo at submit (Task 6.2.2)", () => {
+	const REVIEW = `export const meta = { name: "review-changes", description: "Review changed files", phases: [{ title: "Review" }, { title: "Verify" }] };
+const results = await pipeline(
+  args.files,
+  (f) => agent("Review " + f, { phase: "Review", schema: FINDINGS }),
+  (r, f) => r && parallel(r.issues.map((i) => () => agent("Verify " + i, { phase: "Verify" }))),
+);
+return { verified: results };
+`;
+
+	test("echoes meta name + phases alongside the run-id-first line", async () => {
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0001") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: REVIEW }, ctx("ses_parent"));
+
+		// Run-id-first line is intact (the model parses it).
+		expect(out.startsWith("Launched workflow wf_arch0001")).toBe(true);
+		// Architecture echo: meta name + phase titles.
+		expect(out).toContain("review-changes");
+		expect(out).toContain("Review");
+		expect(out).toContain("Verify");
+		await engine.dispose();
+	});
+
+	test("echoes detected primitive call-site counts, labeled as detected (not a DAG)", async () => {
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0002") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: REVIEW }, ctx("ses_parent"));
+
+		// Honest framing: these are DETECTED call-sites, not a proven graph.
+		expect(out.toLowerCase()).toContain("detected");
+		// REVIEW has 2 agent( call-sites, 1 pipeline(, 1 parallel(, and a schema.
+		expect(out).toContain("agent");
+		expect(out).toContain("pipeline");
+		expect(out).toContain("parallel");
+		expect(out).toContain("schema");
+		await engine.dispose();
+	});
+
+	test("counts agent() call-sites accurately on a multi-agent script", async () => {
+		const SCRIPT = `export const meta = { name: "fan", description: "d" };
+await agent("one");
+await agent("two");
+await agent("three");
+return 1;
+`;
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0003") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: SCRIPT }, ctx("ses_parent"));
+		// Three agent( call-sites detected.
+		expect(out).toMatch(/3.*agent/);
+		await engine.dispose();
+	});
+
+	test("a resume with no source override omits the architecture block (no source in hand)", async () => {
+		// Seed a prior run so the resume path succeeds with no source param.
+		const META_LOCAL = `export const meta = { name: "demo", description: "d" };\n`;
+		const ONE_AGENT = `${META_LOCAL}const r = await agent("do work");\nreturn r;\n`;
+		const record = {
+			id: "wf_priorA",
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_priorA.js`,
+		};
+		const files = {
+			[`${BASE}/workflow-runs/wf_priorA.json`]: JSON.stringify(record),
+			[`${BASE}/workflow-scripts/wf_priorA.js`]: ONE_AGENT,
+		};
+		const { engine, facade } = makeEngine({
+			files,
+			ids: fixedIds("wf_resumeA"),
+		});
+		await engine.ready();
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(
+			t,
+			{ resume_from_run_id: "wf_priorA" },
+			ctx("ses_parent"),
+		);
+		// Run-id-first line still intact; no detected-primitives block.
+		expect(out).toContain("wf_resumeA");
+		expect(out.toLowerCase()).not.toContain("detected");
+		await engine.dispose();
+	});
+});
+
 describe("createWorkflowTool — saved-name resolution", () => {
 	const wfDir = `${DIRECTORY}/.opencode/workflows`;
 
