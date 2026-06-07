@@ -4,7 +4,7 @@
 # Dependencies
 node_modules/
 
-# Build output
+# Build output (CI builds before publish; npm packs it via `files`)
 dist/
 *.tsbuildinfo
 

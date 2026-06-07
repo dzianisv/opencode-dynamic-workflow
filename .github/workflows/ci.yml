@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+      - run: bun install --frozen-lockfile
+      - name: Test
+        run: bun test
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Lint
+        run: bun run lint
+      - name: Build (bundle, verify publish artifacts compile)
+        run: bun run build
