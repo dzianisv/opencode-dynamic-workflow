@@ -25,6 +25,7 @@
 | 5 | Both plugins documented (READMEs + authoring guide) and published to npm, installable in a clean project via `"plugin": [...]` | 5.1, 5.2 | 5.1 Complete / 5.2 Epic-level |
 | 6 | CC parity: structured results survive slow real-world turns (completion-gate watermark), absolute `script_path` works, live in-session workflow observability, active parent wake | 6.1, 6.2, 6.3 | Complete |
 | 7 | Mid-turn completion eliminated (turn-liveness gate: session status + message `time.completed`); structured/empty failures carry diagnostics and full results are retrievable; resume replays journaled items per-item (key+occurrence) instead of prefix | 7.1, 7.2, 7.3 | Complete |
+| 8 | Live observability + native viewer: real-time per-run feed with per-agent tokens/tool-calls/duration, external cancel channel, and a `./tui`-surface full-screen viewer (Phases \| Agents \| Detail) mirroring CC's `/workflows` overlay | 8.1, 8.2, 8.3 | 8.1 Detailed / 8.2–8.3 Epic-level |
 
 ## Design decisions (binding across phases)
 
@@ -1095,6 +1096,128 @@ interface SessionRunner {
 **Verification:** RED-first: (1) edited item 0 + unchanged items 1..3 → item 0 live, 1..3 cached (the R4 scenario, asserted via `agent:end` statuses); (2) N byte-identical calls journaled → N replays, N+1th runs live (occurrence semantics); (3) previously-null item absent from journal → runs live; (4) reordered identical-key calls still replay (position independence); (5) sub-workflow boundary replays by key. Existing prefix tests rewritten to the new semantics — deleting a now-false test is correct, silently weakening one is not. Full suite + typecheck + lint.
 
 **Done when:** the R4 scenario replays the unchanged sibling for free; no `prefixIntact` remains; docs/tool descriptions tell the new truth.
+
+---
+
+## Phase 8 — Live observability: progress feed, control channel, native TUI viewer
+
+**Origin (field validation, 2026-06-07).** Phase 7 passed live validation — the helm 5-reviewer review ran end-to-end with structured verdicts intact. The next gap is UX parity with CC's `/workflows` overlay: live phases tree, per-agent `model · tokens · tool calls · duration`, drill-down with prompt/activity/outcome, and stop controls. Today our observability is the textual `workflow_status` tool only, and per-agent stats (tokens, tool-call counts) are not captured anywhere — core's completion gate deliberately narrows messages to `GateMessage` (`packages/core/src/completion.ts:50-74`), which strips `AssistantMessage.tokens` and tool-part inputs.
+
+**Architecture facts (verified against `.references/opencode`, 2026-06-07):**
+- opencode now has a second plugin surface — the `"./tui"` package export — loaded by the TUI process via plain `await import()` (`.references/opencode/packages/opencode/src/plugin/loader.ts:139`): **no sandbox, full Bun fs access**. TUI plugins register full-screen routes (`api.route.register`), host slots (12 slots incl. `sidebar_content`), keybind layers, and subscribe to the SDK event bus (`.references/opencode/packages/plugin/src/tui.ts:455-486,589-622`).
+- The workflows server plugin already routes ALL SDK events into the engine (`packages/workflows/src/plugin/index.ts:107-108` → `engine.handleEvent`, `engine.ts:225,760`); `message.updated` carries `AssistantMessage.tokens` (`.references/opencode/packages/sdk/js/src/gen/types.gen.ts:112-141`, tokens at 131-139) and `message.part.updated` carries `ToolPart` with name + input (`types.gen.ts:294-305`) — per-agent stats are available WITHOUT widening core's gate types.
+- The engine already has a single progress choke point that stamps every runtime event (`engine.ts:632-637`); the runtime itself is clock-free by design — durations are an engine-side derivation from stamped `at` deltas, never a runtime concern.
+
+**Binding decisions for this phase:**
+- **Feed file is the bus.** The engine appends every enriched event to `<dataDir>/workflow-feed/<runId>.jsonl`; the TUI viewer only tails files. One source of truth; the viewer holds no protocol with the server plugin. Headless runs still produce the feed (the viewer is a lens, not a dependency).
+- **Enrichment happens at the engine choke point** (`engine.ts:632-637`), so `handle.progress` (consumed by `workflow_status`) and the feed file see the same enriched stream.
+- **Feed writes are fenced** — an fs failure must never break a run (same stance as `onProgress` fencing).
+- **TUI surface risk accepted:** the `./tui` API is new; published types lag the runtime (`PluginModule.tui?: never` vs runtime accepting `tui()`). Pin and document the opencode version tested against; treat breakage on host bumps as expected maintenance.
+
+### Epic 8.1: Live progress feed + per-agent stats (data layer)
+
+**Goal:** every run produces a real-time JSONL feed carrying phases, per-agent lifecycle with `sessionID/model/agentType`, live token + tool-call stats, and durations; `workflow_status` renders the CC-style tree from the same enriched stream; per-agent summaries persist on the RunRecord for post-hoc inspection.
+**Scope:** `packages/workflows/src/runtime/` (event vocabulary, emission sites), `packages/workflows/src/plugin/` (feed writer, stats collector, engine wiring, status tool).
+**Dependencies:** none (Phase 7 complete).
+**Done when:** a live smoke run produces a `workflow-feed/<runId>.jsonl` whose `agent:end` lines carry tokens/toolCalls/durationMs; `workflow_status` shows per-agent `model · tokens · tools · duration` rows grouped by phase, live and post-hoc.
+
+#### Task 8.1.1: Extend the progress vocabulary — `agent:launched` + `sessionID` on `agent:end`
+
+- [ ] Done
+
+**Context:** `ProgressEvent` (`packages/workflows/src/runtime/types.ts:52-72`) has four members: `agent:start {label, phase?}`, `agent:end {label, status, note?}`, `log`, `warn`. `agent:start` is emitted before launch (`agent-call.ts:315`), so it cannot carry the child sessionID; the sessionID exists at `agent-call.ts:336` (`sessionId = task.sessionID`) and is in scope in the `finally` that emits `agent:end` (`agent-call.ts:426-433`). The cached path (`agent-call.ts:262-263`) never launches a session. Downstream consumers (engine choke, `workflow_status`, feed) need a session↔label binding to attach stats and compute durations.
+
+**Implementation vision:** Add `agent:launched { type, label, phase?, sessionID, model?, agentType? }` to the `ProgressEvent` union, emitted immediately after `runner.launch` returns (after `agent-call.ts:336`), with `model` resolved as `task.model ?? opts.model` (BgTask carries `model?: string`, `packages/core/src/types.ts:40`) and `agentType` as `opts.agentType ?? defaults.agent`. Add optional `sessionID?: string` to `agent:end`, set in the `finally` when `sessionId !== undefined` (cached and pre-launch-throw paths legitimately omit it). The runtime stays clock-free — NO timestamps or durations here; those are engine-side. Cached emissions are untouched (no session, no `agent:launched`).
+
+**Files:**
+- Modify: `packages/workflows/src/runtime/types.ts`, `packages/workflows/src/runtime/agent-call.ts`
+- Test: `packages/workflows/src/runtime/agent-call.test.ts`
+
+**Verification:** RED-first: live call emits `agent:start` → `agent:launched` (sessionID matches the fake runner's task, model/agentType resolved) → `agent:end` with the same sessionID; cached call emits only `start`/`end` with no sessionID; launch-throw path emits `agent:end` without sessionID. Full runtime suite + typecheck.
+
+**Done when:** the enriched sequence is observable in runtime tests and no existing consumer breaks (additive fields only).
+
+#### Task 8.1.2: Feed writer — `workflow-feed/<runId>.jsonl`
+
+- [ ] Done
+
+**Context:** the engine stamps every runtime event at one choke point (`packages/workflows/src/plugin/engine.ts:632-637`, pushes `StampedProgressEvent` to `handle.progress`); run records are created at `engine.ts:616` and settled at `engine.ts:673,690,707`. Data subdirs are declared as constants (`engine.ts:246-248`: `workflow-runs`, `workflow-scripts`, `workflow-journals`) under the base dir resolved by `resolveDataBaseDir` (`engine.ts:349-351`; XDG default per `packages/core/src/persistence.ts:91`). There is no on-disk live event stream today — `handle.progress` dies with the process.
+
+**Implementation vision:** New module `packages/workflows/src/plugin/feed.ts`: `createFeedWriter({ dir, runId })` → `{ append(event: FeedEvent): void, settled(): Promise<void> }`. `FeedEvent` = stamped/enriched progress events plus two lifecycle lines: `run:start { runId, parentSessionID, scriptPath?, at }` and `run:end { status, agentCount?, budgetSpent?, at }`. Writes are serialized through an internal promise chain (append order = emission order), each line `JSON.stringify + "\n"` via `fs.appendFile`, and **fenced**: any fs error flips the writer into a dead state (log once via the engine logger, drop subsequent appends) — a broken disk must never break a run. `settled()` awaits the chain drain (called before run settlement, same pattern as `journalWrites`). Engine wiring: add `SUBDIR_FEED = "workflow-feed"` beside `engine.ts:246-248`; write `run:start` where the initial record is created (`engine.ts:616`), append every stamped event inside the existing choke (`engine.ts:632-637`), write `run:end` at each settle site (`engine.ts:673,690,707`) and drain before returning. Feed files are append-only and never garbage-collected by this task (retention is out of scope; note it in the module doc).
+
+**Files:**
+- Create: `packages/workflows/src/plugin/feed.ts`
+- Modify: `packages/workflows/src/plugin/engine.ts`
+- Test: `packages/workflows/src/plugin/feed.test.ts`, `packages/workflows/src/plugin/engine.test.ts` (feed lines asserted in an e2e fake run)
+
+**Verification:** RED-first: temp-dir writer test asserts line ordering under interleaved appends, `run:start`/`run:end` framing, and the fenced-failure path (writer with a throwing fs records nothing yet the run completes); engine e2e asserts a completed fake run leaves a parseable JSONL whose first line is `run:start` and last is `run:end`. Full suite + typecheck + lint.
+
+**Done when:** every engine run (success, error, cancel) leaves a complete, parseable feed file, and a feed-write failure provably cannot fail a run.
+
+#### Task 8.1.3: Session stats collector — tokens + tool calls from the SDK event bus
+
+- [ ] Done
+
+**Context:** the plugin's `event` hook forwards every SDK event to `engine.handleEvent` (`packages/workflows/src/plugin/index.ts:107-108`), which today only forwards to the runner's completion gate (`engine.ts:225-226,760`). `message.updated` events carry the full v1 `AssistantMessage` including `tokens { input, output, reasoning, cache { read, write } }` (`.references/opencode/packages/sdk/js/src/gen/types.gen.ts:112-141`); `message.part.updated` carries `ToolPart { tool, callID, state }` with `state.input` (`types.gen.ts:294-305`). Events fire for ALL sessions including workflow children — the data for live per-agent stats already flows through the engine and is discarded.
+
+**Implementation vision:** New module `packages/workflows/src/plugin/session-stats.ts`: a collector with `register(sessionID, { runId, label })`, `unregister(sessionID)`, `snapshot(sessionID)` → `{ tokens: { input, output, reasoning, cacheRead, cacheWrite }, toolCalls, lastTools: string[], updatedAt }`, and `handleEvent(event)`. Token accounting: per-`messageID` map of the latest `tokens` (message.updated fires repeatedly per message — replace per message, sum across messages for the snapshot); tool accounting: count each tool part once on first sight of `state.status === "completed" | "error"` keyed by part id, and keep a 3-deep ring of `"toolName(inputPreview≤60chars)"` labels. Only registered sessions are tracked (everything else is dropped at the first key check — the hook is hot). Wiring: engine constructs one collector per engine instance, calls `collector.handleEvent` inside `handleEvent` (before the runner forward), registers on the choke-point sighting of `agent:launched`, unregisters after the final enrichment on `agent:end` (Task 8.1.4 consumes the snapshot). Throttled live emission: on stats change with ≥2000ms since the session's last emission, the engine appends `agent:stats { label, sessionID, tokens, toolCalls, lastTools, at }` to the feed (feed-only; NOT pushed to `handle.progress` — the status tool reads snapshots directly).
+
+**Files:**
+- Create: `packages/workflows/src/plugin/session-stats.ts`
+- Modify: `packages/workflows/src/plugin/engine.ts`
+- Test: `packages/workflows/src/plugin/session-stats.test.ts`, `packages/workflows/src/plugin/engine.test.ts`
+
+**Verification:** RED-first: synthetic v1 event sequences — repeated `message.updated` for one message does not double-count; multi-message sums are correct; tool parts count once across repeated part updates; unregistered sessions ignored; ring buffer holds the last 3 labels with truncated inputs; throttle emits at most one `agent:stats` per session per 2s window (fake clock). Full suite + typecheck.
+
+**Done when:** a fake run with synthetic child events yields correct token/tool snapshots and throttled `agent:stats` feed lines, with zero allocation cost for non-workflow sessions beyond one map lookup.
+
+#### Task 8.1.4: Enriched `agent:end` + per-agent rollup on the RunRecord
+
+- [ ] Done
+
+**Context:** the choke point (`engine.ts:632-637`) sees the full event stream in order: `agent:launched` (with `at`) precedes its `agent:end` (same sessionID, Task 8.1.1). The collector (Task 8.1.3) holds final token/tool stats at `agent:end` time. `RunRecord` (`engine.ts:80-105`) carries `diagnostics` since Phase 7 but nothing per-agent — post-hoc `workflow_status` cannot show what CC shows (per-agent model/tokens/tools/duration) without re-parsing the feed.
+
+**Implementation vision:** At the choke point, keep a per-run `Map<sessionID, { label, phase?, model?, agentType?, launchedAt }>` populated from `agent:launched`. On `agent:end` with a sessionID: compute `durationMs = at - launchedAt`, take the collector's final snapshot, enrich the stamped event (added fields: `durationMs`, `tokens`, `toolCalls`, `model`, `agentType`) **before** it is pushed to `handle.progress` and appended to the feed — both consumers see identical truth — then unregister the session from the collector. Cached `agent:end` events (no sessionID) pass through untouched. Accumulate each enriched end into `agents: AgentSummary[]` (`{ label, phase?, sessionID?, model?, agentType?, status, tokens?, toolCalls?, durationMs?, note? }` — cached entries carry only label/phase/status) and persist the array on the RunRecord at every settle site (`engine.ts:673,690,707`) alongside `diagnostics`. The map and accumulator live on the run handle (per-run, dropped at settle).
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/engine.ts` (choke-point enrichment, `RunRecord.agents`, settle sites)
+- Modify: `packages/workflows/src/runtime/types.ts` only if the enriched-event type is shared (prefer a plugin-local `EnrichedProgressEvent` type — the runtime never sees enrichment)
+- Test: `packages/workflows/src/plugin/engine.test.ts`
+
+**Verification:** RED-first: engine e2e fake run asserts (1) `agent:end` lines in the feed carry `durationMs` equal to the fake-clock delta and the collector's final tokens/toolCalls; (2) `handle.progress` carries the same enriched values; (3) the settled RunRecord's `agents` array matches, cached entries included with `status: "cached"` and no stats; (4) error/cancel settles still persist partial `agents`. Full suite + typecheck + lint.
+
+**Done when:** post-hoc, the RunRecord alone reconstructs CC's per-agent table; live, `handle.progress` carries the same data.
+
+#### Task 8.1.5: `workflow_status` CC-style rendering
+
+- [ ] Done
+
+**Context:** `workflow-status.ts` reconstructs agent state by pairing `agent:start`/`agent:end` (`packages/workflows/src/plugin/tools/workflow-status.ts:14,94`) and renders a flat list; it has no phases tree, no per-agent stats. After 8.1.4, `handle.progress` (live) and `RunRecord.agents` (settled) both carry model/tokens/toolCalls/durationMs; the collector exposes `snapshot()` for in-flight agents. CC's reference layout (the parity target): phases sidebar with `✓ Impl 5/5`-style counters, agent rows `✓ impl:kadm-leaf  opus-4.8  112.7k tok · 51 tools · 7m 8s`.
+
+**Implementation vision:** Rework the render: group agents by `phase` (events without phase go under a single unnamed group), each phase header `✓|✗|… <phase> <done>/<total>`; one row per agent occurrence: status marker, label, model (short form — strip the provider prefix), `<tokens> tok · <tools> tools · <duration>` where tokens formats as `112.7k`/`1.2M` (output+input+reasoning total? — NO: show **total of input+output+reasoning+cache.read+cache.write the way CC does, a single human number**; document the formula in a comment), duration as `7m 8s`. Running agents (start without end) pull live numbers from the collector snapshot via the engine; cached rows render `cached` in place of stats. Settled runs render from `RunRecord.agents` so the same view works after restart. Keep the existing sections (result preview, diagnostics, `full:true`) untouched below the tree. Formatting helpers (`formatTokens`, `formatDuration`) live in the tool module and are unit-tested.
+
+**Files:**
+- Modify: `packages/workflows/src/plugin/tools/workflow-status.ts`
+- Modify: `packages/workflows/src/plugin/engine.ts` (expose collector snapshot access on the engine surface for the tool)
+- Test: `packages/workflows/src/plugin/tools/workflow-status.test.ts`
+
+**Verification:** RED-first: fragment tests for a live run (phase grouping, running row with live snapshot stats, cached row), a settled run rendered purely from `RunRecord.agents`, and the formatting helpers (`999 → "999"`, `112_700 → "112.7k"`, `1_234_567 → "1.2M"`, `428_000ms → "7m 8s"`). Full suite + typecheck + lint.
+
+**Done when:** `workflow_status` output is a recognizable sibling of CC's `/workflows` tree for live and settled runs.
+
+### Epic 8.2: External control channel
+
+**Goal:** a process other than the opencode server (the TUI viewer, a shell `touch`) can cancel a live run through a file-based sentinel — no RPC between plugin surfaces.
+**Scope:** `packages/workflows/src/plugin/` (engine watch loop, `workflow-control/` subdir convention); feed gains a `run:cancel-requested` line for viewer feedback.
+**Dependencies:** Epic 8.1 (feed conventions, subdir layout).
+**Done when:** `touch <dataDir>/workflow-control/<runId>.cancel` cancels a live run end-to-end (settles as `cancelled`, children stopped, sentinel consumed), verified in the smoke harness.
+
+### Epic 8.3: Native TUI viewer (`./tui` surface)
+
+**Goal:** a full-screen workflow viewer inside the opencode TUI mirroring CC's `/workflows`: Phases | Agents | Detail panes, `j/k` navigation, enter to drill in, `x` to stop (via 8.2 sentinel), esc back; plus a `sidebar_content` slot summarizing active runs (`34/35 agents · 1h34m`) and a keybind to open the route.
+**Scope:** new `"./tui"` entrypoint on `packages/workflows` (dual export per `.references/opencode/packages/plugin/package.json:11-14`), Solid-JSX over opentui (`@opentui/core`/`keymap`/`solid` as peer deps), feed-tailing data layer (fs watch + poll fallback — TUI plugins load via plain `import()`, full fs access confirmed at `.references/opencode/packages/opencode/src/plugin/loader.ts:139`).
+**Dependencies:** Epics 8.1 (feed is the only data source) and 8.2 (stop control).
+**Done when:** with both surfaces installed, a live workflow renders phases/agents/detail updating in real time from the feed, `x` cancels through the sentinel, and the viewer renders settled runs from feed files after a TUI restart. Risk note: `./tui` API is new and types lag the runtime — pin the opencode version tested against and document the type-lag workaround.
 
 ---
 
