@@ -9,6 +9,7 @@ import {
 import type { ToolContext } from "@opencode-ai/plugin";
 import { createWorkflowRun } from "./index";
 import { createStructuredOutputTool } from "./structured/tool";
+import type { JournalEntry } from "./types";
 
 /**
  * Spec-conformance suite (Task 3.2.3). Scripts run as template strings against
@@ -451,19 +452,57 @@ describe("conformance (h) — cores gate limit enforced", () => {
 	});
 });
 
-// ---- (i) workflow() → Phase 4 error --------------------------------------
+// ---- (i) workflow() without a resolver → NestingError --------------------
 
-describe("conformance (i) — workflow() throws Phase 4", () => {
-	test("workflow() in script → status error mentioning Phase 4", async () => {
+describe("conformance (i) — workflow() needs a resolver (depth-1 guard)", () => {
+	test("a run with no resolveSubWorkflow → workflow() throws NestingError", async () => {
 		const h = makeHarness();
 		const run = createWorkflowRun({
 			runner: h.runner,
 			parentSessionID: "ses_root",
 			runId: "run_i",
 		});
+		// No resolveSubWorkflow → structurally a leaf/child: workflow() is unavailable.
 		const result = await run.run(`${META}return workflow("other");\n`);
 		expect(result.status).toBe("error");
-		expect(result.error).toContain("Phase 4");
+		expect(result.error).toContain("one level");
+	});
+
+	test("a top-level run WITH a resolver runs the child inline and returns its value", async () => {
+		const h = makeHarness();
+		// The child script returns a literal — no agents, settles instantly.
+		const CHILD = `export const meta = { name: "child", description: "c" };\nreturn { from: "child", got: args };\n`;
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_i2",
+			resolveSubWorkflow: async () => CHILD,
+		});
+		const result = await run.run(
+			`${META}const r = await workflow("helper", { x: 1 });\nreturn r;\n`,
+		);
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ from: "child", got: { x: 1 } });
+	});
+
+	test("workflow() inside a child throws NestingError (depth 1, structural)", async () => {
+		const h = makeHarness();
+		// The child itself tries to nest — its workflow() must throw (resolver undefined).
+		const GRANDCHILD = `export const meta = { name: "gc", description: "g" };\nreturn 1;\n`;
+		const CHILD = `export const meta = { name: "child", description: "c" };\nreturn await workflow("grandchild");\n`;
+		const run = createWorkflowRun({
+			runner: h.runner,
+			parentSessionID: "ses_root",
+			runId: "run_i3",
+			resolveSubWorkflow: async (ref) =>
+				typeof ref === "string" && ref === "grandchild" ? GRANDCHILD : CHILD,
+		});
+		// Parent calls workflow("child"); the child's own workflow("grandchild") must
+		// throw NestingError, which surfaces as the child's error → parent's
+		// workflow() rethrows → parent run status error.
+		const result = await run.run(`${META}return await workflow("child");\n`);
+		expect(result.status).toBe("error");
+		expect(result.error).toContain("one level");
 	});
 });
 
@@ -671,5 +710,65 @@ describe("conformance (k) — structured output", () => {
 		);
 		expect(result.status).toBe("error");
 		expect(result.error?.toLowerCase()).toContain("schema");
+	});
+});
+
+// ---- (l) replay round-trip: live run records → re-run replays cached ------
+
+describe("conformance (l) — replay round-trip", () => {
+	test("a recorded run replays with zero launches and the same returnValue", async () => {
+		const SCRIPT = `${META}const a = await agent("first");\nconst b = await agent("second");\nreturn [a, b];\n`;
+
+		// --- pass 1: live run, capturing journal entries via onRecord -----------
+		const recorded: JournalEntry[] = [];
+		const h1 = makeHarness();
+		h1.client.queueScript({ messages: done("R1") });
+		h1.client.queueScript({ messages: done("R2") });
+		const run1 = createWorkflowRun({
+			runner: h1.runner,
+			parentSessionID: "ses_root",
+			runId: "run_l1",
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		const p1 = run1.run(SCRIPT);
+		// Two SEQUENTIAL agent() calls: the second only launches after the first
+		// completes, so a single completeAllLive sweep misses it. Drive each live
+		// session as it appears, advancing the clock past MIN_IDLE each turn.
+		// Two SEQUENTIAL agent() calls: the second only launches after the first
+		// completes, so each turn drives ONE freshly-live session. Grace is forced
+		// elapsed by advancing the clock past MIN_IDLE; the direct idle path then
+		// completes on flush WITHOUT firing the awaitCompletion timeout timer.
+		for (let turn = 0; turn < 3; turn += 1) {
+			await flush();
+			const live = h1.client.liveSessionIds();
+			h1.clock.set(1000 + (turn + 1) * MIN_IDLE + 1);
+			for (const id of live) {
+				await h1.runner.handleEvent({
+					type: "session.idle",
+					properties: { sessionID: id },
+				} as never);
+				h1.client.completeSession(id);
+			}
+			await flush();
+		}
+		const r1 = await p1;
+		expect(r1.status).toBe("completed");
+		expect(r1.returnValue).toEqual(["R1", "R2"]);
+		expect(recorded.length).toBe(2);
+
+		// --- pass 2: replay with the captured entries → ZERO session.create -----
+		const h2 = makeHarness();
+		const run2 = createWorkflowRun({
+			runner: h2.runner,
+			parentSessionID: "ses_root",
+			runId: "run_l2",
+			replay: { entries: recorded, onRecord: () => {} },
+		});
+		const r2 = await run2.run(SCRIPT);
+		expect(r2.status).toBe("completed");
+		expect(r2.returnValue).toEqual(["R1", "R2"]);
+		// No child sessions were ever created on the replay pass.
+		expect(h2.client.liveCount()).toBe(0);
+		expect(h2.client.highWater()).toBe(0);
 	});
 });

@@ -27,6 +27,18 @@ export interface AgentOpts {
 /** Spawn a subagent; resolves to its final text, a validated object, or `null`. */
 export type AgentFn = (prompt: string, opts?: AgentOpts) => Promise<unknown>;
 
+/**
+ * Run another workflow inline as a sub-step (spec §8). `nameOrRef` is a saved-name
+ * string or a `{ scriptPath }` ref; `args` is the child's verbatim `args`. Resolves
+ * to the child's `return` value on completion, THROWS on child error (catchable,
+ * unlike `agent()`'s null), and is unavailable (throws {@link NestingError}) inside
+ * a child — nesting is one level deep.
+ */
+export type WorkflowFn = (
+	nameOrRef: string | { scriptPath: string },
+	args?: unknown,
+) => Promise<unknown>;
+
 /** The token budget as the script sees it (spec §6). */
 export interface BudgetView {
 	/** The hard ceiling for the turn, or `null` if none was set. */
@@ -48,6 +60,22 @@ export type ProgressEvent =
 export type ProgressEmitter = (e: ProgressEvent) => void;
 
 /**
+ * One journaled `agent()` call (spec §7). Only SETTLED, NON-null results are
+ * journaled: a failed/null agent must re-run on resume, never replay its failure.
+ * `key` is the {@link computeCallKey} hash of `(prompt, opts)`; `index` is the
+ * deterministic call ordinal (every `agent()` invocation, cached or live).
+ *
+ * Lives here (not in `../plugin/journal`) so the runtime layer stays free of any
+ * plugin import — journal.ts imports this type from the runtime instead.
+ */
+export interface JournalEntry {
+	index: number;
+	key: string;
+	status: "ok";
+	result: unknown;
+}
+
+/**
  * The complete set of globals available to a workflow script body (spec §3.3).
  * `pipeline`/`parallel` keep permissive signatures here — their concrete typing
  * arrives with their implementation (Task 3.2.2).
@@ -60,8 +88,8 @@ export interface RuntimeApi {
 	log: (message: string) => void;
 	args: unknown;
 	budget: BudgetView;
-	/** Sub-workflows are unsupported in this phase; always throws. */
-	workflow: (...args: unknown[]) => never;
+	/** Run another workflow inline as a sub-step (spec §8); see {@link WorkflowFn}. */
+	workflow: WorkflowFn;
 }
 
 /** The lifetime agent-count cap (1,000) was hit — a runaway-loop backstop (§5). */
@@ -90,5 +118,19 @@ export class NotYetSupportedError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "NotYetSupportedError";
+	}
+}
+
+/**
+ * `workflow()` was called inside a child workflow (spec §8: nesting is one level
+ * deep). Thrown structurally — a child run is built with no `resolveSubWorkflow`,
+ * so its `workflow()` global detonates rather than nesting a second level.
+ */
+export class NestingError extends Error {
+	constructor(
+		message = "sub-workflows are limited to one level — workflow() is unavailable inside a child workflow",
+	) {
+		super(message);
+		this.name = "NestingError";
 	}
 }

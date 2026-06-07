@@ -8,6 +8,7 @@ import {
 	type TaskOutput,
 	type TaskStatus,
 } from "@drawers/core";
+import { computeCallKey } from "../plugin/journal";
 import { createAgentPrimitive } from "./agent-call";
 import {
 	createSchemaRegistry,
@@ -18,6 +19,7 @@ import {
 	AgentCapError,
 	BudgetExhaustedError,
 	type BudgetView,
+	type JournalEntry,
 	type ProgressEvent,
 } from "./types";
 
@@ -185,6 +187,12 @@ interface HarnessOverrides {
 	liveTasks?: Set<string>;
 	defaults?: { agent: string; awaitTimeoutMs?: number };
 	registry?: SchemaRegistry;
+	replay?: {
+		entries: JournalEntry[];
+		onRecord: (e: JournalEntry) => void;
+	};
+	prefixIntact?: { value: boolean };
+	callIndex?: { value: number };
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -195,6 +203,8 @@ function harness(overrides: HarnessOverrides = {}) {
 	const counters = overrides.counters ?? { agents: 0 };
 	const liveTasks = overrides.liveTasks ?? new Set<string>();
 	const registry = overrides.registry ?? createSchemaRegistry();
+	const prefixIntact = overrides.prefixIntact ?? { value: true };
+	const callIndex = overrides.callIndex ?? { value: 0 };
 	const agent = createAgentPrimitive({
 		runner,
 		parentSessionID: "parent",
@@ -207,8 +217,21 @@ function harness(overrides: HarnessOverrides = {}) {
 		liveTasks,
 		defaults: overrides.defaults ?? { agent: "build" },
 		registry,
+		replay: overrides.replay,
+		prefixIntact,
+		callIndex,
 	});
-	return { agent, events, runner, gate, counters, liveTasks, registry };
+	return {
+		agent,
+		events,
+		runner,
+		gate,
+		counters,
+		liveTasks,
+		registry,
+		prefixIntact,
+		callIndex,
+	};
 }
 
 describe("createAgentPrimitive — result mapping", () => {
@@ -473,5 +496,423 @@ describe("createAgentPrimitive — launch wiring and live tasks", () => {
 		expect(await agent("p", { isolation: "worktree" })).toBe("OK");
 		expect(events.some((e) => e.type === "warn")).toBe(true);
 		expect(runner.launches.length).toBe(1);
+	});
+});
+
+// ---- replay / journal seam -----------------------------------------------
+
+describe("createAgentPrimitive — live path records non-null results", () => {
+	test("a non-null text result is journaled via onRecord with index+key", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "TEXT" });
+		const { agent } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		const out = await agent("prompt one");
+		expect(out).toBe("TEXT");
+		expect(recorded).toEqual([
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "prompt one" }),
+				status: "ok",
+				result: "TEXT",
+			},
+		]);
+	});
+
+	test("a structured OBJECT result is journaled too", async () => {
+		const recorded: JournalEntry[] = [];
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_obj",
+			onLaunched: () => registry.store("ses_obj", { n: 5 }),
+		});
+		const SCHEMA = {
+			type: "object",
+			properties: { n: { type: "number" } },
+			required: ["n"],
+		} as const;
+		const { agent } = harness({
+			runner,
+			registry,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		const out = await agent("prompt", { schema: SCHEMA });
+		expect(out).toEqual({ n: 5 });
+		expect(recorded.length).toBe(1);
+		expect(recorded[0]?.result).toEqual({ n: 5 });
+	});
+
+	test("a null result (failed agent) is NOT journaled", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "error" });
+		const { agent } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		expect(await agent("prompt")).toBeNull();
+		expect(recorded).toEqual([]);
+	});
+
+	test("callIndex advances once per live call", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "T" });
+		const callIndex = { value: 0 };
+		const { agent } = harness({
+			runner,
+			callIndex,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		await agent("a");
+		await agent("b");
+		expect(callIndex.value).toBe(2);
+		expect(recorded.map((e) => e.index)).toEqual([0, 1]);
+	});
+});
+
+describe("createAgentPrimitive — cached replay path", () => {
+	test("full-prefix replay returns cached results with ZERO launches and status cached", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const {
+			agent,
+			events,
+			runner: r,
+		} = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		expect((r as FakeRunner).launches.length).toBe(0);
+		const ends = events.filter((e) => e.type === "agent:end");
+		expect(
+			ends.every((e) => e.type === "agent:end" && e.status === "cached"),
+		).toBe(true);
+		const starts = events.filter((e) => e.type === "agent:start");
+		expect(starts.length).toBe(2);
+	});
+
+	test("entries recorded OUT OF INDEX ORDER (concurrent journal) still replay cached", async () => {
+		// Live-harness regression: concurrent agents (pipeline/parallel) record into
+		// the journal in COMPLETION order, not call-index order — so entries[0] may
+		// carry index 1. Replay MUST look up by the `index` field, not array position,
+		// or the very first replayed call mismatches and the whole prefix breaks live.
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			// index 1 first (it settled first under concurrency), then index 0.
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const { agent, runner: r } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Calls happen in index order; each must find ITS entry regardless of position.
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		expect((r as FakeRunner).launches.length).toBe(0);
+	});
+
+	test("a cached hit re-records the entry via onRecord (journals stay self-contained on resume)", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const { agent, runner: r } = harness({
+			runner,
+			replay: { entries, onRecord: (e) => recorded.push(e) },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(await agent("b")).toBe("cached-b");
+		// Zero launches, yet both cached hits were re-recorded verbatim so the new
+		// run's journal is standalone (no engine-layer bookkeeping needed).
+		expect((r as FakeRunner).launches.length).toBe(0);
+		expect(recorded).toEqual([
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		]);
+	});
+
+	test("cached calls still advance counters.agents and hit the 1000 cap", async () => {
+		const runner = new FakeRunner({ status: "completed" });
+		const entries: JournalEntry[] = [
+			{
+				index: 1000,
+				key: computeCallKey({ prompt: "x" }),
+				status: "ok",
+				result: "cached",
+			},
+		];
+		// counters already at the cap: a cached call must STILL throw.
+		const { agent } = harness({
+			runner,
+			counters: { agents: 1000 },
+			callIndex: { value: 1000 },
+			replay: { entries, onRecord: () => {} },
+		});
+		await expect(agent("x")).rejects.toBeInstanceOf(AgentCapError);
+	});
+
+	test("divergence: key mismatch flips prefixIntact and runs live from there", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "EDITED" }),
+				status: "ok",
+				result: "cached-b",
+			},
+		];
+		const prefixIntact = { value: true };
+		const { agent, prefixIntact: pi } = harness({
+			runner,
+			prefixIntact,
+			replay: { entries, onRecord: () => {} },
+		});
+		// First call matches → cached.
+		expect(await agent("a")).toBe("cached-a");
+		expect(pi.value).toBe(true);
+		// Second call's prompt was edited → key mismatch → runs LIVE.
+		expect(await agent("b")).toBe("LIVE");
+		expect(pi.value).toBe(false);
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("a later coincidentally-matching key still runs live once prefix is broken", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "EDITED" }), // call 0 will mismatch
+				status: "ok",
+				result: "cached-0",
+			},
+			{
+				index: 1,
+				key: computeCallKey({ prompt: "b" }), // call 1 WOULD match coincidentally
+				status: "ok",
+				result: "cached-1",
+			},
+		];
+		const { agent } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		// Call 0 diverges immediately (prompt "a" != journaled "EDITED").
+		expect(await agent("a")).toBe("LIVE");
+		// Call 1's key matches entries[1], but the prefix is already broken → LIVE.
+		expect(await agent("b")).toBe("LIVE");
+		expect((runner as FakeRunner).launches.length).toBe(2);
+	});
+
+	test("index past entries.length runs live (no entry for that index)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const { agent, prefixIntact } = harness({
+			runner,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a"); // index 0 cached
+		expect(await agent("b")).toBe("LIVE"); // index 1 >= length → live
+		expect(prefixIntact.value).toBe(false);
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+});
+
+// ---- Task 4.3.1: settle-path budget recordTask ---------------------------
+
+/**
+ * A BudgetView that ALSO exposes `recordTask` and a scripted per-session spend.
+ * `spend` maps a sessionID to the tokens that session "cost"; `recordTask` folds
+ * it into the accumulator, so a later call's pre-check sees the prior spend.
+ */
+function recordingBudget(
+	total: number,
+	spend: Record<string, number>,
+): BudgetView & {
+	recordTask(sessionID: string): Promise<void>;
+	recorded: string[];
+} {
+	let accumulated = 0;
+	const recorded: string[] = [];
+	return {
+		total,
+		spent: () => accumulated,
+		remaining: () => Math.max(0, total - accumulated),
+		recorded,
+		async recordTask(sessionID: string): Promise<void> {
+			recorded.push(sessionID);
+			accumulated += spend[sessionID] ?? 0;
+		},
+	};
+}
+
+describe("createAgentPrimitive — budget recordTask at settle", () => {
+	test("records the settled task's sessionID so the NEXT call's pre-check sees its spend", async () => {
+		// Two sequential calls, scripted per-session token costs. After call 1
+		// settles, recordTask folds its spend in; call 2's budget pre-check reads it.
+		let seq = 0;
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		// Override launch's sessionID per call deterministically.
+		const origLaunch = runner.launch.bind(runner);
+		runner.launch = async (req) => {
+			seq += 1;
+			(runner as unknown as { opts: FakeRunnerOpts }).opts.sessionID =
+				`ses_call_${seq}`;
+			return origLaunch(req);
+		};
+		const b = recordingBudget(100, { ses_call_1: 40, ses_call_2: 40 });
+		const { agent } = harness({ runner, budget: b });
+
+		expect(await agent("first")).toBe("OK");
+		// Call 1 settled → its session recorded → spend now 40.
+		expect(b.recorded).toEqual(["ses_call_1"]);
+		expect(b.spent()).toBe(40);
+
+		expect(await agent("second")).toBe("OK");
+		expect(b.recorded).toEqual(["ses_call_1", "ses_call_2"]);
+		expect(b.spent()).toBe(80);
+	});
+
+	test("exhaustion mid-loop: pre-check halts the loop with BudgetExhaustedError", async () => {
+		// Conformance-style ceiling loop: each call costs 40 against a 100 budget.
+		// After two calls (80 spent) a third would exceed, but the gate is
+		// `remaining() > 0`, so the THIRD call's pre-check (remaining 20 > 0) still
+		// runs; the FOURTH (remaining 0) throws. We script all sessions at 40.
+		let seq = 0;
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const origLaunch = runner.launch.bind(runner);
+		runner.launch = async (req) => {
+			seq += 1;
+			(runner as unknown as { opts: FakeRunnerOpts }).opts.sessionID =
+				`ses_${seq}`;
+			return origLaunch(req);
+		};
+		const b = recordingBudget(100, {
+			ses_1: 40,
+			ses_2: 40,
+			ses_3: 40,
+			ses_4: 40,
+		});
+		const { agent } = harness({ runner, budget: b });
+
+		// Drive the conformance loop: keep calling while remaining > 0.
+		const calls: number[] = [];
+		let threw = false;
+		try {
+			while (b.remaining() > 0) {
+				await agent(`call ${calls.length}`);
+				calls.push(b.spent());
+			}
+		} catch (err) {
+			threw = err instanceof BudgetExhaustedError;
+		}
+		// 40, 80, 120 spent across three live calls; the loop re-checks remaining()
+		// == 0 after the third and exits WITHOUT a throw (gate is remaining > 0).
+		expect(calls).toEqual([40, 80, 120]);
+		// No throw needed — the loop's own guard halted at the ceiling. But a direct
+		// extra call now MUST throw (remaining 0).
+		expect(threw).toBe(false);
+		await expect(agent("over")).rejects.toBeInstanceOf(BudgetExhaustedError);
+	});
+
+	test("records on a FAILED terminal status too (any terminal status)", async () => {
+		const runner = new FakeRunner({ status: "error", sessionID: "ses_failed" });
+		const b = recordingBudget(100, { ses_failed: 10 });
+		const { agent } = harness({ runner, budget: b });
+		expect(await agent("x")).toBeNull();
+		// Even though the result was null (failed), the session's tokens are recorded.
+		expect(b.recorded).toEqual(["ses_failed"]);
+		expect(b.spent()).toBe(10);
+	});
+
+	test("cached replay records NOTHING (no session to charge)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const entries: JournalEntry[] = [
+			{
+				index: 0,
+				key: computeCallKey({ prompt: "a" }),
+				status: "ok",
+				result: "cached-a",
+			},
+		];
+		const b = recordingBudget(100, {});
+		const { agent } = harness({
+			runner,
+			budget: b,
+			replay: { entries, onRecord: () => {} },
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(b.recorded).toEqual([]);
+		expect(b.spent()).toBe(0);
+	});
+
+	test("a budget WITHOUT recordTask (plain BudgetView) is left untouched", async () => {
+		// The runtime keeps zero plugin knowledge: recordTask is a structural
+		// optional. A plain BudgetView must not crash the settle path.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const { agent } = harness({ runner, budget: budget(100, 100) });
+		expect(await agent("x")).toBe("OK");
 	});
 });

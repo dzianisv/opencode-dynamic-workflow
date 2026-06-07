@@ -4,6 +4,15 @@
  */
 
 export {
+	type CallKeyInput,
+	computeCallKey,
+	createJournal,
+	type Journal,
+	type JournalFs,
+	type JournalLogger,
+	type JournalOptions,
+} from "./plugin/journal";
+export {
 	type AgentPrimitiveDeps,
 	createAgentPrimitive,
 } from "./runtime/agent-call";
@@ -17,10 +26,15 @@ export {
 export { DeterminismError, evaluateScript } from "./runtime/evaluate";
 export {
 	createWorkflowRun,
+	type SharedRunBoxes,
 	type WorkflowResult,
 	type WorkflowRun,
 	type WorkflowRunDeps,
 } from "./runtime/index";
+export {
+	computeWorkflowKey,
+	stableStringify,
+} from "./runtime/keys";
 export {
 	MetaError,
 	type ParsedScript,
@@ -40,13 +54,21 @@ export {
 	SchemaCompileError,
 } from "./runtime/structured/validate";
 export {
+	type ChildRunResult,
+	createSubWorkflowPrimitive,
+	type SubWorkflowDeps,
+} from "./runtime/sub-workflow";
+export {
 	AgentCapError,
 	type AgentFn,
 	type AgentOpts,
 	BudgetExhaustedError,
 	type BudgetView,
+	type JournalEntry,
+	NestingError,
 	NotYetSupportedError,
 	type ProgressEmitter,
 	type ProgressEvent,
 	type RuntimeApi,
+	type WorkflowFn,
 } from "./runtime/types";
