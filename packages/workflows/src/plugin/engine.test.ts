@@ -2257,3 +2257,115 @@ describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8
 		await engine.dispose();
 	});
 });
+
+// ---- Task 8.2.2: external control channel (sentinel cancel) ---------------
+
+const CONTROL = `${BASE}/workflow-control`;
+
+/**
+ * Capture the control watcher's interval callback through the injected seam so a
+ * test can fire a poll deterministically (no real timers). Returns the captured
+ * callback box and the inject-able fns the engine wires straight into the watcher.
+ */
+function captureControlTick() {
+	const box: { cb?: () => void } = {};
+	return {
+		box,
+		setIntervalFn: (cb: () => void) => {
+			box.cb = cb;
+			return 1;
+		},
+		clearIntervalFn: () => {},
+	};
+}
+
+describe("createWorkflowEngine — external control channel (Task 8.2.2)", () => {
+	test("a `<runId>.cancel` sentinel cancels the live run, brackets the feed with cancel-requested before run:end, and consumes the sentinel", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const tick = captureControlTick();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0001"),
+			setIntervalFn: tick.setIntervalFn,
+			clearIntervalFn: tick.clearIntervalFn,
+		});
+		await engine.ready();
+
+		// Two sequential agents: drive the first to completion, then cancel via the
+		// sentinel while the second is in flight — mirroring the live-cancel path so
+		// the detached settle branch writes the terminal run:end after the aborted
+		// child's agent:end drains.
+		const handle = await engine.startRun({
+			source: `${META}const a = await agent("first", { label: "one", phase: "P" });\nconst b = await agent("second", { label: "two", phase: "P" });\nreturn [a, b];\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		const first = sessions[0] as string;
+		bump(500);
+		await driveIdle(engine, first, bump);
+		await flush();
+		expect(sessions.length).toBe(2);
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("running");
+
+		// The external actor drops the sentinel into the control dir, then the
+		// engine's poll fires.
+		files.set(`${CONTROL}/${handle.runId}.cancel`, "");
+		tick.box.cb?.();
+		await engine.statusOf(handle.runId)?.settled;
+		await flush();
+
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("cancelled");
+
+		// The sentinel was consumed.
+		expect(files.has(`${CONTROL}/${handle.runId}.cancel`)).toBe(false);
+
+		// The feed carries run:cancel-requested BEFORE the terminal run:end.
+		const lines = readFeed(files, handle.runId);
+		const types = lines.map((l) => l.type);
+		expect(types).toContain("run:cancel-requested");
+		const cancelIdx = types.indexOf("run:cancel-requested");
+		const runEndIdx = types.lastIndexOf("run:end");
+		expect(cancelIdx).toBeGreaterThanOrEqual(0);
+		expect(cancelIdx).toBeLessThan(runEndIdx);
+		expect(lines.at(-1)?.type).toBe("run:end");
+		expect(lines.at(-1)?.status).toBe("cancelled");
+
+		await engine.dispose();
+	});
+
+	test("a sentinel for an unknown runId is consumed with no record change and no feed", async () => {
+		const { facade, files } = makeFs();
+		const tick = captureControlTick();
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctl0002"),
+			setIntervalFn: tick.setIntervalFn,
+			clearIntervalFn: tick.clearIntervalFn,
+		});
+		await engine.ready();
+
+		files.set(`${CONTROL}/wf_ghost.cancel`, "");
+		tick.box.cb?.();
+		await flush();
+
+		// No run exists for the ghost id; nothing settles, but the stale sentinel is
+		// consumed so it cannot accumulate or re-fire.
+		expect(engine.statusOf("wf_ghost")).toBeUndefined();
+		expect(files.has(`${CONTROL}/wf_ghost.cancel`)).toBe(false);
+		expect(readFeed(files, "wf_ghost")).toEqual([]);
+
+		await engine.dispose();
+	});
+});

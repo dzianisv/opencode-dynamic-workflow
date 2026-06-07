@@ -56,6 +56,7 @@ import type {
 	JournalEntry,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
+import { type ControlWatcher, createControlWatcher } from "./control";
 import {
 	createFeedWriter,
 	type EnrichedProgressEvent,
@@ -257,6 +258,19 @@ export interface CreateWorkflowEngineOptions {
 	clock?: Clock;
 	/** Injectable runId generator; defaults to a `wf_`-prefixed core generator. */
 	ids?: IdGenerator;
+	/**
+	 * Poll cadence for the external control-channel watcher (Task 8.2.2), in ms.
+	 * Defaults to 1000. The watcher scans `<dataDir>/workflow-control/` for
+	 * `<runId>.cancel` sentinels and cancels the matching live run.
+	 */
+	controlPollMs?: number;
+	/**
+	 * Injectable interval arming for the control watcher; defaults to
+	 * `globalThis.setInterval`. Tests pin the cadence and drive `tick()` directly.
+	 */
+	setIntervalFn?: (cb: () => void, ms: number) => unknown;
+	/** Injectable interval clearing; defaults to `globalThis.clearInterval`. */
+	clearIntervalFn?: (handle: unknown) => void;
 }
 
 export interface WorkflowEngine {
@@ -320,7 +334,6 @@ const SUBDIR_FEED = "workflow-feed";
 // External control-channel sentinel dir (Task 8.2.1). Declared beside its sibling
 // subdirs so the on-disk layout stays in one place; the control watcher (Task
 // 8.2.2) resolves it via `subdir()` and polls it for `<runId>.cancel` sentinels.
-// biome-ignore lint/correctness/noUnusedVariables: consumed by the 8.2.2 watcher; this is the layout-vocabulary layer.
 const SUBDIR_CONTROL = "workflow-control";
 
 /**
@@ -473,6 +486,7 @@ export function createWorkflowEngine(
 	const scriptsDir = subdir(SUBDIR_SCRIPTS);
 	const journalsDir = subdir(SUBDIR_JOURNALS);
 	const feedDir = subdir(SUBDIR_FEED);
+	const controlDir = subdir(SUBDIR_CONTROL);
 
 	// Sub-workflow source resolver (spec §8): maps a name/{scriptPath} to source
 	// against the project directory. Threaded into every TOP-LEVEL run's
@@ -560,6 +574,35 @@ export function createWorkflowEngine(
 		string,
 		{ runId: string; label: string; lastEmittedAt: number }
 	>();
+
+	// External control channel (Task 8.2.2): a poll loop over `workflow-control/`
+	// for `<runId>.cancel` sentinels. `stopRun` is the single cancel authority and
+	// is safe to call unconditionally (its own `status !== "running"` guard makes
+	// unknown/terminal ids no-ops); the `run:cancel-requested` feed line is appended
+	// ONLY for a live run, BEFORE stopRun, so a viewer tailing the feed sees the
+	// cancelling state ahead of the terminal `run:end`. The watcher reuses the engine
+	// `FsFacade` (readdir/rm), so no new fs surface is introduced. Armed below once
+	// the maps exist; stopped first thing in dispose().
+	const control: ControlWatcher = createControlWatcher({
+		dir: controlDir,
+		fs,
+		intervalMs: opts.controlPollMs ?? 1000,
+		setIntervalFn: opts.setIntervalFn,
+		clearIntervalFn: opts.clearIntervalFn,
+		logger,
+		onCancel: async (runId) => {
+			const handle = runs.get(runId);
+			if (handle?.record.status === "running") {
+				feeds.get(runId)?.append({
+					type: "run:cancel-requested",
+					runId,
+					at: clock.now(),
+				});
+			}
+			stopRun(runId);
+		},
+	});
+	control.start();
 
 	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
 	const queue = createNotificationQueue({
@@ -1147,6 +1190,9 @@ export function createWorkflowEngine(
 		liveRunsFor,
 		handleEvent,
 		dispose: async () => {
+			// Stop the control poll loop before draining stores so no late tick races
+			// a disposed engine.
+			control.stop();
 			await readyPromise;
 			await runner.dispose();
 			await taskStore.dispose();

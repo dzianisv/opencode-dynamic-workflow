@@ -1233,7 +1233,7 @@ interface SessionRunner {
 
 #### Task 8.2.2: Engine control watcher — poll `workflow-control/`, cancel live runs, consume sentinels
 
-- [ ] Done
+- [x] Done
 
 **Context:** `stopRun(runId)` (`engine.ts:1032-1043`) ALREADY performs the complete cancel: `handle.run?.abort()` flips in-flight children terminal (fire-and-forget) and `settleRecord(handle, { status: "cancelled" })` flips the record; the detached settle branch (`engine.ts:951-999`) then writes the terminal `run:end` feed line after the aborted children's `agent:end` events drain (`engine.ts:1037-1040`). `stopRun` is a no-op for any run not currently `running` (`engine.ts:1034`). The per-run feed writers live in `feeds: Map<runId, FeedWriter>` (`engine.ts:542`), reachable for appending the new line. The engine has no periodic loop today; `dispose()` (`engine.ts:1144-1149`) drains the stores + runner. The in-memory test facade's `readdir` returns basenames of files whose parent dir equals the requested dir, and `rm` deletes (`engine.test.ts:42-72`) — so the loop is unit-testable against the existing `makeFs`. The control dir is NOT created at startup (no run has touched it); `readdir` on a missing dir throws ENOENT and must degrade to "no sentinels".
 
