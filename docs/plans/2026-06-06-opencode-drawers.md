@@ -1291,7 +1291,7 @@ interface SessionRunner {
 
 #### Task 8.3.2: Feed tailer — fs.watch with poll fallback, line-buffered, feeding the reducer
 
-- [ ] Done
+- [x] Done
 
 **Context:** the reducer (8.3.1) folds parsed `FeedEvent` lines but does not touch the filesystem. The viewer needs to stream a live `<dataDir>/workflow-feed/<runId>.jsonl` as the engine appends to it, AND read a completed file after a TUI restart (Epic Done-when: "renders settled runs from feed files after a TUI restart"). TUI plugins load via plain `import()` with full Bun fs access (`.references/opencode/packages/opencode/src/plugin/loader.ts:139`), so `node:fs`'s `watch`/`open`/`read` are all available — unlike the server engine, which is constrained to the injected `FsFacade` (Task 8.2.2 context explains why `fs.watch` was rejected THERE; that constraint does not apply to the unsandboxed TUI surface). Feed files are append-only and never rewritten (`feed.ts:160-202` only `appendFile`s), so a tailer only ever needs to read forward from a byte offset.
 
