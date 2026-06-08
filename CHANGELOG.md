@@ -1,3 +1,17 @@
+# [1.1.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.0.0...v1.1.0) (2026-06-08)
+
+
+### Bug Fixes
+
+* **build:** compile the TUI bundle with @opentui/solid's Solid transform ([4a97b59](https://github.com/fredcamaral/opencode-drawers/commit/4a97b59c07cf811ce9a6620f374d745b693f8b16))
+* **workflows:** drop the per-agent wall-clock timeout ([922284d](https://github.com/fredcamaral/opencode-drawers/commit/922284dd9e7a9cd821be704320c9803ac08f266d))
+
+
+### Features
+
+* **tui:** q/esc quit the viewer (was esc=back) ([1e4bd21](https://github.com/fredcamaral/opencode-drawers/commit/1e4bd21aaee9e1c010d82c7bd48432603d415382))
+* **workflows:** TUI run switcher, scrollable tree, upfront phases ([dee4203](https://github.com/fredcamaral/opencode-drawers/commit/dee4203e39cdfa2a4be009a5328abca61dfbeefd))
+
 # 1.0.0 (2026-06-07)
 
 
