@@ -16,8 +16,8 @@
  * selection through agent rows across all phases; `←/→` (or `h/l`) switch between runs
  * (every run in the feed dir, settled or live, freshest first — the cross-session
  * switcher: two opencode sessions running two workflows in the same repo flip between
- * each other's runs here); `esc` closes the route to the return route; `x` writes the
- * cancel sentinel for the open run (the 8.2 external touch). Single-key specs only —
+ * each other's runs here); `q`/`esc` quit the viewer (back to the return route); `x`
+ * writes the cancel sentinel for the open run (the 8.2 external touch). Single-key specs only —
  * `@opentui/keymap` does NOT comma-split a binding `key`, so each alternate is its own
  * entry.
  *
@@ -291,7 +291,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ name: "workflows.up", run: () => moveSelection(-1) },
 				{ name: "workflows.nextRun", run: () => switchRun(1) },
 				{ name: "workflows.prevRun", run: () => switchRun(-1) },
-				{ name: "workflows.back", run: () => back() },
+				{ name: "workflows.quit", run: () => quit() },
 				{ name: "workflows.cancel", run: () => void cancelSelected() },
 			],
 			// One entry PER key — `@opentui/keymap` does not comma-split a binding key.
@@ -304,7 +304,8 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ key: "l", cmd: "workflows.nextRun" },
 				{ key: "left", cmd: "workflows.prevRun" },
 				{ key: "h", cmd: "workflows.prevRun" },
-				{ key: "escape", cmd: "workflows.back" },
+				{ key: "q", cmd: "workflows.quit" },
+				{ key: "escape", cmd: "workflows.quit" },
 				{ key: "x", cmd: "workflows.cancel" },
 				{ key: "s", cmd: "workflows.cancel" },
 			],
@@ -350,8 +351,8 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		setSelected((i) => clamp(i + delta, 0, max));
 	}
 
-	/** `esc` closes the route to the return route (the originating screen, or `home`). */
-	function back(): void {
+	/** `q`/`esc` quit the viewer — navigate to the return route (originating screen, or `home`). */
+	function quit(): void {
 		const returnRoute = props.params?.returnRoute as
 			| TuiRouteCurrent
 			| undefined;
@@ -505,7 +506,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 			</box>
 			<box flexShrink={0} paddingLeft={1}>
 				<text fg={theme().textMuted}>
-					↑↓ agent · ←→ run · x cancel · esc back
+					↑↓ agent · ←→ run · x cancel · q/esc quit
 				</text>
 			</box>
 		</box>
