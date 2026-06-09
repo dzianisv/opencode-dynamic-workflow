@@ -131,6 +131,10 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 	// pass the pre-await guard and double-increment / double-prompt. While an id is
 	// here, a fresh tick/idle for it returns immediately.
 	const inFlight = new Set<string>();
+	// Set once by dispose(). An in-flight tick/idle that is mid-await when teardown
+	// runs re-reads this after each await and bails before any re-prompt or save, so
+	// a prompt is never injected (and no file written) after the plugin is disposed.
+	let disposed = false;
 	let counter = 0;
 
 	function nextId(): string {
@@ -230,8 +234,9 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 	/**
 	 * One loop tick. Guarded against re-entrancy: if a prior tick for this id is
 	 * still mid-await it is skipped. Every state check is RE-READ after each await
-	 * (the messages fetch, the re-prompt) so a stop/dispose/completion that landed
-	 * during the await is honored before any mutation.
+	 * (the messages fetch, the re-prompt) so a stop/completion that landed during the
+	 * await is honored before any mutation. A dispose() during an await is honored via
+	 * the `disposed` flag checked in those same re-reads (it does not mutate the map).
 	 */
 	async function loopTick(id: string): Promise<void> {
 		if (inFlight.has(id)) {
@@ -244,11 +249,23 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 		}
 		inFlight.add(id);
 		try {
-			if (pre.until !== undefined && pre.until.length > 0) {
+			// Arming baseline: a sentinel can only satisfy the directive AFTER it has
+			// re-prompted at least once. Without this, a stale GOAL_COMPLETE left in the
+			// session by a prior, unrelated turn would finalize a freshly-armed loop on
+			// tick 1 having done zero work. `iterations` counts delivered re-prompts.
+			if (
+				pre.until !== undefined &&
+				pre.until.length > 0 &&
+				pre.iterations > 0
+			) {
 				const text = await lastAssistantText(pre.sessionID);
 				// Re-check: the directive may have been stopped/disposed during the fetch.
 				const afterFetch = directives.get(id);
-				if (afterFetch === undefined || afterFetch.status !== "active") {
+				if (
+					afterFetch === undefined ||
+					afterFetch.status !== "active" ||
+					disposed
+				) {
 					clearTimer(id);
 					return;
 				}
@@ -271,9 +288,14 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 			}
 
 			const delivered = await reprompt(current.sessionID, promptText(current));
-			// Re-check after the re-prompt await; only count progress on delivery.
+			// Re-check after the re-prompt await; only count progress on delivery. A
+			// dispose that landed during the await must NOT mutate/persist post-teardown.
 			const afterPrompt = directives.get(id);
-			if (afterPrompt === undefined || afterPrompt.status !== "active") {
+			if (
+				afterPrompt === undefined ||
+				afterPrompt.status !== "active" ||
+				disposed
+			) {
 				return;
 			}
 			if (!delivered) {
@@ -383,8 +405,9 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 	/**
 	 * Handle one active goal on idle. Same discipline as {@link loopTick}: an
 	 * in-flight guard against overlapping idle events for the same goal, and a
-	 * re-read of state after every await so a stop/completion during the fetch or
-	 * re-prompt is honored. Progress counts on delivery only.
+	 * re-read of state (including the `disposed` flag) after every await so a
+	 * stop/dispose/completion during the fetch or re-prompt is honored before any
+	 * mutation. Progress counts on delivery only.
 	 */
 	async function handleGoalIdle(id: string, sessionID: string): Promise<void> {
 		if (inFlight.has(id)) {
@@ -394,10 +417,18 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 		try {
 			const text = await lastAssistantText(sessionID);
 			const afterFetch = directives.get(id);
-			if (afterFetch === undefined || afterFetch.status !== "active") {
+			if (
+				afterFetch === undefined ||
+				afterFetch.status !== "active" ||
+				disposed
+			) {
 				return;
 			}
-			if (hasCompletionSentinel(text)) {
+			// Arming baseline: honor the completion sentinel only AFTER the goal has
+			// re-prompted at least once. Otherwise a stale GOAL_COMPLETE left by a prior,
+			// unrelated turn would satisfy a freshly-armed goal on the first idle having
+			// done zero work. `iterations` counts delivered re-prompts.
+			if (afterFetch.iterations > 0 && hasCompletionSentinel(text)) {
 				await finalize(afterFetch, "done");
 				logger?.info?.("goal satisfied", { id });
 				return;
@@ -410,7 +441,11 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 
 			const delivered = await reprompt(sessionID, promptText(afterFetch));
 			const afterPrompt = directives.get(id);
-			if (afterPrompt === undefined || afterPrompt.status !== "active") {
+			if (
+				afterPrompt === undefined ||
+				afterPrompt.status !== "active" ||
+				disposed
+			) {
 				return;
 			}
 			if (!delivered) {
@@ -456,6 +491,7 @@ export function createCadenceEngine(deps: CadenceEngineDeps): CadenceEngine {
 	}
 
 	function dispose(): void {
+		disposed = true;
 		for (const handle of timers.values()) {
 			handle.clear();
 		}

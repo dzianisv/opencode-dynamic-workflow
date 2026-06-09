@@ -92,6 +92,60 @@ function fakeTimers(): {
 
 const clock = { now: () => 1000 };
 
+/** Client whose messages()/promptAsync() resolve only when the test releases them. */
+function deferredClient(lastReply: string): CadenceClient & {
+	prompts: number;
+	releaseMessages(): void;
+	releasePrompt(): void;
+	failPrompt: { value: boolean };
+} {
+	let prompts = 0;
+	let resolveMessages: (() => void) | undefined;
+	let resolvePrompt: (() => void) | undefined;
+	const failPrompt = { value: false };
+	return {
+		get prompts() {
+			return prompts;
+		},
+		failPrompt,
+		releaseMessages() {
+			resolveMessages?.();
+			resolveMessages = undefined;
+		},
+		releasePrompt() {
+			resolvePrompt?.();
+			resolvePrompt = undefined;
+		},
+		session: {
+			promptAsync() {
+				return new Promise<unknown>((resolve, reject) => {
+					resolvePrompt = () => {
+						if (failPrompt.value) {
+							reject(new Error("send failed"));
+							return;
+						}
+						prompts += 1;
+						resolve(undefined);
+					};
+				});
+			},
+			messages() {
+				return new Promise((resolve) => {
+					resolveMessages = () =>
+						resolve({
+							data: [
+								{
+									info: { role: "assistant" },
+									parts: [{ type: "text", text: lastReply }],
+								},
+							],
+						});
+				});
+			},
+		},
+	};
+}
+
 describe("loop", () => {
 	test("each tick re-prompts; stops after max_iterations", async () => {
 		const client = fakeClient();
@@ -126,7 +180,7 @@ describe("loop", () => {
 		expect(timers.cleared.count).toBeGreaterThanOrEqual(1);
 	});
 
-	test("until: sentinel in last reply stops without re-prompting", async () => {
+	test("until: sentinel honored only after the first re-prompt (arming baseline)", async () => {
 		const client = fakeClient(`all done\n${GOAL_COMPLETE}`);
 		const store = fakeStore();
 		const timers = fakeTimers();
@@ -146,9 +200,16 @@ describe("loop", () => {
 			maxIterations: 10,
 		});
 
+		// Tick 1: iterations == 0, so the pre-existing sentinel is IGNORED — the loop
+		// re-prompts first (a stale GOAL_COMPLETE must not satisfy a zero-work loop).
 		await timers.tick();
+		expect(client.prompts.length).toBe(1);
+		expect(store.map.get(directive.id)?.iterations).toBe(1);
+		expect(store.map.get(directive.id)?.status).toBe("active");
 
-		expect(client.prompts.length).toBe(0);
+		// Tick 2: iterations > 0, the sentinel now finalizes without another re-prompt.
+		await timers.tick();
+		expect(client.prompts.length).toBe(1);
 		expect(store.map.has(directive.id)).toBe(false);
 	});
 
@@ -346,7 +407,7 @@ describe("goal (idle-driven)", () => {
 		expect(store.map.get(directive.id)?.status).toBe("active");
 	});
 
-	test("sentinel last message marks done and stops", async () => {
+	test("sentinel honored only after the first re-prompt (arming baseline)", async () => {
 		const client = fakeClient(`${GOAL_COMPLETE}`);
 		const store = fakeStore();
 		const engine = createCadenceEngine({ client, store, clock });
@@ -358,9 +419,16 @@ describe("goal (idle-driven)", () => {
 			maxIterations: 5,
 		});
 
+		// Idle 1: iterations == 0, the pre-existing sentinel is IGNORED — the goal
+		// re-prompts first so a stale GOAL_COMPLETE can't satisfy it with zero work.
 		await engine.handleEvent(idle("s1"));
+		expect(client.prompts.length).toBe(1);
+		expect(store.map.get(directive.id)?.iterations).toBe(1);
+		expect(store.map.get(directive.id)?.status).toBe("active");
 
-		expect(client.prompts.length).toBe(0);
+		// Idle 2: iterations > 0, the sentinel now finalizes the goal.
+		await engine.handleEvent(idle("s1"));
+		expect(client.prompts.length).toBe(1);
 		expect(store.map.has(directive.id)).toBe(false);
 	});
 
@@ -486,7 +554,7 @@ describe("sentinel matching (exact line, not substring)", () => {
 		expect(store.map.get(directive.id)?.iterations).toBe(1);
 	});
 
-	test("goal: the sentinel alone on its own line DOES complete", async () => {
+	test("goal: the sentinel alone on its own line DOES complete (after arming)", async () => {
 		const client = fakeClient(`here is the result\n${GOAL_COMPLETE}\n`);
 		const store = fakeStore();
 		const engine = createCadenceEngine({ client, store, clock });
@@ -498,9 +566,11 @@ describe("sentinel matching (exact line, not substring)", () => {
 			maxIterations: 5,
 		});
 
+		// Idle 1 arms (iterations 0 → 1, re-prompts); idle 2 honors the own-line sentinel.
+		await engine.handleEvent(idle("s1"));
 		await engine.handleEvent(idle("s1"));
 
-		expect(client.prompts.length).toBe(0);
+		expect(client.prompts.length).toBe(1);
 		expect(store.map.has(directive.id)).toBe(false);
 	});
 
@@ -538,60 +608,6 @@ describe("sentinel matching (exact line, not substring)", () => {
 });
 
 describe("in-flight guard + count-on-delivery", () => {
-	/** Client whose messages()/promptAsync() resolve only when the test releases them. */
-	function deferredClient(lastReply: string): CadenceClient & {
-		prompts: number;
-		releaseMessages(): void;
-		releasePrompt(): void;
-		failPrompt: { value: boolean };
-	} {
-		let prompts = 0;
-		let resolveMessages: (() => void) | undefined;
-		let resolvePrompt: (() => void) | undefined;
-		const failPrompt = { value: false };
-		return {
-			get prompts() {
-				return prompts;
-			},
-			failPrompt,
-			releaseMessages() {
-				resolveMessages?.();
-				resolveMessages = undefined;
-			},
-			releasePrompt() {
-				resolvePrompt?.();
-				resolvePrompt = undefined;
-			},
-			session: {
-				promptAsync() {
-					return new Promise<unknown>((resolve, reject) => {
-						resolvePrompt = () => {
-							if (failPrompt.value) {
-								reject(new Error("send failed"));
-								return;
-							}
-							prompts += 1;
-							resolve(undefined);
-						};
-					});
-				},
-				messages() {
-					return new Promise((resolve) => {
-						resolveMessages = () =>
-							resolve({
-								data: [
-									{
-										info: { role: "assistant" },
-										parts: [{ type: "text", text: lastReply }],
-									},
-								],
-							});
-					});
-				},
-			},
-		};
-	}
-
 	test("a messages fetch slower than the interval does not double-fire", async () => {
 		const client = deferredClient("still working");
 		const store = fakeStore();
@@ -698,5 +714,106 @@ describe("stop is session-scoped", () => {
 		const owned = await engine.stop(directive.id, "sessionA");
 		expect(owned?.status).toBe("stopped");
 		expect(store.map.has(directive.id)).toBe(false);
+	});
+
+	test("stopForSession stops only the target session's active directives", async () => {
+		const client = fakeClient();
+		const store = fakeStore();
+		const timers = fakeTimers();
+		const engine = createCadenceEngine({
+			client,
+			store,
+			setIntervalFn: timers.setIntervalFn,
+			clock,
+		});
+
+		const a1 = await engine.start({
+			sessionID: "s1",
+			kind: "loop",
+			instruction: "a1",
+			intervalMs: 5000,
+			maxIterations: 10,
+		});
+		const a2 = await engine.start({
+			sessionID: "s1",
+			kind: "goal",
+			instruction: "a2",
+			maxIterations: 10,
+		});
+		const b1 = await engine.start({
+			sessionID: "s2",
+			kind: "loop",
+			instruction: "b1",
+			intervalMs: 5000,
+			maxIterations: 10,
+		});
+		// An already-finalized directive in s1 must be excluded from the sweep.
+		const doneA = await engine.start({
+			sessionID: "s1",
+			kind: "loop",
+			instruction: "done",
+			intervalMs: 5000,
+			maxIterations: 10,
+		});
+		await engine.stop(doneA.id, "s1");
+
+		const armedBefore = timers.armed.count; // a1, b1, doneA
+		const clearedBefore = timers.cleared.count; // doneA's stop cleared one
+
+		const stopped = await engine.stopForSession("s1");
+
+		// Returned array: exactly s1's two still-active directives, neither the
+		// already-stopped one nor s2's.
+		const ids = stopped.map((d) => d.id).sort();
+		expect(ids).toEqual([a1.id, a2.id].sort());
+		expect(stopped.every((d) => d.status === "stopped")).toBe(true);
+
+		// s1's active directives are gone from the store and from list().
+		expect(store.map.has(a1.id)).toBe(false);
+		expect(store.map.has(a2.id)).toBe(false);
+		expect(engine.list("s1")).toHaveLength(0);
+
+		// s2 is untouched: still active in the store and listed.
+		expect(store.map.get(b1.id)?.status).toBe("active");
+		expect(engine.list("s2")).toHaveLength(1);
+
+		// Only the loop among the stopped pair owned a timer (a1), so exactly one
+		// more timer was cleared by this sweep.
+		expect(timers.cleared.count).toBe(clearedBefore + 1);
+		expect(timers.armed.count).toBe(armedBefore); // sweep arms nothing
+	});
+
+	test("dispose mid-await does not deliver a re-prompt or persist", async () => {
+		const client = deferredClient("still working");
+		const store = fakeStore();
+		const timers = fakeTimers();
+		const engine = createCadenceEngine({
+			client,
+			store,
+			setIntervalFn: timers.setIntervalFn,
+			clock,
+		});
+
+		const directive = await engine.start({
+			sessionID: "s1",
+			kind: "loop",
+			instruction: "go",
+			intervalMs: 5000,
+			maxIterations: 10,
+		});
+
+		// Tick fires and blocks on the (slow) re-prompt enqueue.
+		const t1 = timers.tick();
+		client.releaseMessages();
+		for (let i = 0; i < 10; i += 1) {
+			await Promise.resolve();
+		}
+		// Plugin is torn down WHILE the tick is mid-await on promptAsync.
+		engine.dispose();
+		client.releasePrompt();
+		await t1;
+
+		// The disposed guard bails before counting/persisting: iterations stays 0.
+		expect(store.map.get(directive.id)?.iterations).toBe(0);
 	});
 });
