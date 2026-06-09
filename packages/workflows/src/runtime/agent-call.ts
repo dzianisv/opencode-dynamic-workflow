@@ -447,7 +447,17 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// and we release the held slot before returning (degrade, don't detonate).
 		let worktree: { dir: string; branch: string } | undefined;
 		let launchDirectory = directory;
-		if (opts.isolation === "worktree") {
+		// Phase 3 / Task 3.1.1: `verifyDiff` IMPLIES worktree isolation — an agent
+		// with a post-condition must run in its own worktree so the check (a git diff
+		// or a real tsc/lint command reading disk) observes only THIS agent's edits,
+		// not a sibling's mid-flight mutation of the shared tree. Two booleans split
+		// the contracts: an EXPLICIT `isolation:'worktree'` request keeps the loud
+		// degrade-to-null on a mint miss (the script demanded a guarantee), while an
+		// IMPLIED isolation (verifyDiff-only) falls through to run unisolated on a mint
+		// miss — honoring verifyDiff's INERT-on-no-shell contract (types.ts:60-66).
+		const explicitIsolation = opts.isolation === "worktree";
+		const wantsIsolation = explicitIsolation || opts.verifyDiff !== undefined;
+		if (wantsIsolation) {
 			// Fold the unique per-call `index` into the mint key so the worktree manager
 			// (which derives both the branch and the checkout dir from this label and
 			// DOES NOT de-dup — git-worktree.ts) can never collide two parallel isolated
@@ -469,7 +479,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 						? await serializeOnCheckpoint(doMint)
 						: await doMint();
 			}
-			if (minted === null) {
+			if (minted === null && explicitIsolation) {
 				gate.release(runId);
 				// Distinguish "no manager threaded" (genuine isolation_unsupported: the
 				// feature has no primitive here) from "manager present but create()
@@ -501,8 +511,17 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				});
 				return null;
 			}
-			worktree = minted;
-			launchDirectory = minted.dir;
+			// IMPLIED isolation (verifyDiff-only) mint miss: do NOT degrade. Leave
+			// `worktree` undefined and `launchDirectory` as the run-wide directory, then
+			// fall through to a normal unisolated launch. The later verify (it sees
+			// `worktree === undefined`) forwards no directory and evaluates against the
+			// shared tree / inert-on-no-shell path — identical to pre-fix verifyDiff
+			// behavior, no worse than the baseline. A successful mint applies to BOTH
+			// explicit and implied isolation.
+			if (minted !== null) {
+				worktree = minted;
+				launchDirectory = minted.dir;
+			}
 		}
 
 		// 5a. Pre-launch checkpoint barrier (Task 2.1.5): with the slot held, block

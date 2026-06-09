@@ -340,6 +340,15 @@ export function createWorkflowTool(
 						"output+reasoning tokens). When the budget is exhausted, further " +
 						"agent() calls are refused. Omit for no ceiling.",
 				),
+			spec_path: tool.schema
+				.string()
+				.optional()
+				.describe(
+					"Path to the run's source-of-truth file (e.g. a rolling-wave plan " +
+						"doc), resolved relative to the project directory. Classified for a " +
+						"git diagnostic; if untracked/ignored it is copied into " +
+						"worktree-isolated agents so they can see it. Omit if none.",
+				),
 		},
 		async execute(args, context: ToolContext) {
 			const resumeFrom = trimmedOrAbsent(args.resume_from_run_id);
@@ -349,6 +358,7 @@ export function createWorkflowTool(
 			const script = trimmedOrAbsent(args.script);
 			const scriptPath = trimmedOrAbsent(args.script_path);
 			const name = trimmedOrAbsent(args.name);
+			const specPath = trimmedOrAbsent(args.spec_path);
 
 			const present = [script, scriptPath, name].filter((v) => v !== undefined);
 			// The source xor only applies when NOT resuming: a resume may carry zero
@@ -415,6 +425,7 @@ export function createWorkflowTool(
 					parentSessionID: context.sessionID,
 					...(resumeFrom !== undefined ? { resumeFromRunId: resumeFrom } : {}),
 					...(budgetTokens !== undefined ? { budgetTokens } : {}),
+					...(specPath !== undefined ? { specPath } : {}),
 				});
 			} catch (err) {
 				// Resume guards (unknown id / still-running) throw — surface them as

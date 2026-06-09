@@ -504,6 +504,46 @@ describe("createWorkflowTool — budget_tokens coercion", () => {
 	});
 });
 
+describe("createWorkflowTool — spec_path coercion (Issue 6)", () => {
+	const stubEngine = (calls: { specPath?: string }[]): WorkflowEngine =>
+		({
+			startRun: async (a: { specPath?: string }) => {
+				calls.push({ specPath: a.specPath });
+				return { runId: "wf_x", scriptPath: "/p", name: "n" };
+			},
+			statusOf: () => undefined,
+			runs: new Map(),
+		}) as unknown as WorkflowEngine;
+
+	test("a non-empty spec_path threads (trimmed) to startRun as specPath", async () => {
+		const calls: { specPath?: string }[] = [];
+		const { facade } = makeFs();
+		const t = createWorkflowTool(stubEngine(calls), {
+			directory: DIRECTORY,
+			fs: facade,
+		});
+		await run(
+			t,
+			{ script: HANGING, spec_path: "  docs/plans/plan.md  " },
+			ctx("ses_parent"),
+		);
+		expect(calls[0]?.specPath).toBe("docs/plans/plan.md");
+	});
+
+	test("an empty / whitespace / absent spec_path coerces to undefined (no key set)", async () => {
+		for (const raw of ["", "   ", undefined]) {
+			const calls: { specPath?: string }[] = [];
+			const { facade } = makeFs();
+			const t = createWorkflowTool(stubEngine(calls), {
+				directory: DIRECTORY,
+				fs: facade,
+			});
+			await run(t, { script: HANGING, spec_path: raw }, ctx("ses_parent"));
+			expect(calls[0]?.specPath).toBeUndefined();
+		}
+	});
+});
+
 describe("createWorkflowTool — resume", () => {
 	const META_LOCAL = `export const meta = { name: "demo", description: "d" };\n`;
 	const ONE_AGENT = `${META_LOCAL}const r = await agent("do work");\nreturn r;\n`;

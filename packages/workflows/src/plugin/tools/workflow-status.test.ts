@@ -1479,3 +1479,271 @@ describe("createWorkflowStatusTool — CC-style agent tree, SETTLED run (Task 8.
 		expect(out).toContain("result:");
 	});
 });
+
+// ---- Epic 2.1/2.2/2.3/2.4: engine git-truth surfaces ----------------------
+
+describe("createWorkflowStatusTool — engine files changed (Epic 2.1)", () => {
+	test("renders the sorted, de-duplicated union separate from the agent self-report", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fc000001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { filesChanged: ["docs/plans/x.md"] },
+					checkpoints: [
+						{ sha: "s1", label: "a", paths: ["z.ts", "a.ts"] },
+						{ sha: "s2", label: "b", paths: ["b.ts", "a.ts"] },
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fc000001" }, ctx());
+		// Agent self-report still shown under result:.
+		expect(out).toContain('result: {"filesChanged":["docs/plans/x.md"]}');
+		// Engine union: sorted + de-duplicated (a.ts appears once).
+		expect(out).toContain("files changed (engine-computed, 3):");
+		const fcIdx = out.indexOf("files changed (engine-computed");
+		const block = out.slice(fcIdx);
+		expect(block).toContain("  a.ts");
+		expect(block).toContain("  b.ts");
+		expect(block).toContain("  z.ts");
+		expect(block.indexOf("a.ts")).toBeLessThan(block.indexOf("b.ts"));
+		expect(block.indexOf("b.ts")).toBeLessThan(block.indexOf("z.ts"));
+	});
+
+	test("a no-checkpoint run renders no engine files block", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fc000002",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fc000002" }, ctx());
+		expect(out).not.toContain("files changed (engine-computed");
+	});
+
+	test("a failed run still surfaces the engine files block", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fc000003",
+					status: "error",
+					completedAt: 2_000,
+					error: "boom",
+					checkpoints: [{ sha: "s1", label: "a", paths: ["a.ts"] }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fc000003" }, ctx());
+		expect(out).toContain("files changed (engine-computed, 1):");
+		expect(out).toContain("  a.ts");
+	});
+
+	test("a mode-flipped path is tagged (mode old→new), others bare (Epic 2.3)", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_fc000004",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+					checkpoints: [
+						{
+							sha: "s1",
+							label: "a",
+							paths: ["scripts/foo.sh", "src/a.ts"],
+							modeFlips: { "scripts/foo.sh": "100644→100755" },
+						},
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_fc000004" }, ctx());
+		expect(out).toContain("  scripts/foo.sh  (mode 100644→100755)");
+		expect(out).toContain("  src/a.ts");
+		expect(out).not.toContain("src/a.ts  (mode");
+	});
+});
+
+describe("createWorkflowStatusTool — checkpoint ledger (Epic 2.2)", () => {
+	const ledgerRecord = () =>
+		makeRecord({
+			id: "wf_led00001",
+			status: "completed",
+			completedAt: 2_000,
+			returnValue: { ok: true },
+			checkpoints: [
+				{ sha: "abcdef1234", label: "agent-a", phase: "1", paths: ["a.ts"] },
+				{ label: "agent-b", paths: ["b.ts", "c.ts"] },
+			],
+		});
+
+	test("under full: one line per commit, sha7/label/phase/file-count; (no sha) when absent", async () => {
+		const engine = fakeEngine([{ record: ledgerRecord(), progress: [] }]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_led00001", full: true }, ctx());
+		expect(out).toContain("checkpoints (2):");
+		expect(out).toContain("  abcdef1 agent-a phase=1 (1 files)");
+		expect(out).toContain("  (no sha) agent-b (2 files)");
+	});
+
+	test("without full: no checkpoint ledger", async () => {
+		const engine = fakeEngine([{ record: ledgerRecord(), progress: [] }]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_led00001" }, ctx());
+		expect(out).not.toContain("checkpoints (2):");
+	});
+
+	test("a no-checkpoint record shows no ledger even under full", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_led00002",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_led00002", full: true }, ctx());
+		expect(out).not.toContain("checkpoints (");
+	});
+});
+
+describe("createWorkflowStatusTool — no-commit contradiction (Epic 2.2/Issue 4)", () => {
+	test("flags a 'no commit' claim contradicted by real checkpoints", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { notes: ["No commit was created, per request."] },
+					checkpoints: [
+						{ sha: "s1", label: "a", paths: ["a.ts"] },
+						{ sha: "s2", label: "b", paths: ["b.ts"] },
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000001" }, ctx());
+		expect(out).toContain(
+			"⚠ result claims no commit, but the engine created 2 checkpoint commit(s)",
+		);
+	});
+
+	test("no flag when checkpoints absent (the note is true)", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000002",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { notes: ["No commit was created, per request."] },
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000002" }, ctx());
+		expect(out).not.toContain("result claims no commit");
+	});
+
+	test("no flag when checkpoints exist but result never says 'no commit'", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000003",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { notes: ["committed the fix"] },
+					checkpoints: [{ sha: "s1", label: "a", paths: ["a.ts"] }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000003" }, ctx());
+		expect(out).not.toContain("result claims no commit");
+	});
+
+	test("undefined returnValue does not throw and does not flag", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000004",
+					status: "completed",
+					completedAt: 2_000,
+					checkpoints: [{ sha: "s1", label: "a", paths: ["a.ts"] }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000004" }, ctx());
+		expect(out).not.toContain("result claims no commit");
+	});
+});
+
+describe("createWorkflowStatusTool — source diagnostics (Epic 2.4/Issue 6)", () => {
+	test("renders an ignored source-path warning naming the rule", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_sd000001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+					sourceDiagnostics: [
+						{
+							path: "docs/plans/x.md",
+							classification: "ignored",
+							rule: ".gitignore:47:docs/plans/",
+						},
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_sd000001" }, ctx());
+		expect(out).toContain("source diagnostics:");
+		expect(out).toContain(
+			"⚠ docs/plans/x.md is ignored (.gitignore:47:docs/plans/) — not a tracked artifact",
+		);
+	});
+
+	test("no diagnostics → no block", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_sd000002",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_sd000002" }, ctx());
+		expect(out).not.toContain("source diagnostics:");
+	});
+});

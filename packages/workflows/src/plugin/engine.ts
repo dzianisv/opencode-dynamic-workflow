@@ -56,6 +56,8 @@ import type {
 	JournalEntry,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
+import { BUILTIN_WORKFLOWS } from "./builtins";
+import { classifyPath, type SourceDiagnostic } from "./classify-path";
 import { type ControlWatcher, createControlWatcher } from "./control";
 import {
 	createFeedWriter,
@@ -70,20 +72,16 @@ import {
 	type Checkpointer,
 	createGitCheckpointer,
 } from "./git-checkpoint";
-import { BUILTIN_WORKFLOWS } from "./builtins";
 import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
-import {
-	type RunLookup,
-	saveRunAsWorkflow,
-} from "./tools/workflow-save";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
 	type SessionStatsSnapshot,
 	type SessionTokenSnapshot,
 } from "./session-stats";
+import { type RunLookup, saveRunAsWorkflow } from "./tools/workflow-save";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
 export interface EngineLogger {
@@ -122,6 +120,29 @@ export interface AgentSummary {
 	durationMs?: number;
 	/** The degrade note (Task 7.2.1), when the call collapsed to null/empty. */
 	note?: string;
+}
+
+/**
+ * The engine-computed git truth for ONE committed checkpoint (Epic 2.1). One
+ * entry per `agent:checkpoint` the engine emits, accumulated on the
+ * {@link RunRecord} at the settle choke point so a finished run reports which
+ * files actually changed (the de-duplicated union of every `paths`) and which
+ * commits a run created — independent of whatever the synthesis agent claimed in
+ * `returnValue`. `sha` is absent when the rev-parse read-back failed (the commit
+ * still landed; `paths` are still real). `modeFlips` (Epic 2.3) tags committed
+ * paths whose file mode flipped between two live modes (a chmod).
+ */
+export interface CheckpointRecord {
+	/** The checkpoint commit sha; absent when the rev-parse read-back failed. */
+	sha?: string;
+	/** The exact pathspecs committed (workflow-touched, baseline-excluded). */
+	paths: string[];
+	/** The committing agent's display label. */
+	label: string;
+	/** The active progress phase, when one was known. */
+	phase?: string;
+	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
+	modeFlips?: Record<string, string>;
 }
 
 /**
@@ -176,6 +197,23 @@ export interface RunRecord {
 	 * per-agent table post-hoc. Absent when the run launched no agents.
 	 */
 	agents?: AgentSummary[];
+	/**
+	 * Engine-computed checkpoint git truth (Epic 2.1/2.2): one {@link CheckpointRecord}
+	 * per committed checkpoint, accumulated at the choke point and persisted at every
+	 * settle site. The de-duplicated union of every entry's `paths` is the
+	 * engine-computed `filesChanged` surface; the array itself is the per-commit
+	 * ledger (`sha`/`paths`/`label`/`phase`). Absent on a run with no committed
+	 * checkpoints. Source of truth, not agent self-report.
+	 */
+	checkpoints?: CheckpointRecord[];
+	/**
+	 * Run-scoped source-path classification (Issue 6): the engine classifies the run's
+	 * EXPLICITLY declared `spec_path` and records only the operator-relevant verdicts
+	 * (`ignored`/`missing`) so an ignored ghost (e.g. a `docs/plans/…md` matched by
+	 * `.gitignore`) is surfaced rather than silently trusted. Absent when no
+	 * `spec_path` was declared, or it classified `tracked`/`untracked`.
+	 */
+	sourceDiagnostics?: SourceDiagnostic[];
 }
 
 /** In-memory handle for a run: live run (absent for recovered records), record, progress. */
@@ -242,6 +280,15 @@ export interface StartRunArgs {
 	 * before passing it. Absent → no budget (the runtime's null-budget default).
 	 */
 	budgetTokens?: number;
+	/**
+	 * The run's declared source-of-truth file (Issue 6), repo-relative or absolute.
+	 * EXPLICIT — replaces the prior heuristic `.md` arg-scan. When provided, the
+	 * engine classifies it (tracked/untracked/ignored/missing) and (a) attaches the
+	 * operator-relevant verdict to {@link RunRecord.sourceDiagnostics}, and (b) when
+	 * untracked/ignored, registers it with the worktree manager so isolated agents
+	 * get it copied into their fresh checkout. Absent → no classification, no copy.
+	 */
+	specPath?: string;
 }
 
 /** What `startRun` returns synchronously (before the run settles). */
@@ -527,6 +574,15 @@ export function createWorkflowEngine(
 	// before, breaking resume in production (live-harness Scenario C regression).
 	const fs = opts.fs ?? nodeFsFacade();
 	const logger = opts.logger;
+	/** Fenced on-disk existence probe (Epic 2.4): a readFile that resolves → exists. */
+	const fileExists = async (absPath: string): Promise<boolean> => {
+		try {
+			await fs.readFile(absPath, "utf-8");
+			return true;
+		} catch {
+			return false;
+		}
+	};
 	// The ONE canonical base, shared with the background-agents plugin. ALWAYS a
 	// string (XDG default when no dataDir/env), so every subdir is a real path and
 	// scripts/journals/runs/tasks always persist — even on a default install.
@@ -802,6 +858,9 @@ export function createWorkflowEngine(
 		// The run is now terminal — drop it from the live-run index so the digest path
 		// never scans a settled run (and the index does not grow unbounded).
 		unindexLiveRun(handle.record.parentSessionID, handle.record.id);
+		// Drop any registered spec-copy intent so the manager's map does not grow
+		// unbounded across a long-lived engine (no-op when none was registered).
+		worktreeManager.unregisterSpec(handle.record.id);
 		persistRecord(handle.record);
 		noticePush(handle.record);
 	}
@@ -943,6 +1002,47 @@ export function createWorkflowEngine(
 			record.budgetTotal = budget.total ?? undefined;
 		}
 
+		// Source-path diagnostic (Issue 6): classify the run's EXPLICITLY declared
+		// `spec_path` (replaces the prior heuristic `.md` arg-scan) so an ignored ghost
+		// (a `docs/plans/…md` matched by `.gitignore`) is surfaced rather than silently
+		// trusted, AND so an untracked/ignored spec gets copied into worktree-isolated
+		// agents (which see only HEAD). Records ONLY operator-relevant verdicts
+		// (`ignored`/`missing`); `tracked`/`untracked` are unremarkable noise. The whole
+		// block is fenced — a classification failure NEVER blocks or breaks startRun.
+		// No `spec_path` → no classification, no diagnostic, no copy (do not guess).
+		if (args.specPath !== undefined) {
+			try {
+				const specPath = args.specPath;
+				const exists = await fileExists(join(opts.directory, specPath));
+				const verdict = await classifyPath(
+					opts.shell,
+					opts.directory,
+					specPath,
+					exists,
+				);
+				if (
+					verdict.classification === "ignored" ||
+					verdict.classification === "missing"
+				) {
+					record.sourceDiagnostics = [verdict];
+				}
+				// Untracked/ignored → absent from a fresh `worktree add … HEAD` checkout.
+				// Register so the worktree manager copies it into every worktree this run
+				// mints. Tracked (already in HEAD) and missing (not on disk) never copy.
+				if (
+					verdict.classification === "untracked" ||
+					verdict.classification === "ignored"
+				) {
+					worktreeManager.registerSpec(runId, specPath);
+				}
+			} catch (err) {
+				logger?.warn("source-path classification failed (non-blocking)", {
+					runId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
 		// `now` is the live clock view for elapsed rendering (Task 6.2.1) — present
 		// only while this process owns the run. Recovered handles omit it.
 		const handle: RunHandle = {
@@ -1031,7 +1131,23 @@ export function createWorkflowEngine(
 							sessionID: meta.sessionID,
 							...(res.sha !== undefined ? { sha: res.sha } : {}),
 							paths: res.paths ?? [],
+							...(res.modeFlips !== undefined
+								? { modeFlips: res.modeFlips }
+								: {}),
 							at: clock.now(),
+						});
+						// Epic 2.1/2.2/2.3: accumulate the engine's git truth onto the record
+						// (same object the settle sites persist), so `filesChanged`, the
+						// checkpoint ledger, and mode flips are reported from git, not from
+						// the agent's self-report. Mirrors rollupAgent's lazy-create idiom.
+						recordCheckpoint({
+							...(res.sha !== undefined ? { sha: res.sha } : {}),
+							paths: res.paths ?? [],
+							label: meta.label,
+							...(meta.phase !== undefined ? { phase: meta.phase } : {}),
+							...(res.modeFlips !== undefined
+								? { modeFlips: res.modeFlips }
+								: {}),
 						});
 					}
 				} catch (err) {
@@ -1077,6 +1193,14 @@ export function createWorkflowEngine(
 				record.agents = [];
 			}
 			record.agents.push(summary);
+		};
+
+		/** Append one checkpoint's git truth onto the record (Epic 2.1), lazily creating it. */
+		const recordCheckpoint = (cp: CheckpointRecord): void => {
+			if (record.checkpoints === undefined) {
+				record.checkpoints = [];
+			}
+			record.checkpoints.push(cp);
 		};
 
 		const run = createWorkflowRun({
@@ -1344,6 +1468,22 @@ export function createWorkflowEngine(
 				() => undefined,
 			);
 
+		/**
+		 * Promote (success) or discard (abandoned) this run's checkpoint commits (Epic
+		 * 4.1). A `completed` terminal keeps the commits on the working branch and drops
+		 * the per-run marker; any other terminal (error/cancelled) rewinds the branch to
+		 * the run-start baseline (non-destructively) and GCs the orphaned commits. Fenced
+		 * — a ref-op failure must never fail the run or block the terminal feed line.
+		 */
+		const settleCheckpoints = (terminalStatus: string): Promise<void> =>
+			(terminalStatus === "completed"
+				? runCheckpointer.promote()
+				: runCheckpointer.discard()
+			).then(
+				() => undefined,
+				() => undefined,
+			);
+
 		// Capture this run's OWN operator-safety baseline (Task 2.1.3) BEFORE firing the
 		// detached run, so the pre-existing-dirty snapshot predates any agent edit and
 		// stays scoped to THIS run (no cross-run clobber). Fenced (a dead/no-shell
@@ -1398,6 +1538,11 @@ export function createWorkflowEngine(
 				// invariant a viewer relies on. On cancel, the aborted agents' ends have
 				// already enqueued their checkpoints, so this drains those too.
 				await drainCheckpoints();
+				// Promote/discard the run's checkpoint commits (Epic 4.1), AFTER the chain
+				// drains (so the marker is at the true tip) and BEFORE run:end. Use the
+				// record's terminal status — a stopRun pre-flips it to `cancelled`, which
+				// must route to discard() even though result.status may read `completed`.
+				await settleCheckpoints(handle.record.status);
 				await finalizeFeed(handle, {
 					...(result.agentCount !== undefined
 						? { agentCount: result.agentCount }
@@ -1419,6 +1564,8 @@ export function createWorkflowEngine(
 				}
 				// Drain the checkpoint chain before run:end on the error path too.
 				await drainCheckpoints();
+				// A thrown run is always non-success → discard (Epic 4.1).
+				await settleCheckpoints("error");
 				await finalizeFeed(handle, {});
 			});
 
@@ -1593,6 +1740,12 @@ export function createWorkflowEngine(
 				}
 				if (counts.agents.length > 0) {
 					record.agents = counts.agents;
+				}
+				// Epic 2.2 recovery parity: rehydrate the checkpoint ledger from the feed
+				// (a real crash dropped it from the record). FeedCheckpoint is assignable
+				// to CheckpointRecord (phase optional), so this is a direct assign.
+				if (counts.checkpoints.length > 0) {
+					record.checkpoints = counts.checkpoints;
 				}
 				persistRecord(record);
 			}

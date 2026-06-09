@@ -339,7 +339,13 @@ describe("readFeedCounts", () => {
 			"/feed/missing.jsonl",
 			readFs("/feed/other.jsonl", undefined),
 		);
-		expect(counts).toEqual({ agentCount: 0, live: 0, cached: 0, agents: [] });
+		expect(counts).toEqual({
+			agentCount: 0,
+			live: 0,
+			cached: 0,
+			agents: [],
+			checkpoints: [],
+		});
 	});
 
 	test("drops a truncated FINAL line (crash mid-append)", async () => {
@@ -397,7 +403,13 @@ describe("readFeedCounts", () => {
 		];
 		const path = "/feed/wf_e.jsonl";
 		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
-		expect(counts).toEqual({ agentCount: 0, live: 0, cached: 0, agents: [] });
+		expect(counts).toEqual({
+			agentCount: 0,
+			live: 0,
+			cached: 0,
+			agents: [],
+			checkpoints: [],
+		});
 	});
 
 	test("reads a real on-disk feed file end-to-end", async () => {
@@ -428,5 +440,83 @@ describe("readFeedCounts", () => {
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
+	});
+
+	// ---- Epic 2.2/2.3: harvest agent:checkpoint lines into the ledger -------
+
+	test("harvests agent:checkpoint lines (with/without sha, with modeFlips)", async () => {
+		const events: FeedEvent[] = [
+			{
+				type: "agent:checkpoint",
+				label: "agent-a",
+				sessionID: "ses_a",
+				sha: "abcdef1234",
+				paths: ["a.ts"],
+				modeFlips: { "a.ts": "100644→100755" },
+				at: 1,
+			},
+			{
+				type: "agent:end",
+				label: "agent-a",
+				status: "completed",
+				sessionID: "ses_a",
+				at: 2,
+			},
+			{
+				type: "agent:checkpoint",
+				label: "agent-b",
+				sessionID: "ses_b",
+				paths: ["b.ts", "c.ts"],
+				at: 3,
+			},
+		];
+		const path = "/feed/wf_cp.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts.checkpoints).toEqual([
+			{
+				sha: "abcdef1234",
+				paths: ["a.ts"],
+				label: "agent-a",
+				modeFlips: { "a.ts": "100644→100755" },
+			},
+			{ paths: ["b.ts", "c.ts"], label: "agent-b" },
+		]);
+	});
+
+	test("a truncated final checkpoint line is dropped, prior ones kept", async () => {
+		const good = JSON.stringify({
+			type: "agent:checkpoint",
+			label: "a",
+			sessionID: "s",
+			sha: "deadbeef",
+			paths: ["a.ts"],
+			at: 1,
+		});
+		const truncated = '{"type":"agent:checkpoint","label":"b","pat';
+		const path = "/feed/wf_ct.jsonl";
+		const counts = await readFeedCounts(
+			path,
+			readFs(path, `${good}\n${truncated}`),
+		);
+		expect(counts.checkpoints).toHaveLength(1);
+		expect(counts.checkpoints[0]).toMatchObject({
+			label: "a",
+			sha: "deadbeef",
+		});
+	});
+
+	test("a feed with no checkpoint lines → checkpoints: []", async () => {
+		const events: FeedEvent[] = [
+			{
+				type: "agent:end",
+				label: "a",
+				status: "completed",
+				sessionID: "s",
+				at: 1,
+			},
+		];
+		const path = "/feed/wf_nc.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts.checkpoints).toEqual([]);
 	});
 });

@@ -142,6 +142,8 @@ export interface AgentCheckpointLine {
 	sha?: string;
 	/** The exact pathspecs committed (workflow-touched, baseline-excluded). */
 	paths: string[];
+	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
+	modeFlips?: Record<string, string>;
 	at: number;
 }
 
@@ -279,6 +281,21 @@ export interface FeedAgentSummary {
 	note?: string;
 }
 
+/**
+ * The per-checkpoint git truth rehydrated from an `agent:checkpoint` feed line
+ * (Epic 2.2 recovery parity). Structurally a `CheckpointRecord` (engine.ts) MINUS
+ * `phase` — the feed line never carried `phase` (engine.ts:1028-1036), so a
+ * recovered run's ledger omits it honestly. `phase` stays optional on the engine
+ * `CheckpointRecord`, so a `FeedCheckpoint` is directly assignable to it.
+ */
+export interface FeedCheckpoint {
+	sha?: string;
+	paths: string[];
+	label: string;
+	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
+	modeFlips?: Record<string, string>;
+}
+
 /** The outcome counts a recovered run rehydrates from its feed (Phase 3.2.1). */
 export interface FeedCounts {
 	/** Total `agent:end` lines (every agent-call outcome). */
@@ -289,6 +306,12 @@ export interface FeedCounts {
 	cached: number;
 	/** Per-agent rollup, one entry per `agent:end`, in feed order. */
 	agents: FeedAgentSummary[];
+	/**
+	 * Per-checkpoint ledger harvested from `agent:checkpoint` lines (Epic 2.2). One
+	 * entry per committed checkpoint, in feed order, so a rehydrated run keeps its
+	 * `filesChanged`/ledger. Empty when the feed carried no checkpoint lines.
+	 */
+	checkpoints: FeedCheckpoint[];
 }
 
 /** The launch metadata carried from `agent:launched` to its matching `agent:end`. */
@@ -336,7 +359,13 @@ export async function readFeedCounts(
 	path: string,
 	fs: FeedReadFs = defaultReadFs,
 ): Promise<FeedCounts> {
-	const empty: FeedCounts = { agentCount: 0, live: 0, cached: 0, agents: [] };
+	const empty: FeedCounts = {
+		agentCount: 0,
+		live: 0,
+		cached: 0,
+		agents: [],
+		checkpoints: [],
+	};
 
 	let raw: string;
 	try {
@@ -374,11 +403,23 @@ export async function readFeedCounts(
 	};
 
 	const agents: FeedAgentSummary[] = [];
+	const checkpoints: FeedCheckpoint[] = [];
 	let live = 0;
 	let cached = 0;
 
 	for (const e of events) {
-		if (e.type === "agent:start") {
+		if (e.type === "agent:checkpoint") {
+			// Epic 2.2 recovery parity: harvest the per-checkpoint git truth a real
+			// crash dropped from the record (the record persists only at settle). The
+			// feed line carries label/sha?/paths/modeFlips? but NOT phase (it was never
+			// widened with it), so the rehydrated ledger omits phase — honest.
+			checkpoints.push({
+				...(e.sha !== undefined ? { sha: e.sha } : {}),
+				paths: e.paths ?? [],
+				label: e.label,
+				...(e.modeFlips !== undefined ? { modeFlips: e.modeFlips } : {}),
+			});
+		} else if (e.type === "agent:start") {
 			startQueue.push({ label: e.label, phase: e.phase });
 		} else if (e.type === "agent:launched") {
 			launchMeta.set(e.sessionID, {
@@ -430,5 +471,5 @@ export async function readFeedCounts(
 		}
 	}
 
-	return { agentCount: agents.length, live, cached, agents };
+	return { agentCount: agents.length, live, cached, agents, checkpoints };
 }

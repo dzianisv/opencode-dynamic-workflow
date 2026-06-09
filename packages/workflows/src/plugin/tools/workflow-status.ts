@@ -247,6 +247,114 @@ function renderDiagnostics(record: RunRecord): string[] {
 }
 
 /**
+ * The engine-computed `filesChanged` (Epic 2.1): the sorted, de-duplicated union
+ * of every checkpoint's committed `paths`. Independent of the agent's
+ * self-reported `returnValue.filesChanged` — this is git truth. Empty when the
+ * run committed no checkpoints.
+ */
+export function engineFilesChanged(record: RunRecord): string[] {
+	const set = new Set<string>();
+	for (const cp of record.checkpoints ?? []) {
+		for (const p of cp.paths) {
+			set.add(p);
+		}
+	}
+	return [...set].sort();
+}
+
+/**
+ * Render the engine-computed files-changed block (Epic 2.1/2.3). Returns `[]` when
+ * the union is empty (no misleading "0 files" header). Each path renders bare, or
+ * tagged `(mode <old>→<new>)` when ANY checkpoint flagged a mode flip for it
+ * (Epic 2.3 merge: any-flip-shown, so the rarer gate-relevant chmod signal is never
+ * hidden behind a later content-only touch).
+ */
+function renderFilesChanged(record: RunRecord): string[] {
+	const paths = engineFilesChanged(record);
+	if (paths.length === 0) {
+		return [];
+	}
+	// Merge every checkpoint's modeFlips: path → transition (any-flip-shown).
+	const flips = new Map<string, string>();
+	for (const cp of record.checkpoints ?? []) {
+		for (const [p, t] of Object.entries(cp.modeFlips ?? {})) {
+			flips.set(p, t);
+		}
+	}
+	const lines = [`files changed (engine-computed, ${paths.length}):`];
+	for (const p of paths) {
+		const flip = flips.get(p);
+		lines.push(flip !== undefined ? `  ${p}  (mode ${flip})` : `  ${p}`);
+	}
+	return ["", ...lines];
+}
+
+/**
+ * Render the per-commit checkpoint ledger (Epic 2.2), a deeper forensic surface
+ * than the union — shown under `full` (parity with {@link renderDiagnostics}). One
+ * line per commit: `<sha7> <label>[ phase=<phase>] (<n> files)`; a missing sha
+ * renders `(no sha)`. Returns `[]` when the run committed no checkpoints.
+ */
+function renderCheckpoints(record: RunRecord): string[] {
+	const cps = record.checkpoints;
+	if (cps === undefined || cps.length === 0) {
+		return [];
+	}
+	const lines: string[] = ["", `checkpoints (${cps.length}):`];
+	for (const cp of cps) {
+		const sha7 = cp.sha?.slice(0, 7) ?? "(no sha)";
+		const phase = cp.phase !== undefined ? ` phase=${cp.phase}` : "";
+		lines.push(`  ${sha7} ${cp.label}${phase} (${cp.paths.length} files)`);
+	}
+	return lines;
+}
+
+/**
+ * Flag a synthesized "no commit" claim contradicted by real checkpoint commits
+ * (Epic 2.2, Issue 4). Returns a warning ONLY when BOTH: (1) real checkpoints
+ * exist, AND (2) the agent's `returnValue` text contains the literal token
+ * "no commit" (conservative — a false flag erodes trust more than a missed one).
+ * `undefined` `returnValue` never throws and never flags.
+ */
+function noCommitContradiction(record: RunRecord): string | undefined {
+	const n = record.checkpoints?.length ?? 0;
+	if (n === 0) {
+		return undefined;
+	}
+	const text = JSON.stringify(record.returnValue);
+	if (text === undefined || !text.toLowerCase().includes("no commit")) {
+		return undefined;
+	}
+	return (
+		`⚠ result claims no commit, but the engine created ${n} checkpoint ` +
+		`commit(s) — see the checkpoints block / git log`
+	);
+}
+
+/**
+ * Render the run-scoped source-path diagnostics (Epic 2.4, Issue 6). One ⚠ line
+ * per recorded verdict (only `ignored`/`missing` are recorded upstream), naming
+ * the matching `.gitignore` rule and warning that the path is not a tracked
+ * artifact. Shown on every terminal arm regardless of `full` (a
+ * reproducibility/safety warning). Returns `[]` when none were recorded.
+ */
+function renderSourceDiagnostics(record: RunRecord): string[] {
+	const diags = record.sourceDiagnostics;
+	if (diags === undefined || diags.length === 0) {
+		return [];
+	}
+	const lines: string[] = ["", "source diagnostics:"];
+	for (const d of diags) {
+		const rule = d.rule !== undefined ? ` (${d.rule})` : "";
+		lines.push(
+			`  ⚠ ${d.path} is ${d.classification}${rule} — not a tracked artifact; ` +
+				"it will not travel with the branch and may be invisible to isolated agents",
+		);
+	}
+	return lines;
+}
+
+/**
  * Pair each `agent:start` with its matching `agent:end` by first-unmatched-start
  * per label (Task 6.2.1). Labels may repeat, so a strict label→last-end map would
  * mis-attribute status and duration; chronological pairing (consume the earliest
@@ -688,15 +796,32 @@ function render(
 
 	if (record.status === "completed") {
 		parts.push("", renderResult(record, full));
+		// Epic 2.1/2.3: the engine-computed files-changed union (git truth), shown
+		// regardless of `full` and visibly SEPARATE from the agent's self-report above.
+		parts.push(...renderFilesChanged(record));
+		// Epic 2.2 (Issue 4): flag a "no commit" claim contradicted by real commits.
+		const contradiction = noCommitContradiction(record);
+		if (contradiction !== undefined) {
+			parts.push("", contradiction);
+		}
+		// Epic 2.4 (Issue 6): surface ignored/missing source-path ghosts.
+		parts.push(...renderSourceDiagnostics(record));
 		// Task 7.2.2: under `full`, append the persisted per-agent diagnostics so the
 		// whole post-mortem is readable through the tool — no shell access required.
 		if (full) {
 			parts.push(...renderDiagnostics(record));
+			// Epic 2.2: the per-commit checkpoint ledger (forensic, full-only).
+			parts.push(...renderCheckpoints(record));
 		}
 	} else if (record.status === "error") {
 		parts.push("", `error: ${record.error ?? "(no message)"}`);
+		// Epic 2.1: a failed run still changed real files — the operator needs them.
+		parts.push(...renderFilesChanged(record));
+		// Epic 2.4: surface ignored/missing source-path ghosts on the error arm too.
+		parts.push(...renderSourceDiagnostics(record));
 		if (full) {
 			parts.push(...renderDiagnostics(record));
+			parts.push(...renderCheckpoints(record));
 		}
 	}
 

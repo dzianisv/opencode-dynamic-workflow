@@ -1209,6 +1209,121 @@ describe("createAgentPrimitive — worktree isolation mint (Task H.1.2)", () => 
 	});
 });
 
+// ---- Phase 3 / Task 3.1.1: verifyDiff IMPLIES worktree isolation ----------
+
+describe("createAgentPrimitive — verifyDiff implies worktree isolation (Task 3.1.1)", () => {
+	test("a verifyDiff:true agent mints a worktree, re-roots the launch, and verifies in it", async () => {
+		// The race fix: with only verifyDiff set (no explicit isolation), the agent
+		// must run in its OWN worktree so the check sees only its edits, not a
+		// sibling's mid-flight mutation of the shared tree.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		});
+		const verifyCalls: { directory?: string }[] = [];
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			directory: "/repo/main",
+			verifyResult: async (v) => {
+				verifyCalls.push({ directory: v.directory });
+				return { passed: true, available: true };
+			},
+		});
+
+		expect(await agent("mutate", { verifyDiff: true })).toBe("OK");
+
+		// Exactly one worktree minted for this verifyDiff agent.
+		expect(manager.creates).toEqual([{ runId: "run-1", label: "mutate-0" }]);
+		// The launch was re-rooted to the minted worktree, not the run-wide dir.
+		expect(runner.launches).toHaveLength(1);
+		expect(runner.launches[0]?.directory).toBe("/tmp/wf/run-1/iso");
+		// verifyResult was handed the worktree dir so the check observes only this
+		// agent's edits (the false-negative fix).
+		expect(verifyCalls).toEqual([{ directory: "/tmp/wf/run-1/iso" }]);
+	});
+
+	test("a verifyDiff:{check} agent mints a worktree (the check reads disk in isolation)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		});
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			verifyResult: async () => ({ passed: true, available: true }),
+		});
+
+		expect(await agent("mutate", { verifyDiff: { check: "tsc" } })).toBe("OK");
+		expect(manager.creates).toHaveLength(1);
+		expect(runner.launches[0]?.directory).toBe("/tmp/wf/run-1/iso");
+	});
+
+	test("verifyDiff with NO manager threaded falls through unisolated — NOT degrade-to-null", async () => {
+		// verifyDiff is INERT on a no-isolation engine: the agent runs unisolated and
+		// verifies against the shared tree exactly as before the fix. It must NEVER
+		// degrade to null (that contract belongs to EXPLICIT isolation:'worktree').
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const verifyCalls: { directory?: string }[] = [];
+		const { agent, events, diags } = harness({
+			runner,
+			directory: "/repo/main",
+			verifyResult: async (v) => {
+				verifyCalls.push({ directory: v.directory });
+				return { passed: true, available: true };
+			},
+		});
+
+		expect(await agent("mutate", { verifyDiff: true })).toBe("OK");
+		// Ran unisolated against the run-wide directory; no degrade, no diagnostic.
+		expect(runner.launches[0]?.directory).toBe("/repo/main");
+		expect(diags).toHaveLength(0);
+		expect(events.some((e) => e.type === "warn")).toBe(false);
+		// Verify ran with no worktree dir → shared-tree path, exactly as today.
+		expect(verifyCalls).toEqual([{ directory: undefined }]);
+	});
+
+	test("verifyDiff with a manager whose create() returns null falls through unisolated — NOT degrade-to-null", async () => {
+		// A no-shell engine threads a manager whose create() returns null. A verifyDiff
+		// agent must fall through unisolated (honoring the inert-on-no-shell contract),
+		// never turn into a spurious null with a worktree_mint_failed diagnostic.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({ create: async () => null });
+		const { agent, events, diags } = harness({
+			runner,
+			worktreeManager: manager,
+			directory: "/repo/main",
+			verifyResult: async () => ({ passed: true, available: true }),
+		});
+
+		expect(await agent("mutate", { verifyDiff: true })).toBe("OK");
+		expect(diags.some((d) => d.reason === "worktree_mint_failed")).toBe(false);
+		expect(
+			events.some(
+				(e) =>
+					e.type === "agent:end" &&
+					(e as { note?: string }).note?.includes("worktree_mint_failed"),
+			),
+		).toBe(false);
+		// Ran unisolated; the run-wide directory applies.
+		expect(runner.launches[0]?.directory).toBe("/repo/main");
+	});
+
+	test("BOTH verifyDiff AND explicit isolation, mint miss → explicit contract wins (degrade-to-null)", async () => {
+		// The stronger contract (explicit isolation:'worktree') governs: a mint miss
+		// degrades to null loudly, even though verifyDiff alone would fall through.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({ create: async () => null });
+		const { agent, diags } = harness({ runner, worktreeManager: manager });
+
+		expect(
+			await agent("p", { isolation: "worktree", verifyDiff: true }),
+		).toBeNull();
+		expect(diags).toHaveLength(1);
+		expect(diags[0]?.reason).toBe("worktree_mint_failed");
+	});
+});
+
 // ---- Task H.1.3: verifyDiff + merge-back on agent:end --------------------
 
 describe("createAgentPrimitive — worktree merge-back on settle (Task H.1.3)", () => {

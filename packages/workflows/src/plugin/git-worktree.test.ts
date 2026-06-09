@@ -1,4 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { $ } from "bun";
 import { branchFor, createWorktreeManager } from "./git-worktree";
 
 /**
@@ -715,5 +719,123 @@ describe("createWorktreeManager — non-repo dead latch shared across the manage
 		expect(warns).toHaveLength(1);
 		expect(commands.some((c) => c.includes("worktree add"))).toBe(false);
 		expect(commands.some((c) => c.includes("merge"))).toBe(false);
+	});
+});
+
+/**
+ * Issue 6 structural half — real-git temp-repo harness (the spec's required pattern):
+ * a registered UNTRACKED spec (covering both ignored and plain-untracked) must be
+ * COPIED into a freshly-minted worktree, which — born from `HEAD` — would otherwise
+ * lack it. Uses the real `Bun.$` shell + a real on-disk git repo (no fake shell), so
+ * the `worktree add … HEAD` + `node:fs` copy round-trip is exercised end-to-end.
+ */
+describe("createWorktreeManager — registerSpec copies an untracked spec into the worktree (Issue 6)", () => {
+	const tmps: string[] = [];
+
+	afterEach(async () => {
+		for (const dir of tmps.splice(0)) {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	/** Init a real git repo with one tracked commit so `HEAD` exists for `worktree add`. */
+	async function makeRepo(): Promise<string> {
+		const dir = await mkdtemp(join(tmpdir(), "wf-wt-"));
+		tmps.push(dir);
+		// The managed worktree root is a SIBLING of the repo (`<repo>/../.wf-worktrees`),
+		// so register the parent for cleanup too.
+		tmps.push(join(dir, "..", ".wf-worktrees"));
+		const git = $.cwd(dir).nothrow();
+		await git`git init -q -b main`.quiet();
+		await git`git config user.email t@t.local`.quiet();
+		await git`git config user.name tester`.quiet();
+		await writeFile(join(dir, "README.md"), "# tracked\n");
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m init`.quiet();
+		return dir;
+	}
+
+	test("an IGNORED spec is copied into the new worktree (not in HEAD)", async () => {
+		const repo = await makeRepo();
+		// A .gitignore'd plan doc: tracked .gitignore, ignored+untracked plan file.
+		await writeFile(join(repo, ".gitignore"), "docs/plans/\n");
+		await $.cwd(repo).nothrow()`git add .gitignore`.quiet();
+		await $.cwd(repo).nothrow()`git commit -q -m ignore`.quiet();
+		await $.cwd(repo).nothrow()`mkdir -p docs/plans`.quiet();
+		await writeFile(
+			join(repo, "docs/plans/plan.md"),
+			"# the source of truth\n",
+		);
+
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec("wf_run1", "docs/plans/plan.md");
+		const handle = await mgr.create({ runId: "wf_run1", label: "worker" });
+		expect(handle).not.toBeNull();
+		const dir = (handle as { dir: string }).dir;
+
+		// The ignored plan is PRESENT in the worktree with the main tree's content.
+		const copied = await readFile(join(dir, "docs/plans/plan.md"), "utf-8");
+		expect(copied).toBe("# the source of truth\n");
+		await mgr.cleanup(dir, (handle as { branch: string }).branch);
+	});
+
+	test("a PLAIN-UNTRACKED spec is copied into the new worktree", async () => {
+		const repo = await makeRepo();
+		// Untracked, not ignored — also absent from a HEAD checkout.
+		await writeFile(join(repo, "notes.md"), "# untracked notes\n");
+
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec("wf_run2", "notes.md");
+		const handle = await mgr.create({ runId: "wf_run2", label: "worker" });
+		const dir = (handle as { dir: string }).dir;
+
+		expect(await readFile(join(dir, "notes.md"), "utf-8")).toBe(
+			"# untracked notes\n",
+		);
+		await mgr.cleanup(dir, (handle as { branch: string }).branch);
+	});
+
+	test("NO registered spec → no copy (worktree carries only HEAD)", async () => {
+		const repo = await makeRepo();
+		await writeFile(join(repo, "notes.md"), "# untracked notes\n");
+
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		// No registerSpec call.
+		const handle = await mgr.create({ runId: "wf_run3", label: "worker" });
+		const dir = (handle as { dir: string }).dir;
+
+		// README (tracked) is in HEAD; the untracked notes are NOT copied.
+		expect(await readFile(join(dir, "README.md"), "utf-8")).toBe("# tracked\n");
+		await expect(stat(join(dir, "notes.md"))).rejects.toThrow();
+		await mgr.cleanup(dir, (handle as { branch: string }).branch);
+	});
+
+	test("a copy failure (spec vanished) is fenced — the mint still succeeds", async () => {
+		const repo = await makeRepo();
+		const { logger, warns } = captureLogger();
+		const mgr = createWorktreeManager({ shell: $, directory: repo, logger });
+		// Register a path that does not exist on disk → copyFile rejects (ENOENT).
+		mgr.registerSpec("wf_run4", "ghost.md");
+		const handle = await mgr.create({ runId: "wf_run4", label: "worker" });
+		// The mint is NOT failed by a copy error.
+		expect(handle).not.toBeNull();
+		const dir = (handle as { dir: string }).dir;
+		await expect(stat(join(dir, "ghost.md"))).rejects.toThrow();
+		expect(
+			warns.some((w) => w.msg.includes("failed to copy declared spec")),
+		).toBe(true);
+		await mgr.cleanup(dir, (handle as { branch: string }).branch);
+	});
+
+	test("unregisterSpec stops the copy on a later mint", async () => {
+		const repo = await makeRepo();
+		await writeFile(join(repo, "notes.md"), "# untracked notes\n");
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec("wf_run5", "notes.md");
+		mgr.unregisterSpec("wf_run5");
+		const handle = await mgr.create({ runId: "wf_run5", label: "worker" });
+		const dir = (handle as { dir: string }).dir;
+		await expect(stat(join(dir, "notes.md"))).rejects.toThrow();
+		await mgr.cleanup(dir, (handle as { branch: string }).branch);
 	});
 });

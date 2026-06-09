@@ -41,7 +41,8 @@
  * `BunShellOutput` carries `.exitCode` and a SYNCHRONOUS `.text()`.
  */
 
-import { join } from "node:path";
+import { copyFile, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 /** The host shell primitive — `PluginInput['$']`; NOT a named package export. */
@@ -112,6 +113,21 @@ export interface WorktreeManager {
 	cleanup(dir: string, branch: string): Promise<void>;
 	/** Prune orphan `wf/*` worktrees + branches from a crashed prior run. */
 	sweep(): Promise<void>;
+	/**
+	 * Declare a run's source-of-truth spec as an UNTRACKED file that must be copied
+	 * into every worktree this run mints (Issue 6 structural half). A fresh
+	 * `worktree add … HEAD` checkout carries only HEAD's tracked files, so an
+	 * untracked/ignored spec (e.g. a `.gitignore`d `docs/plans/…md`) is invisible to
+	 * an isolated agent. The engine registers ONLY when its own classification
+	 * verdict is `untracked`/`ignored` (tracked → already in HEAD; missing → not on
+	 * disk), so `create` copies exactly the declared path, never a blanket sync.
+	 * `repoRelPath` is repo-relative (resolved against `directory`). NOT part of the
+	 * runtime {@link WorktreeManagerSeam} — an engine-only, out-of-band channel keyed
+	 * by runId so the runtime mint call (`create({runId,label})`) stays unchanged.
+	 */
+	registerSpec(runId: string, repoRelPath: string): void;
+	/** Drop a run's registered spec (best-effort, at run settle). */
+	unregisterSpec(runId: string): void;
 }
 
 export interface CreateWorktreeManagerOptions {
@@ -224,6 +240,12 @@ export function createWorktreeManager(
 	// isUnchanged() count commits ahead WITHOUT threading the main ref through callers.
 	const baseByDir = new Map<string, string>();
 
+	// Per-run UNTRACKED spec paths (Issue 6 structural half), keyed by runId. The
+	// engine registers a run's declared `spec_path` here ONLY when its classification
+	// verdict is untracked/ignored; doCreate copies it from the main tree into the
+	// fresh worktree (which, born from HEAD, lacks any non-tracked file). Repo-relative.
+	const specByRun = new Map<string, string>();
+
 	// The managed worktree root: a SIBLING of the repo, outside the working tree (a
 	// checkout inside the tree is a nested status/ignore hazard; inside .git is illegal).
 	// `join` collapses the `..` so the path genuinely resolves OUTSIDE `directory`.
@@ -291,6 +313,29 @@ export function createWorktreeManager(
 			const base = readText(head).trim();
 			if (base.length > 0) {
 				baseByDir.set(dir, base);
+			}
+		}
+		// Issue 6 structural half: the worktree was born from HEAD, so an UNTRACKED
+		// declared spec (ignored or plain-untracked) is absent from it. Copy ONLY that
+		// one registered path from the main tree into the worktree so the isolated
+		// agent can read its source of truth. Fenced — a copy failure (the file
+		// vanished, a permission error) NEVER fails the mint or the agent.
+		const spec = specByRun.get(key.runId);
+		if (spec !== undefined) {
+			try {
+				const dest = join(dir, spec);
+				await mkdir(dirname(dest), { recursive: true });
+				await copyFile(join(directory, spec), dest);
+			} catch (err) {
+				logger?.warn(
+					"failed to copy declared spec into worktree; the isolated agent may " +
+						"not see its source of truth (non-blocking)",
+					{
+						runId: key.runId,
+						spec,
+						error: err instanceof Error ? err.message : String(err),
+					},
+				);
 			}
 		}
 		return { dir, branch };
@@ -467,5 +512,21 @@ export function createWorktreeManager(
 		}
 	}
 
-	return { create, mergeBack, isUnchanged, cleanup, sweep };
+	function registerSpec(runId: string, repoRelPath: string): void {
+		specByRun.set(runId, repoRelPath);
+	}
+
+	function unregisterSpec(runId: string): void {
+		specByRun.delete(runId);
+	}
+
+	return {
+		create,
+		mergeBack,
+		isUnchanged,
+		cleanup,
+		sweep,
+		registerSpec,
+		unregisterSpec,
+	};
 }

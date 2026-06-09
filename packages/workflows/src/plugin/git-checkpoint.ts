@@ -92,6 +92,16 @@ export interface CheckpointResult {
 	paths?: string[];
 	/** Paths refused because they were operator-dirty at baseline (never stomped). */
 	refused?: string[];
+	/**
+	 * Mode-aware change enumeration (Epic 2.3): committed paths whose file mode
+	 * changed in this commit between two NON-ZERO modes (a real chmod, e.g. a
+	 * `chmod +x` that flips `100644 → 100755`), keyed by path with the transition
+	 * string `"<oldmode>→<newmode>"`. Creations (`000000→…`) and deletions
+	 * (`…→000000`) are NOT mode flips and are excluded — only an executable-bit /
+	 * symlink-style transition between two live modes lands here. Absent when no
+	 * committed path changed mode (the common case).
+	 */
+	modeFlips?: Record<string, string>;
 }
 
 export interface Checkpointer {
@@ -113,6 +123,26 @@ export interface Checkpointer {
 	diff(): Promise<DiffResult>;
 	/** The run-start HEAD captured by {@link Checkpointer.baseline}; null in a zero-commit repo or before baseline. */
 	baselineRef(): string | null;
+	/**
+	 * SUCCESS terminal (Epic 4.1): the run completed, so its checkpoint commits stay
+	 * on the working branch. Promotion only removes the now-redundant per-run marker
+	 * ref ({@link checkpointRefFor}); it NEVER touches the branch. No-op when the run
+	 * committed nothing or the checkpointer is dead. Fenced — never rejects.
+	 */
+	promote(): Promise<void>;
+	/**
+	 * FAILURE / ABORT / CANCEL terminal (Epic 4.1): the run did not complete, so its
+	 * checkpoint commits must not pollute the working branch's permanent history.
+	 * Rewinds the branch pointer to {@link Checkpointer.baselineRef} ONLY when the
+	 * branch tip still equals the run's marker tip (nothing was layered on top) and a
+	 * baseline exists — a NON-destructive `update-ref` that moves the pointer only,
+	 * never the index/working tree (the abandoned edits survive on disk as
+	 * uncommitted changes). When the tips diverge (operator/other-run layered work) or
+	 * no baseline exists, it SKIPS the rewind and warns with the residue SHAs. Always
+	 * deletes the marker afterward. No-op when the run committed nothing or the
+	 * checkpointer is dead. Fenced — never rejects.
+	 */
+	discard(): Promise<void>;
 }
 
 export interface CreateGitCheckpointerOptions {
@@ -171,6 +201,58 @@ function unquotePath(path: string): string {
 	return path;
 }
 
+/**
+ * Parse `git diff-tree --no-commit-id --no-renames -r <sha>` raw output into a
+ * path → `"<oldmode>→<newmode>"` map of MODE FLIPS only (Epic 2.3). Each raw line
+ * is `:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`: a leading colon,
+ * space-separated metadata, a TAB, then the path. An entry is recorded ONLY when
+ * the two modes differ AND BOTH are non-zero — a creation (`000000→…`) or a
+ * deletion (`…→000000`) is not a chmod and is excluded. A content-only change
+ * (equal modes) yields no entry. The blob-sha columns are read past but not used:
+ * v1 surfaces the transition string, not the mode-only-vs-mode+content distinction.
+ */
+export function parseModeFlips(stdout: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const raw of stdout.split("\n")) {
+		if (!raw.startsWith(":")) {
+			continue;
+		}
+		const tab = raw.indexOf("\t");
+		if (tab === -1) {
+			continue;
+		}
+		// Metadata is the pre-TAB segment, minus the leading colon.
+		const meta = raw.slice(1, tab).trim().split(/\s+/);
+		const oldmode = meta[0];
+		const newmode = meta[1];
+		if (oldmode === undefined || newmode === undefined) {
+			continue;
+		}
+		// Only a transition between two LIVE (non-zero) modes is a chmod.
+		if (oldmode === newmode || oldmode === "000000" || newmode === "000000") {
+			continue;
+		}
+		const path = unquotePath(raw.slice(tab + 1).trim());
+		if (path.length > 0) {
+			out[path] = `${oldmode}→${newmode}`;
+		}
+	}
+	return out;
+}
+
+/**
+ * The ref namespace for per-run checkpoint markers (Epic 4.1). Each run advances
+ * `refs/wf-checkpoints/<runId>` to its latest checkpoint commit; on a SUCCESS
+ * terminal the marker is deleted (commits stay), on a FAILURE/ABORT/CANCEL terminal
+ * the branch is rewound to baseline and the marker deleted (orphaned commits → GC'd).
+ */
+const WF_CHECKPOINT_REF_PREFIX = "refs/wf-checkpoints/";
+
+/** The per-run checkpoint marker ref for a runId (engine-generated `wf_…`, ref-name-safe). */
+export function checkpointRefFor(runId: string): string {
+	return `${WF_CHECKPOINT_REF_PREFIX}${runId}`;
+}
+
 /** The forensic commit message: traceable to the run/agent that made it. */
 export function commitMessageFor(meta: CheckpointMeta): string {
 	const phase = meta.phase !== undefined ? ` phase=${meta.phase}` : "";
@@ -211,6 +293,12 @@ export function createGitCheckpointer(
 	// captured for forensic parity and read back by {@link Checkpointer.baselineRef}.
 	let preexistingDirty = new Set<string>();
 	let baselineHead: string | null = null;
+
+	// The runId of THIS run, captured lazily on the FIRST sha-bearing checkpoint
+	// commit (Epic 4.1). `baseline()` takes no meta, so the runId is not known until
+	// `checkpoint(meta)` runs; promote()/discard() run only AFTER a terminal, by which
+	// point either a checkpoint committed (set) or none did (undefined → no-op).
+	let ownRunId: string | undefined;
 
 	/**
 	 * The repo-bound, fenced shell. Only reachable when `shell` is defined.
@@ -344,6 +432,18 @@ export function createGitCheckpointer(
 			const add = await git()`git add -- ${path}`.quiet();
 			if (add.exitCode === 0) {
 				staged.push(path);
+				continue;
+			}
+			// A failed `git add` is NOT proof the path is uncommittable: an
+			// ALREADY-STAGED deletion (the file is gone from disk — what `git rm`/`git
+			// mv` both produce, porcelain column-1 `D`) makes `git add -- <path>` fail
+			// with `fatal: pathspec did not match any files`, yet the deletion is already
+			// in the index and the scoped `git commit -- <staged>` commits it. Probe the
+			// index before dropping the path: if `--cached --name-only` lists it, keep it.
+			const cached =
+				await git()`git diff --cached --name-only -- ${path}`.quiet();
+			if (cached.exitCode === 0 && readText(cached).trim().length > 0) {
+				staged.push(path);
 			} else {
 				logger?.warn("git checkpoint add failed; skipping path", {
 					runId: meta.runId,
@@ -386,12 +486,113 @@ export function createGitCheckpointer(
 		const rev = await git()`git rev-parse HEAD`.quiet();
 		const sha = rev.exitCode === 0 ? readText(rev).trim() : undefined;
 
+		// (6b) Advance the per-run checkpoint marker to the new HEAD (Epic 4.1). The
+		// marker is forensic + the rewind anchor for promote()/discard(); its failure
+		// must NOT fail a checkpoint that already committed, so it is fenced and logged
+		// at debug. Skipped when the sha read-back failed (no sha to point the ref at).
+		if (sha !== undefined) {
+			ownRunId = meta.runId;
+			const upd =
+				await git()`git update-ref ${checkpointRefFor(meta.runId)} ${sha}`.quiet();
+			if (upd.exitCode !== 0) {
+				logger?.debug("git checkpoint marker update failed", {
+					runId: meta.runId,
+					sha,
+					stderr: readText({ text: () => upd.stderr.toString() }),
+				});
+			}
+		}
+
+		// (7) Mode-aware enumeration (Epic 2.3): read the just-created commit's raw
+		// diff against its parent to surface chmod transitions (e.g. `100644→100755`)
+		// the bare `M path` porcelain status hides. Fenced + quieted (host-fd safety,
+		// header lines 25-34); a non-zero exit → empty stdout → empty map → omitted.
+		// Skipped when the sha read-back failed (no commit to inspect).
+		let modeFlips: Record<string, string> = {};
+		if (sha !== undefined) {
+			const dt =
+				await git()`git diff-tree --no-commit-id --no-renames -r ${sha}`.quiet();
+			if (dt.exitCode === 0) {
+				modeFlips = parseModeFlips(readText(dt));
+			}
+		}
+
 		return {
 			committed: true,
 			...(sha !== undefined ? { sha } : {}),
 			paths: staged,
 			...(refused.length > 0 ? { refused } : {}),
+			...(Object.keys(modeFlips).length > 0 ? { modeFlips } : {}),
 		};
+	}
+
+	async function promote(): Promise<void> {
+		// Success terminal: commits are already on the branch; only drop the now-
+		// redundant marker. No-op on a dead checkpointer or a run with no commits.
+		if (dead || ownRunId === undefined) {
+			return;
+		}
+		const del =
+			await git()`git update-ref -d ${checkpointRefFor(ownRunId)}`.quiet();
+		if (del.exitCode !== 0) {
+			logger?.debug("git checkpoint marker delete (promote) failed", {
+				runId: ownRunId,
+				stderr: readText({ text: () => del.stderr.toString() }),
+			});
+		}
+	}
+
+	async function discard(): Promise<void> {
+		// Failure/abort/cancel terminal. No-op on a dead checkpointer or a run with no
+		// commits (nothing to rewind, no marker to delete).
+		if (dead || ownRunId === undefined) {
+			return;
+		}
+		const ref = checkpointRefFor(ownRunId);
+		// (a) Current branch tip and (b) the run's marker tip.
+		const branch = await git()`git rev-parse HEAD`.quiet();
+		const branchTip = branch.exitCode === 0 ? readText(branch).trim() : "";
+		const marker = await git()`git rev-parse ${ref}`.quiet();
+		const markerTip = marker.exitCode === 0 ? readText(marker).trim() : "";
+		// (c) OPERATOR-LAYERING GUARD: rewind ONLY when a baseline exists, the marker
+		// tip read succeeded, and the branch tip still equals the marker tip (nothing
+		// was layered on top of the run's last checkpoint). Otherwise SKIP the rewind —
+		// blindly repointing to baseline would discard an operator's / another run's
+		// commit. A NON-destructive `update-ref HEAD <baseline>`: it follows the
+		// checked-out branch symref and moves ONLY the pointer, never the index/working
+		// tree, so the abandoned run's edits survive on disk as uncommitted changes.
+		if (
+			baselineHead !== null &&
+			markerTip.length > 0 &&
+			branchTip === markerTip
+		) {
+			const rewind = await git()`git update-ref HEAD ${baselineHead}`.quiet();
+			if (rewind.exitCode !== 0) {
+				logger?.debug("git checkpoint discard rewind failed", {
+					runId: ownRunId,
+					stderr: readText({ text: () => rewind.stderr.toString() }),
+				});
+			}
+		} else {
+			// Diverged or no baseline: surface the residue SHA(s) the operator can
+			// inspect/clean before GC (ISSUES.md Issue 1 fallback).
+			logger?.warn(
+				"git checkpoint discard skipped the branch rewind: the branch tip no " +
+					"longer matches this run's checkpoint marker (work was layered on top, " +
+					"or there is no run-start baseline) — the run's checkpoint commits are " +
+					"left in place; inspect/clean them manually",
+				{ runId: ownRunId, markerTip, branchTip, baselineRef: baselineHead },
+			);
+		}
+		// (d) Always delete the marker (the orphaned commits, if rewound, become
+		// unreachable → GC'd).
+		const del = await git()`git update-ref -d ${ref}`.quiet();
+		if (del.exitCode !== 0) {
+			logger?.debug("git checkpoint marker delete (discard) failed", {
+				runId: ownRunId,
+				stderr: readText({ text: () => del.stderr.toString() }),
+			});
+		}
 	}
 
 	return {
@@ -401,5 +602,7 @@ export function createGitCheckpointer(
 		dirtyPaths,
 		diff,
 		baselineRef: () => baselineHead,
+		promote,
+		discard,
 	};
 }
