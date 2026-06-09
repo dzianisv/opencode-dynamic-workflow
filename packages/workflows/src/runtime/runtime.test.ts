@@ -316,3 +316,28 @@ describe("createWorkflowRun — directory seam (Epic H.1, inert)", () => {
 		expect(launches[0]?.directory).toBeUndefined();
 	});
 });
+
+describe("createWorkflowRun — worktreeManager seam (Epic H.1.6, inert)", () => {
+	test("WorkflowRunDeps.worktreeManager is accepted and the run is unchanged", async () => {
+		// H.1.6 threads the manager handle from the engine to the agent primitive; it
+		// is UNUSED until H.1.2 mints a per-agent worktree. So a run with a manager
+		// injected behaves exactly as one without — no launch re-roots, none degrades.
+		const { runner, launches } = recordingRunner();
+		const run = createWorkflowRun({
+			runner,
+			parentSessionID: "ses_p",
+			runId: "run_wt",
+			worktreeManager: {
+				create: async () => null,
+				mergeBack: async () => ({ merged: true }),
+				isUnchanged: async () => true,
+				cleanup: async () => undefined,
+				sweep: async () => undefined,
+			},
+		});
+		const result = await run.run(`${META}await agent("do it");\nreturn 1;\n`);
+		expect(result.status).toBe("completed");
+		expect(launches).toHaveLength(1);
+		expect(launches[0]?.directory).toBeUndefined();
+	});
+});

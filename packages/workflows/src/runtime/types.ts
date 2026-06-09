@@ -152,9 +152,16 @@ export type ProgressEmitter = (e: ProgressEvent) => void;
  *   status.
  * - `await_failed`: `launch()`/`awaitCompletion()` threw (degraded, not detonated).
  * - `empty_output`: the child completed and produced an empty (`""`) final text.
- * - `isolation_unsupported`: `isolation:'worktree'` was requested but unsupported,
- *   so the call degraded to `null` BEFORE launch rather than running unisolated
- *   (Epic 0.4) — no child session, no `agent:launched`.
+ * - `isolation_unsupported`: `isolation:'worktree'` was requested but NO worktree
+ *   manager is threaded (the standalone library / no-shell engine has no worktree
+ *   primitive), so the call degraded to `null` BEFORE launch rather than running
+ *   unisolated (Epic 0.4) — no child session, no `agent:launched`.
+ * - `worktree_mint_failed`: `isolation:'worktree'` was requested and a manager IS
+ *   present, but `create()` returned `null` for a real reason (a non-repo checkout,
+ *   a transient `git worktree add` failure, an index-lock loss, disk-full). Isolation
+ *   IS supported here — the MINT failed — so this is reported distinctly from
+ *   `isolation_unsupported` (which would falsely tell an operator the feature does not
+ *   work). Same pre-launch degrade-to-null: no child session, no `agent:launched`.
  * - `empty_diff`: `contextDiff:true` was set but the engine-computed git diff for
  *   the unit under review was PROVABLY empty (a live work tree), so the review was
  *   refused BEFORE launch rather than reviewing narrative-only claims (Epic 4.1) —
@@ -165,6 +172,22 @@ export type ProgressEmitter = (e: ProgressEvent) => void;
  *   launch and settle (it carries a childSessionID) — the downgrade nulls the RESULT
  *   so it re-runs on resume, but does NOT un-commit (P2 recovery still holds for
  *   bytes already on disk).
+ * - `merge_conflict`: an `isolation:'worktree'` agent settled with real work, but the
+ *   serialized merge-back of its scratch branch into the main tree CONFLICTED (Epic
+ *   H.1.3, locked design decision #2). A conflict means two agents got overlapping
+ *   scope — a decomposition error, surfaced LOUD and first-class rather than silently
+ *   auto-resolved. The conflicted worktree+branch are PRESERVED (not cleaned) so a Tier
+ *   2 resolver script can act on them; the batch is NOT detonated (degrade-don't-
+ *   detonate). The agent launched and settled (it carries a childSessionID).
+ * - `merge_failed`: an `isolation:'worktree'` agent settled with real work, but the
+ *   serialized merge-back FAILED WITHOUT a conflict (git exited non-zero with zero
+ *   unmerged files — e.g. the operator dirtied the main tree mid-run, or a transient
+ *   failure). Unlike a clean merge, the work did NOT reach the main tree; unlike a
+ *   conflict, there is nothing to 3-way resolve. The worktree+branch are PRESERVED (the
+ *   edits live committed on the scratch branch, recoverable) and the agent degrades to
+ *   `null` so a resumed run re-attempts rather than replaying a false `ok`. NEVER a
+ *   silent cleanup — that would re-introduce the #5 lost-work catastrophe through the
+ *   isolation path. The batch is NOT detonated.
  */
 export type DiagnosticReason =
 	| "schema_no_call"
@@ -174,8 +197,11 @@ export type DiagnosticReason =
 	| "await_failed"
 	| "empty_output"
 	| "isolation_unsupported"
+	| "worktree_mint_failed"
 	| "empty_diff"
-	| "verify_failed";
+	| "verify_failed"
+	| "merge_conflict"
+	| "merge_failed";
 
 /**
  * A post-mortem diagnostic for a single failed/empty `agent()` call (Task 7.2.1).
@@ -254,6 +280,45 @@ export interface IntentJournalEntry {
  * plugin import — journal.ts imports this type from the runtime instead.
  */
 export type JournalEntry = SettledJournalEntry | IntentJournalEntry;
+
+/**
+ * The OPAQUE per-agent worktree-manager seam (Epic H.1.6). The engine constructs the
+ * concrete `createWorktreeManager({ shell, directory, logger })` (in the plugin layer)
+ * ONCE and threads THIS structural surface down through {@link WorkflowRunDeps} →
+ * `AgentPrimitiveDeps` so the future isolation mint-point (Epic H.1.2) can reach it.
+ *
+ * It is defined STRUCTURALLY here — NOT imported from the plugin — so the runtime stays
+ * plugin-agnostic, exactly like the `resolveContextDiff`/`verifyResult` seams: the
+ * runtime never learns what a worktree IS, it only forwards the handle. The engine's
+ * concrete `WorktreeManager` satisfies this shape by structural typing.
+ *
+ * ABSENT (the standalone library, child runs, and a no-shell engine — the manager is a
+ * documented no-op when `$` is absent) → isolation requests degrade-to-null as today
+ * (Epic 0.4). UNUSED until Epic H.1.2 mints a per-agent worktree at the
+ * `isolation:'worktree'` seam; this task threads the handle only (no behavior change).
+ */
+export interface WorktreeManagerSeam {
+	create(key: { runId: string; label: string }): Promise<{
+		dir: string;
+		branch: string;
+	} | null>;
+	mergeBack(
+		dir: string,
+		branch: string,
+	): Promise<
+		| { merged: true }
+		| {
+				conflict: true;
+				branch: string;
+				files: string[];
+				baseRef: string | undefined;
+		  }
+		| { failed: true }
+	>;
+	isUnchanged(dir: string): Promise<boolean>;
+	cleanup(dir: string, branch: string): Promise<void>;
+	sweep(): Promise<void>;
+}
 
 /**
  * The complete set of globals available to a workflow script body (spec §3.3).

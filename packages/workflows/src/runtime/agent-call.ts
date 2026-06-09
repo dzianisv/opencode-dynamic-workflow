@@ -16,6 +16,7 @@ import {
 	type JournalEntry,
 	type ProgressEmitter,
 	type SettledJournalEntry,
+	type WorktreeManagerSeam,
 } from "./types";
 
 /**
@@ -160,7 +161,23 @@ export interface AgentPrimitiveDeps {
 	verifyResult?: (opts: {
 		verifyDiff: boolean | { check?: string };
 		sessionId?: string;
+		/**
+		 * Epic H.1.3: the worktree dir to re-root the verify shell to. For an
+		 * `isolation:'worktree'` agent the `{check}` command must run in the WORKTREE
+		 * checkout (where the agent's edits live), not the main tree. ABSENT → the
+		 * engine-wide directory applies as today.
+		 */
+		directory?: string;
 	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
+	/**
+	 * Serialize a task onto the engine's per-run checkpoint chain (Epic H.1.3). The
+	 * engine appends `task` onto the SAME `checkpointTail` that orders per-unit commits
+	 * and resolves with its result once the tail drains — so an isolated agent's
+	 * merge-back never interleaves with a sibling's commit. OPAQUE: the runtime never
+	 * learns what a checkpoint is. ABSENT (standalone library, no-shell engine) → the
+	 * runtime runs the task INLINE (no shared git tree to serialize against).
+	 */
+	serializeOnCheckpoint?: <T>(task: () => Promise<T>) => Promise<T>;
 	/**
 	 * Per-agent project/worktree directory (Epic H.1, inert seam), forwarded
 	 * straight to `runner.launch` → `session.create`'s `query.directory`, which
@@ -173,6 +190,17 @@ export interface AgentPrimitiveDeps {
 	 * engine-wide directory applies as today.
 	 */
 	directory?: string;
+	/**
+	 * The OPAQUE per-agent worktree manager (Epic H.1.6), constructed once by the
+	 * engine from the host `$` and threaded straight to this primitive. The future
+	 * isolation mint-point (Epic H.1.2) will call `worktreeManager.create(key)` at the
+	 * `isolation:'worktree'` seam (replacing the current degrade-to-null) and feed the
+	 * minted dir into the {@link AgentPrimitiveDeps.directory} launch injection. OPAQUE
+	 * to the runtime — see {@link WorktreeManagerSeam}. UNUSED today (this task threads
+	 * the handle only); ABSENT (no-shell engine, standalone library, child runs) →
+	 * isolation requests degrade-to-null as today (Epic 0.4).
+	 */
+	worktreeManager?: WorktreeManagerSeam;
 }
 
 /** The single nudge sent when a child completes without a structured result. */
@@ -218,6 +246,14 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		resolveContextDiff,
 		verifyResult,
 		directory,
+		// Epic H.1.3: serialize an isolated agent's merge-back onto the engine's
+		// per-run checkpoint tail (so merges never interleave with commits). Absent →
+		// the merge runs inline (no shared git tree to order against).
+		serializeOnCheckpoint,
+		// Epic H.1.2: the worktree manager is the per-agent isolation mint-point. When
+		// an `isolation:'worktree'` call holds a gate slot, the manager mints a worktree
+		// whose dir re-roots the launch; absent (or a null create) → degrade-to-null.
+		worktreeManager,
 	} = deps;
 
 	/**
@@ -248,6 +284,12 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		}
 		if (reason === "verify_failed") {
 			return "null — verify_failed (git/command post-condition failed)";
+		}
+		if (reason === "worktree_mint_failed") {
+			return "null — worktree_mint_failed (isolation supported; git worktree mint failed)";
+		}
+		if (reason === "merge_conflict") {
+			return "merge_conflict — worktree merge-back conflicted; worktree preserved for Tier 2 resolution";
 		}
 		const raw =
 			rawLen !== undefined ? `; raw ${humanizeChars(rawLen)} preserved` : "";
@@ -385,33 +427,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		const compiled =
 			opts.schema !== undefined ? compileSchema(opts.schema) : undefined;
 
-		// 4. Worktree isolation has no OpenCode session primitive (Epic 0.4). The old
-		// no-op silently ran the agent UNISOLATED, giving false safety. Now it fails
-		// loudly: a warn on the progress stream, a typed post-mortem diagnostic, and a
-		// visible agent:start/agent:end pair — then the call DEGRADES to `null`. We do
-		// NOT throw: this branch runs BEFORE gate.acquire, and a throw here would
-		// detonate the whole parallel() batch rather than failing just this agent
-		// (degrade, don't detonate). The rest of the batch survives; this agent does
-		// not run unisolated.
-		if (opts.isolation === "worktree") {
-			const message = new IsolationUnsupportedError().message;
-			emit({ type: "warn", message });
-			emit({
-				type: "agent:start",
-				label,
-				phase,
-				promptPreview: promptPreviewOf(prompt),
-			});
-			onDiagnostic?.({ label, index, reason: "isolation_unsupported" });
-			emit({
-				type: "agent:end",
-				label,
-				status: "error",
-				note: diagnosticNote("isolation_unsupported"),
-			});
-			return null;
-		}
-
 		// With a schema, the child returns its result by calling structured_output;
 		// it must be told so (suffix) and granted the tool (override).
 		const launchPrompt =
@@ -421,6 +436,76 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 
 		// 5. Gate the launch on the run's concurrency slots.
 		await gate.acquire(runId);
+
+		// 5w. Per-agent worktree isolation (Epic H.1.2). Minted AFTER gate.acquire — a
+		// created worktree holds a real resource (a checkout + scratch branch), so we
+		// do not mint one the gate would have rejected. On success the worktree's dir
+		// OVERRIDES the run-wide `directory` at the launch injection (re-rooting just
+		// this agent's worker), and the handle is carried into the finally for teardown.
+		// When NO manager is threaded (no-shell engine / standalone library) OR
+		// `create` returns null (non-repo / git failure), we KEEP the loud P0.4
+		// degrade-to-null: a warn, a typed diagnostic, a visible start/end pair, then
+		// `null`. We do NOT throw (a throw would detonate the whole parallel() batch)
+		// and we release the held slot before returning (degrade, don't detonate).
+		let worktree: { dir: string; branch: string } | undefined;
+		let launchDirectory = directory;
+		if (opts.isolation === "worktree") {
+			// Fold the unique per-call `index` into the mint key so the worktree manager
+			// (which derives both the branch and the checkout dir from this label and
+			// DOES NOT de-dup — git-worktree.ts) can never collide two parallel isolated
+			// calls onto one branch+dir. The display `label` stays as-is; only the
+			// path/branch IDENTITY is made unique-per-call (`<label>-<index>`).
+			// Serialize the `git worktree add` on the SAME checkpoint tail that orders
+			// merges + per-unit commits (5a/9), so a create never races a sibling's
+			// merge/commit for the `.git` ref locks. An unserialized create CAN lose that
+			// race → the merge then exits non-zero with zero unmerged files → a phantom
+			// `{failed}` → the agent's work is dropped: the #5 lost-work tail re-entering
+			// through a lock race, under exactly the parallel load this epic makes safe.
+			// Falls back to a direct create for the standalone library (no shared tree).
+			let minted: { dir: string; branch: string } | null = null;
+			if (worktreeManager !== undefined) {
+				const mgr = worktreeManager;
+				const doMint = () => mgr.create({ runId, label: `${label}-${index}` });
+				minted =
+					serializeOnCheckpoint !== undefined
+						? await serializeOnCheckpoint(doMint)
+						: await doMint();
+			}
+			if (minted === null) {
+				gate.release(runId);
+				// Distinguish "no manager threaded" (genuine isolation_unsupported: the
+				// feature has no primitive here) from "manager present but create()
+				// returned null" (a real mint failure: a non-repo checkout, a transient
+				// `git worktree add` failure, an index-lock loss). Emitting
+				// isolation_unsupported for the latter would falsely tell an operator the
+				// feature does not work; worktree_mint_failed names the true cause.
+				const reason: DiagnosticReason =
+					worktreeManager === undefined
+						? "isolation_unsupported"
+						: "worktree_mint_failed";
+				const message =
+					reason === "isolation_unsupported"
+						? new IsolationUnsupportedError().message
+						: `isolation:worktree mint failed for '${label}' (runId ${runId}) — degrading this agent to null`;
+				emit({ type: "warn", message });
+				emit({
+					type: "agent:start",
+					label,
+					phase,
+					promptPreview: promptPreviewOf(prompt),
+				});
+				onDiagnostic?.({ label, index, reason });
+				emit({
+					type: "agent:end",
+					label,
+					status: "error",
+					note: diagnosticNote(reason),
+				});
+				return null;
+			}
+			worktree = minted;
+			launchDirectory = minted.dir;
+		}
 
 		// 5a. Pre-launch checkpoint barrier (Task 2.1.5): with the slot held, block
 		// until the PRIOR agent's per-unit commit has drained. The gate slot was freed
@@ -460,6 +545,29 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// Carried into the finally so the single `agent:end` emit can attach the
 		// diagnostic note (Task 7.2.1) — set on any null/empty collapse below.
 		let endNote: string | undefined;
+		// Task H.1.4: the first-class merge-conflict result (locked design decision #2).
+		// The merge-back settle runs in the finally (so it also covers teardown on the
+		// throw path); when it hits a Tier 1 conflict it sets this, and the finally
+		// RETURNS it — overriding the try's resolved value so the agent resolves to a
+		// structured `{status:'conflict', …}` a Tier 2 script can branch on, NOT the
+		// agent's text. Non-throwing (mirrors P0.4): the batch survives.
+		let conflictResult:
+			| {
+					status: "conflict";
+					branch: string;
+					files: string[];
+					baseRef: string | undefined;
+			  }
+			| undefined;
+		// A non-conflict merge-back failure (merge_failed): the worktree is preserved and
+		// the agent degrades to null (the finally returns null and journals nothing, so a
+		// resumed run re-attempts). Set in the worktree settle; read by the finally.
+		let mergeFailed = false;
+		// The try body's settled non-null result, hoisted so the finally can journal it
+		// AFTER the worktree merge-back settles (a conflict supersedes it). For a
+		// worktree agent the `onRecord` is deferred to the finally; this carries the
+		// value across that seam. `undefined` means nothing to journal.
+		let settledResult: unknown;
 		try {
 			// 6. Announce the start once the slot is held.
 			emit({
@@ -515,9 +623,13 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				agent: opts.agentType ?? defaults.agent,
 				model: opts.model,
 				depth: 0,
-				// Epic H.1 (inert seam): forward the engine-owned per-agent directory
-				// when present so it re-roots the worker cwd; absent → identical launch.
-				...(directory !== undefined ? { directory } : {}),
+				// Epic H.1: forward the per-agent directory so it re-roots the worker
+				// cwd. For an isolation:'worktree' agent this is the minted worktree dir
+				// (overriding the run-wide `directory`, set at 5w); otherwise it is the
+				// engine-owned run-wide directory. Absent → identical launch as today.
+				...(launchDirectory !== undefined
+					? { directory: launchDirectory }
+					: {}),
 				...(contextParts.length > 0 ? { contextParts } : {}),
 				...(compiled !== undefined
 					? {
@@ -633,6 +745,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					verdict = await verifyResult({
 						verifyDiff: opts.verifyDiff,
 						...(sessionId !== undefined ? { sessionId } : {}),
+						// Epic H.1.3: re-root the verify shell to the WORKTREE checkout for
+						// an isolated agent — its edits live there, not in the main tree.
+						...(worktree !== undefined ? { directory: worktree.dir } : {}),
 					});
 				} catch {
 					// A thrown verify degrades to pass-through (treated as inert).
@@ -651,9 +766,17 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			}
 
 			// Spec §7: only SETTLED non-null results are journaled — a failed/null
-			// agent must re-run on resume, not replay its failure.
+			// agent must re-run on resume, not replay its failure. For a worktree agent
+			// the journaled value is decided AFTER the finally's merge-back settle (a
+			// conflict replaces the result with the Tier 1 `{status:'conflict'}` value,
+			// Task H.1.4); deferring the record there keeps resume replaying the SAME
+			// value the script saw, never the now-superseded agent text.
 			if (result !== null && result !== undefined) {
-				replay?.onRecord({ index, key, status: "ok", result });
+				if (worktree !== undefined && worktreeManager !== undefined) {
+					settledResult = result;
+				} else {
+					replay?.onRecord({ index, key, status: "ok", result });
+				}
 			}
 			return result;
 		} catch (err) {
@@ -679,6 +802,105 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				liveTasks?.delete(taskId);
 			}
 			gate.release(runId);
+			// Epic H.1.3: settle the per-agent worktree minted at 5w with a
+			// merge-back-then-conditional-cleanup, SERIALIZED on the engine's checkpoint
+			// tail (so a merge never interleaves with a sibling's commit). The whole
+			// thing is FENCED + best-effort — a merge/cleanup failure must never crash
+			// this agent or detonate its batch (degrade, don't detonate). The work runs
+			// BEFORE the `agent:end` emit below, so the merge lands on the tail ahead of
+			// this agent's own checkpoint (driven by that event), letting the main
+			// checkpointer capture the merged result next.
+			if (worktree !== undefined && worktreeManager !== undefined) {
+				const mgr = worktreeManager;
+				const wt = worktree;
+				// The serialized settle: unchanged → cleanup (CC auto-cleanup-if-
+				// unchanged, no merge commit); else mergeBack from the main tree. A clean
+				// merge (or a non-conflict {failed}) → cleanup; a real CONFLICT → preserve
+				// the worktree+branch (SKIP cleanup) for Tier 2 and surface merge_conflict.
+				const settleWorktree = async (): Promise<void> => {
+					if (await mgr.isUnchanged(wt.dir)) {
+						await mgr.cleanup(wt.dir, wt.branch);
+						return;
+					}
+					const merge = await mgr.mergeBack(wt.dir, wt.branch);
+					if ("conflict" in merge) {
+						// Locked design decision #2 (Task H.1.4): a conflict is Tier 1 —
+						// loud, first-class, NOT auto-resolved. Preserve the worktree (no
+						// cleanup) so a Tier 2 resolver script can act on it, emit a loud
+						// warn + a merge_conflict diagnostic, and surface the conflict as a
+						// STRUCTURED result the script branches on (set here, RETURNED by the
+						// finally — overriding the agent's text). Do NOT throw: the parallel()
+						// batch survives (same non-detonating discipline as P0.4).
+						endNote = diagnosticNote("merge_conflict");
+						emit({
+							type: "warn",
+							message: `agent '${label}' merge-back CONFLICTED on branch ${merge.branch} (${merge.files.length} file(s): ${merge.files.join(", ")}) — worktree preserved for Tier 2 resolution; the agent resolves to a {status:'conflict'} result`,
+						});
+						onDiagnostic?.({
+							label,
+							index,
+							reason: "merge_conflict",
+							...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
+						});
+						conflictResult = {
+							status: "conflict",
+							branch: merge.branch,
+							files: merge.files,
+							baseRef: merge.baseRef,
+						};
+						return;
+					}
+					if ("failed" in merge) {
+						// merge_failed: git exited non-zero with ZERO unmerged files (operator
+						// dirtied the main tree mid-run, or a transient failure). The agent's
+						// edits are committed on the scratch branch but did NOT reach the main
+						// tree. PRESERVE the worktree+branch (recoverable) and surface LOUD —
+						// NEVER a silent cleanup, which would drop the work (#5 through the
+						// isolation path). The agent degrades to null (finally returns null) so a
+						// resumed run re-attempts rather than replaying a false `ok`.
+						mergeFailed = true;
+						endNote = diagnosticNote("merge_failed");
+						emit({
+							type: "warn",
+							message: `agent '${label}' merge-back FAILED without conflict on branch ${wt.branch} — worktree preserved (edits are committed on the scratch branch, NOT in the main tree); this agent degrades to null for re-attempt on resume`,
+						});
+						onDiagnostic?.({
+							label,
+							index,
+							reason: "merge_failed",
+							...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
+						});
+						return;
+					}
+					// merged (clean): reclaim the worktree+branch.
+					await mgr.cleanup(wt.dir, wt.branch);
+				};
+				try {
+					// Serialize on the engine's checkpoint tail when wired; otherwise run
+					// inline (the standalone library has no shared git tree to order against).
+					if (serializeOnCheckpoint !== undefined) {
+						await serializeOnCheckpoint(settleWorktree);
+					} else {
+						await settleWorktree();
+					}
+				} catch {
+					// Settling a worktree is best-effort; never propagate its failure into
+					// the agent's resolution (degrade, don't detonate).
+				}
+				// Journal the value the script actually saw (deferred from the try body
+				// for worktree agents): the Tier 1 conflict result on a conflict, else the
+				// agent's settled result. A conflict is a deterministic structured value, so
+				// recording IT (not the superseded agent text) keeps a resumed run replaying
+				// the same conflict the script branched on. Spec §7: only non-null records.
+				// On merge_failed, journal NOTHING — the work did not land, so a resumed run
+				// must re-attempt the agent rather than replay a false `ok`.
+				const recordValue = mergeFailed
+					? undefined
+					: (conflictResult ?? settledResult);
+				if (recordValue !== null && recordValue !== undefined) {
+					replay?.onRecord({ index, key, status: "ok", result: recordValue });
+				}
+			}
 			// Structured output: drop the schema + any stored result for this child.
 			if (sessionId !== undefined) {
 				registry.clear(sessionId);
@@ -694,6 +916,25 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				...(sessionId !== undefined ? { sessionID: sessionId } : {}),
 				...(endNote !== undefined ? { note: endNote } : {}),
 			});
+			// Task H.1.4: a Tier 1 merge conflict supersedes the try's resolved value.
+			// A `return` in the finally overrides whatever the try returned (the agent's
+			// text), so the script receives the first-class `{status:'conflict', …}`
+			// result. Only on conflict — a clean settle leaves the try's return intact.
+			// The override is SAFE here: the catch above always resolves to `return null`
+			// and never rethrows, so there is no in-flight exception/return for this to
+			// swallow — it is a deliberate value substitution (locked design decision #2).
+			if (conflictResult !== undefined) {
+				// biome-ignore lint/correctness/noUnsafeFinally: deliberate Tier 1 conflict result override; catch never rethrows (see comment above).
+				return conflictResult;
+			}
+			// merge_failed degrades the agent to null (the work did not reach the main
+			// tree; the worktree+branch are preserved for recovery). Same safe override as
+			// the conflict path: the catch never rethrows, so substituting the value
+			// swallows no in-flight exception.
+			if (mergeFailed) {
+				// biome-ignore lint/correctness/noUnsafeFinally: deliberate merge_failed degrade-to-null; catch never rethrows (see comment above).
+				return null;
+			}
 		}
 	};
 

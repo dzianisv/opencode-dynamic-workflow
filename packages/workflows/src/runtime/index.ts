@@ -37,6 +37,7 @@ import type {
 	ProgressEvent,
 	RuntimeApi,
 	SettledJournalEntry,
+	WorktreeManagerSeam,
 } from "./types";
 
 /**
@@ -159,7 +160,24 @@ export interface WorkflowRunDeps {
 	verifyResult?: (opts: {
 		verifyDiff: boolean | { check?: string };
 		sessionId?: string;
+		/**
+		 * Epic H.1.3: the worktree dir to re-root the verify shell to. For an
+		 * `isolation:'worktree'` agent the engine runs the `{check}` command against
+		 * the WORKTREE checkout (where the agent's edits live), not the main tree.
+		 * ABSENT → the engine-wide directory applies as today.
+		 */
+		directory?: string;
 	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
+	/**
+	 * Serialize a task onto the engine's per-run checkpoint chain (Epic H.1.3),
+	 * threaded straight to the `agent()` primitive. The engine appends the task onto
+	 * the SAME `checkpointTail` that orders per-unit commits and resolves with the
+	 * task's result once it drains — so an isolated agent's merge-back never interleaves
+	 * with a sibling's commit. OPAQUE to the runtime — it never learns what a checkpoint
+	 * is. ABSENT (the standalone library, a no-shell engine) → the runtime runs the task
+	 * inline (no cross-unit serialization, which is fine without a shared git tree).
+	 */
+	serializeOnCheckpoint?: <T>(task: () => Promise<T>) => Promise<T>;
 	/**
 	 * Per-agent project/worktree directory (Epic H.1, inert seam), threaded
 	 * straight to the `agent()` primitive (`AgentPrimitiveDeps.directory`) and
@@ -172,6 +190,17 @@ export interface WorkflowRunDeps {
 	 * per-agent value yet) → the engine-wide directory applies as today.
 	 */
 	directory?: string;
+	/**
+	 * The OPAQUE per-agent worktree manager (Epic H.1.6), threaded straight to the
+	 * `agent()` primitive (`AgentPrimitiveDeps.worktreeManager`) and inherited by child
+	 * sub-workflow runs (a child shares the parent's git tree today). The engine
+	 * constructs it ONCE from the host `$` and passes it here; the future isolation
+	 * mint-point (Epic H.1.2) consumes it. OPAQUE to the runtime — see
+	 * {@link WorktreeManagerSeam}. ABSENT (the standalone library, a no-shell engine —
+	 * where the manager is a documented no-op) → isolation requests degrade-to-null as
+	 * today (Epic 0.4). UNUSED until H.1.2; this task threads the handle only.
+	 */
+	worktreeManager?: WorktreeManagerSeam;
 }
 
 /** The terminal outcome of a workflow run (spec §2.3, §3.3). */
@@ -316,9 +345,19 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		...(deps.verifyResult !== undefined
 			? { verifyResult: deps.verifyResult }
 			: {}),
+		// Epic H.1.3: thread the checkpoint-serialization thunk so an isolated agent's
+		// merge-back rides the SAME tail as the per-unit commits; absent → inline.
+		...(deps.serializeOnCheckpoint !== undefined
+			? { serializeOnCheckpoint: deps.serializeOnCheckpoint }
+			: {}),
 		// Epic 4.2 + H.1: thread the inert per-agent directory seam straight to the
 		// primitive when present; absent → identical primitive as today.
 		...(deps.directory !== undefined ? { directory: deps.directory } : {}),
+		// Epic H.1.6: thread the opaque worktree manager to the primitive (reachable at
+		// the future isolation mint-point); absent → identical primitive as today.
+		...(deps.worktreeManager !== undefined
+			? { worktreeManager: deps.worktreeManager }
+			: {}),
 	});
 
 	// Wrap the primitive so that after abort(), NEW calls resolve null immediately
@@ -371,10 +410,21 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				...(deps.verifyResult !== undefined
 					? { verifyResult: deps.verifyResult }
 					: {}),
+				// Epic H.1.3: a child's isolated merge-backs ride the SAME checkpoint tail
+				// as the parent's (they share the run/git tree).
+				...(deps.serializeOnCheckpoint !== undefined
+					? { serializeOnCheckpoint: deps.serializeOnCheckpoint }
+					: {}),
 				// Epic H.1 (inert seam): a child sub-workflow inherits the parent's
 				// per-agent directory by default — a child runs in the same project
 				// today; a future worktree epic can override per-child.
 				...(deps.directory !== undefined ? { directory: deps.directory } : {}),
+				// Epic H.1.6: a child inherits the parent's worktree manager (same git
+				// tree / run today), so the future isolation mint-point reaches it inside
+				// a sub-workflow too.
+				...(deps.worktreeManager !== undefined
+					? { worktreeManager: deps.worktreeManager }
+					: {}),
 				// No resolver → child workflow() throws NestingError (depth 1).
 				// No replay → the boundary entry in the PARENT journal covers the child.
 			});
