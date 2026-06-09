@@ -61,8 +61,15 @@ import {
 	createFeedWriter,
 	type EnrichedProgressEvent,
 	type FeedFs,
+	type FeedReadFs,
 	type FeedWriter,
+	readFeedCounts,
 } from "./feed";
+import {
+	type BunShell,
+	type Checkpointer,
+	createGitCheckpointer,
+} from "./git-checkpoint";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
 import {
@@ -271,6 +278,16 @@ export interface CreateWorkflowEngineOptions {
 	setIntervalFn?: (cb: () => void, ms: number) => unknown;
 	/** Injectable interval clearing; defaults to `globalThis.clearInterval`. */
 	clearIntervalFn?: (handle: unknown) => void;
+	/**
+	 * The host BunShell (Epic 2.1), captured verbatim from `PluginInput['$']` in the
+	 * plugin entry — it already carries `.cwd(directory)`. Injectable like
+	 * `fs`/`clock`/`ids`: the production path passes the real `$`; tests pass a fake
+	 * or omit it. When ABSENT the per-agent git-checkpoint subsystem is not
+	 * constructed at all and the feature no-ops (every existing test construction
+	 * passes no shell, so this widening breaks nothing). NOT routed through
+	 * `adaptSdkClient`/`EngineClient` — `$` is a host primitive, sibling to `client`.
+	 */
+	shell?: BunShell;
 }
 
 export interface WorkflowEngine {
@@ -298,6 +315,15 @@ export interface WorkflowEngine {
 	 * settled agent's final stats live on `RunRecord.agents` / the enriched end).
 	 */
 	statsSnapshot(sessionID: string): SessionStatsSnapshot | undefined;
+	/**
+	 * Whether `sessionID` is a LIVE workflow worker — a child session spawned by a
+	 * workflow agent that has emitted `agent:launched` but not yet `agent:end`
+	 * (Epic 0.1). The deny hook (`tool.execute.before`) reads this to tell a
+	 * worker's Bash call apart from the parent's: the host hook payload carries only
+	 * `{ tool, sessionID, callID }`, no parent lineage. Pure membership, no I/O; the
+	 * parent and unrelated sessions are always false.
+	 */
+	isWorkerSession(sessionID: string): boolean;
 	/**
 	 * Live (status `running`) run handles owned by a parent session (Task 6.2.4).
 	 * The chat.message digest hook reads this to prepend a one-line digest per live
@@ -523,6 +549,11 @@ export function createWorkflowEngine(
 	// The live feed writer's fs (Task 8.1.2): same read-modify-write synthesis as the
 	// journal so the in-memory test fs works unchanged. ALWAYS present (fs always is).
 	const feedFs = feedFsFromFacade(fs);
+	// The feed READ fs (Phase 3.2.2): recovery re-reads a crashed run's feed to
+	// rehydrate its per-agent rollup. The facade always exposes readFile.
+	const feedReadFs: FeedReadFs = {
+		readFile: (path, enc) => fs.readFile(path, enc),
+	};
 	const feedLogger = logger
 		? {
 				error: (msg: string, meta?: Record<string, unknown>) =>
@@ -562,6 +593,34 @@ export function createWorkflowEngine(
 		logger: storeLogger,
 	});
 
+	// Engine-owned per-agent git checkpointer (Epic 2.1). Constructed from the host
+	// `$` bound to the project root; ABSENT shell → a documented no-op (the feature
+	// simply does not run). The work-tree is probed ONCE here (in readyPromise) and
+	// the verdict cached in `checkpointerAlive`; each run then gets its OWN per-run
+	// checkpointer (so the operator baseline is RUN-SCOPED and two concurrent runs
+	// never clobber each other's refuse-set) seeded with that probed verdict so it
+	// neither re-probes nor re-warns. The engine is the privileged VCS actor — NOT a
+	// worker session — so the deny hook never fires on its commits (the asymmetry).
+	const probeCheckpointer: Checkpointer = createGitCheckpointer({
+		shell: opts.shell,
+		directory: opts.directory,
+		...(logger !== undefined ? { logger } : {}),
+		clock,
+	});
+	// The single probe verdict, set in readyPromise; until then a per-run checkpointer
+	// would be premature (startRun awaits readyPromise first, so it is always set by
+	// the time a run is created). `undefined` shell yields `false` (a no-op anyway).
+	let checkpointerAlive = false;
+	/** A fresh RUN-SCOPED checkpointer seeded with the one probe verdict (no re-warn). */
+	const newRunCheckpointer = (): Checkpointer =>
+		createGitCheckpointer({
+			shell: opts.shell,
+			directory: opts.directory,
+			...(logger !== undefined ? { logger } : {}),
+			clock,
+			presumedAlive: checkpointerAlive,
+		});
+
 	// (2) The run-record store + ONE shared registry.
 	const runStore = createRunStore({
 		baseDir: subdir(SUBDIR_RUNS),
@@ -593,6 +652,13 @@ export function createWorkflowEngine(
 		string,
 		{ runId: string; label: string; lastEmittedAt: number }
 	>();
+	// Live worker-session set (Epic 0.1): a child session's id between its
+	// `agent:launched` and `agent:end`. The deny hook reads `isWorkerSession` to
+	// distinguish a worker's destructive-git Bash call from the parent's. Lives and
+	// dies on the same launched/end lifecycle as `statsBindings`, so it never leaks;
+	// a crashed session that never emits `agent:end` leaves a harmless stale entry
+	// (a dead session makes no tool calls), bounded by process lifetime.
+	const workerSessions = new Set<string>();
 
 	// External control channel (Task 8.2.2): a poll loop over `workflow-control/`
 	// for `<runId>.cancel` sentinels. `stopRun` is the single cancel authority and
@@ -736,7 +802,14 @@ export function createWorkflowEngine(
 				fs: journalFs,
 				logger: journalLogger,
 			});
-			entries = await priorJournal.load();
+			// Phase 3 load-boundary filter (the LOAD-BEARING guard): drop every
+			// non-settled (intent) line before the runtime ever sees it. resolveResume
+			// loads `entries` ONCE and threads the SAME array into BOTH the agent and
+			// sub-workflow replay caches, so this one filter protects every consumer —
+			// a crashed prior run's intent lines can never reach replay. The empty-check
+			// tests the POST-filter length: an all-intent journal warns "running live"
+			// (correct — there are no settled results to replay).
+			entries = (await priorJournal.load()).filter((e) => e.status === "ok");
 			if (entries.length === 0) {
 				logger?.warn("resume found no prior journal — running live", {
 					priorId,
@@ -828,6 +901,7 @@ export function createWorkflowEngine(
 			parentSessionID: args.parentSessionID,
 			scriptPath,
 			...(declaredPhases !== undefined ? { phases: declaredPhases } : {}),
+			name,
 			at: clock.now(),
 		});
 
@@ -846,6 +920,57 @@ export function createWorkflowEngine(
 		// (live-harness Scenario C: a single-turn `opencode run` exits the instant
 		// the turn ends; an unflushed journal means a later resume replays nothing).
 		const journalWrites: Promise<void>[] = [];
+
+		// This run's OWN checkpointer (Epic 2.1). A per-run instance keeps the operator
+		// baseline RUN-SCOPED: two concurrent runs each snapshot their own pre-existing
+		// dirty set, so run B's baseline can never clobber run A's refuse-set (which a
+		// shared engine-level instance did, sweeping the operator's work into a commit).
+		// Seeded with the one probe verdict so it neither re-probes nor re-warns.
+		const runCheckpointer = newRunCheckpointer();
+
+		// Per-run serialized checkpoint chain (Task 2.1.5). Each LIVE completed
+		// `agent:end` appends a commit onto this tail (fire-and-forget from the
+		// synchronous onProgress), so commits NEVER interleave and always apply in
+		// agent:end order. The pre-launch barrier below awaits this same tail so the
+		// next agent's launch blocks until the prior agent's commit drains — making
+		// commit-before-next-unit real, not just ordering. Settle drains it before
+		// `run:end` so the terminal feed line follows the last checkpoint line. The
+		// chain is fenced (each link swallows its own error) so a checkpoint failure
+		// never poisons the tail or the barrier.
+		let checkpointTail: Promise<void> = Promise.resolve();
+		/** Append a checkpoint for a live completed agent, fenced, in agent:end order. */
+		const enqueueCheckpoint = (meta: {
+			label: string;
+			sessionID: string;
+			phase?: string;
+		}): void => {
+			checkpointTail = checkpointTail.then(async () => {
+				try {
+					const res = await runCheckpointer.checkpoint({
+						runId,
+						label: meta.label,
+						sessionID: meta.sessionID,
+						...(meta.phase !== undefined ? { phase: meta.phase } : {}),
+					});
+					if (res.committed) {
+						feed.append({
+							type: "agent:checkpoint",
+							label: meta.label,
+							sessionID: meta.sessionID,
+							...(res.sha !== undefined ? { sha: res.sha } : {}),
+							paths: res.paths ?? [],
+							at: clock.now(),
+						});
+					}
+				} catch (err) {
+					logger?.error("workflow checkpoint failed", {
+						runId,
+						label: meta.label,
+						err: err instanceof Error ? err.message : String(err),
+					});
+				}
+			});
+		};
 
 		// Task 7.2.1: collect each null/empty agent diagnostic; persisted on the
 		// record at settle so a finished run is debuggable without SQLite.
@@ -891,6 +1016,64 @@ export function createWorkflowEngine(
 			// Top-level run: its workflow() global can nest one level (spec §8).
 			resolveSubWorkflow,
 			...(budget !== undefined ? { budget } : {}),
+			// Pre-launch checkpoint barrier (Task 2.1.5): the runtime awaits this opaque
+			// thunk after gate.acquire and before runner.launch, so the next agent's
+			// launch blocks until the prior agent's commit (queued on checkpointTail)
+			// drains. Reads the LIVE tail at call time (it is reassigned per checkpoint).
+			// Fenced both ends — never rejects.
+			awaitCheckpointClear: () =>
+				checkpointTail.then(
+					() => undefined,
+					() => undefined,
+				),
+			// Epic 4.1: supply the engine-computed real git diff (since run start) for a
+			// `contextDiff:true` review from THIS run's OWN checkpointer (no cross-run
+			// bleed — each run closes over its own runCheckpointer; the baseline is
+			// captured at startRun before the detached run fires). On the no-shell / non
+			// -git path the checkpointer is dead → diff() returns available:false, so the
+			// runtime injects nothing and refuses nothing (emptiness is unprovable). The
+			// diff rides a SYNTHETIC contextPart, never the prompt, so computeCallKey is
+			// unchanged and the reviewer replays its verdict on resume.
+			resolveContextDiff: () => runCheckpointer.diff(),
+			// Epic 4.2: verify a settled agent's git/command post-condition against GIT
+			// TRUTH (this run's checkpointer + the host shell), NEVER the opencode session
+			// diff (a snapshot that survives an out-of-band git restore — see the Phase 4
+			// probe verdict). `true`/`{}` → the working-tree diff vs baseline must be NON-
+			// EMPTY (valid PRE-commit; no commit-ordering dance). `{check}` → run the
+			// command via the repo-bound shell and assert exit 0. On the no-shell / non-git
+			// path the checkpointer is dead and `opts.shell` is absent → available:false
+			// (inert pass-through, NEVER a fabricated failure). Fenced — a thrown shell
+			// degrades to available:false.
+			verifyResult: async (v) => {
+				const wantsCheck =
+					typeof v.verifyDiff === "object" &&
+					typeof v.verifyDiff.check === "string";
+				if (wantsCheck) {
+					const command = (v.verifyDiff as { check: string }).check;
+					if (opts.shell === undefined) {
+						return { passed: false, available: false };
+					}
+					try {
+						const res = await opts.shell.cwd(opts.directory).nothrow()`${{
+							raw: command,
+						}}`;
+						return { passed: res.exitCode === 0, available: true };
+					} catch (err) {
+						logger?.debug(
+							"workflow verifyDiff check threw; treating as inert",
+							{
+								runId,
+								command,
+								err: err instanceof Error ? err.message : String(err),
+							},
+						);
+						return { passed: false, available: false };
+					}
+				}
+				// `true` or `{}` → git-diff-nonempty mode (the {} collapse).
+				const d = await runCheckpointer.diff();
+				return { passed: !d.isEmpty, available: d.available };
+			},
 			onProgress: (e) => {
 				// Stamp at the ENGINE boundary (Task 6.2.1): the runtime stays clock-free;
 				// the timestamp comes from the engine's injected clock here. A LIVE
@@ -909,6 +1092,7 @@ export function createWorkflowEngine(
 					// stats themselves are harvested from the SDK event stream (see
 					// handleEvent), not from these lifecycle events.
 					stats.register(e.sessionID, { runId, label: e.label });
+					workerSessions.add(e.sessionID);
 					statsBindings.set(e.sessionID, {
 						runId,
 						label: e.label,
@@ -962,9 +1146,20 @@ export function createWorkflowEngine(
 						...(durationMs !== undefined ? { durationMs } : {}),
 						...(e.note !== undefined ? { note: e.note } : {}),
 					});
+					// Task 2.1.5: a LIVE completed agent gets a per-unit checkpoint, queued
+					// onto the serialized per-run chain (commit-and-continue). Cached and
+					// degraded ends (no sessionID) never reach here, so no empty commits.
+					enqueueCheckpoint({
+						label: e.label,
+						sessionID: e.sessionID,
+						...(meta?.phase !== undefined ? { phase: meta.phase } : {}),
+					});
 					stats.unregister(e.sessionID);
 					statsBindings.delete(e.sessionID);
 					launchMeta.delete(e.sessionID);
+					// The worker has settled (ok/error/cancelled all flow through this
+					// sessionID-bearing end), so it is no longer a live worker.
+					workerSessions.delete(e.sessionID);
 				} else if (e.type === "agent:end") {
 					// A CACHED agent ended (no sessionID): the stamped end rides through
 					// untouched, and a stats-free summary carrying only label/phase/status
@@ -995,6 +1190,20 @@ export function createWorkflowEngine(
 						journalWrites.push(journal.record(e));
 					}
 				},
+				// Phase 3: write-ahead the intent onto the SAME journalWrites drain so it
+				// is durable by settle, AND return its promise so agent-call awaits it
+				// before launch (a crash in the launch window then leaves a visible
+				// intent with no matching ok). The append is awaited twice — inline
+				// before launch and again at the settle drain — both resolve the same
+				// fenced promise, which is harmless.
+				onIntent: (e) => {
+					if (journal !== undefined) {
+						const w = journal.record(e);
+						journalWrites.push(w);
+						return w;
+					}
+					return Promise.resolve();
+				},
 			},
 		});
 		handle.run = run;
@@ -1002,6 +1211,20 @@ export function createWorkflowEngine(
 		/** Await all pending journal appends (fenced — a failed append must not throw). */
 		const drainJournal = (): Promise<void> =>
 			Promise.allSettled(journalWrites).then(() => undefined);
+
+		/** Await the per-run checkpoint chain (Task 2.1.5), fenced — never rejects. */
+		const drainCheckpoints = (): Promise<void> =>
+			checkpointTail.then(
+				() => undefined,
+				() => undefined,
+			);
+
+		// Capture this run's OWN operator-safety baseline (Task 2.1.3) BEFORE firing the
+		// detached run, so the pre-existing-dirty snapshot predates any agent edit and
+		// stays scoped to THIS run (no cross-run clobber). Fenced (a dead/no-shell
+		// checkpointer is a no-op); awaited so the snapshot is durable before the first
+		// agent can launch.
+		await runCheckpointer.baseline();
 
 		// Fire DETACHED — never await the run. On settle, DRAIN the journal AND the
 		// feed, then update the record. The settle promise is exposed on the handle so
@@ -1045,6 +1268,11 @@ export function createWorkflowEngine(
 					// disk (stopRun's settle ran before those ends arrived).
 					persistRecord(handle.record);
 				}
+				// Drain the checkpoint chain (Task 2.1.5) BEFORE run:end so the terminal
+				// feed line follows the last `agent:checkpoint` line — the framing
+				// invariant a viewer relies on. On cancel, the aborted agents' ends have
+				// already enqueued their checkpoints, so this drains those too.
+				await drainCheckpoints();
 				await finalizeFeed(handle, {
 					...(result.agentCount !== undefined
 						? { agentCount: result.agentCount }
@@ -1064,6 +1292,8 @@ export function createWorkflowEngine(
 				} else {
 					persistRecord(handle.record);
 				}
+				// Drain the checkpoint chain before run:end on the error path too.
+				await drainCheckpoints();
 				await finalizeFeed(handle, {});
 			});
 
@@ -1162,6 +1392,10 @@ export function createWorkflowEngine(
 		return stats.snapshot(sessionID);
 	}
 
+	function isWorkerSession(sessionID: string): boolean {
+		return workerSessions.has(sessionID);
+	}
+
 	function liveRunsFor(parentSessionID: string): RunHandle[] {
 		const out: RunHandle[] = [];
 		for (const handle of runs.values()) {
@@ -1178,13 +1412,43 @@ export function createWorkflowEngine(
 	// Startup recovery: load persisted records, flip stale `running` → error, seed
 	// the queue from terminal records. Runs as a promise `ready()` awaits.
 	const readyPromise = (async () => {
+		// Probe the git work tree ONCE (Task 2.1.6): a non-repo warns exactly here
+		// (one warn for the engine's whole lifetime), and the verdict is cached so each
+		// per-run checkpointer adopts it without re-probing or re-warning — per-run
+		// baseline/checkpoint stay silent no-ops on a non-repo. No-op when no shell.
+		checkpointerAlive = await probeCheckpointer.ready();
 		const recovered = await runStore.load();
 		const seed: RunRecord[] = [];
 		for (const record of recovered) {
 			if (record.status === "running") {
 				record.status = "error";
-				record.error = "interrupted by restart";
+				// Epic 1.4: warn that the working tree may carry agent edits the journal
+				// does not record (per-agent data is persisted only at settle, never in
+				// onProgress, so `record.agents` is empty on a real crash — any count
+				// would be a lie). Surfacing the real pre-crash per-agent shape is Phase 3
+				// (feed-rehydration), not here; this just points the operator at disk.
+				record.error =
+					"interrupted by restart — agents may have mutated the working tree " +
+					"before the interrupt; inspect `git status` before resume or relaunch";
 				record.completedAt = clock.now();
+				// Phase 3.2.2: a real crash persists no per-agent data (rolled up only at
+				// settle), so re-read the run's feed to recover the per-agent table the
+				// operator needs. readFeedCounts is FENCED (never throws) — a missing/empty
+				// feed degrades to today's 0/0, never poisoning startup for other runs.
+				// We rehydrate the SAME fields the status render already reads
+				// (record.agents / record.agentCount), so the recovered run renders its real
+				// table with no change to workflow-status.ts. The 'interrupted by restart'
+				// error string is left untouched (no count folded into the message).
+				const counts = await readFeedCounts(
+					join(feedDir, `${record.id}.jsonl`),
+					feedReadFs,
+				);
+				if (counts.agentCount > 0) {
+					record.agentCount = counts.agentCount;
+				}
+				if (counts.agents.length > 0) {
+					record.agents = counts.agents;
+				}
 				persistRecord(record);
 			}
 			runs.set(record.id, { record, progress: [] });
@@ -1208,6 +1472,7 @@ export function createWorkflowEngine(
 		stopRun,
 		statusOf,
 		statsSnapshot,
+		isWorkerSession,
 		liveRunsFor,
 		handleEvent,
 		dispose: async () => {

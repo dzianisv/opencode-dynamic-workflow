@@ -64,9 +64,56 @@ export function formatDuration(ms: number): string {
 	return parts.join(" ");
 }
 
+/**
+ * Format a CC-style compact relative age — the `· 3m` segment the run header shows
+ * for how long ago a run started. Both timestamps are PARAMS (the reducer/format
+ * layer holds no system clock; the route passes a ticked `nowMs` signal), so this
+ * stays pure and testable. `delta = nowMs - thenMs`. A negative delta (clock skew /
+ * a future stamp) or a non-finite input degrades to `"just now"` — a display path
+ * never shows a backwards or `NaN` age. Otherwise a SINGLE floored unit, no spaces:
+ * `<60s → "Ns"`, `<60m → "Nm"`, `<24h → "Nh"`, else `"Nd"`. Distinct on purpose from
+ * {@link formatDuration}'s multi-unit `"1h 1m 1s"` form — a header age is one glance.
+ */
+export function formatRelativeTime(thenMs: number, nowMs: number): string {
+	if (!Number.isFinite(thenMs) || !Number.isFinite(nowMs)) {
+		return "just now";
+	}
+	const delta = nowMs - thenMs;
+	if (delta < 0) {
+		return "just now";
+	}
+	const seconds = Math.floor(delta / 1000);
+	if (seconds < 60) {
+		return `${seconds}s`;
+	}
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) {
+		return `${minutes}m`;
+	}
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) {
+		return `${hours}h`;
+	}
+	return `${Math.floor(hours / 24)}d`;
+}
+
 /** Sum every token field into the one number {@link formatTokens} renders. */
 export function totalTokens(t: SessionTokenSnapshot): number {
 	return t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite;
+}
+
+/**
+ * Render the input vs output token split as `<input>→<output+reasoning>` (Epic 1.3,
+ * #8). A single flattened total reads as "millions of output" when it is mostly
+ * repeated context-LOADING (input) — the split makes that legible. Reasoning folds
+ * into the output side (it is output-priced, matching the budget line's "output
+ * tokens" semantics); cache.read/write are excluded (they are neither produced work
+ * nor the operator's concern at a glance). Each side runs through {@link formatTokens}
+ * so the bands match the rest of the tree. {@link totalTokens} stays the canonical
+ * sum for any consumer wanting one number.
+ */
+export function formatTokenSplit(t: SessionTokenSnapshot): string {
+	return `${formatTokens(t.input)}→${formatTokens(t.output + t.reasoning)}`;
 }
 
 /**

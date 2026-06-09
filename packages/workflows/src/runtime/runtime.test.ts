@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+	type BgTask,
 	ConcurrencyManager,
 	createSessionRunner,
 	type EngineClient,
+	type LaunchRequest,
+	type ReadOpts,
+	type SessionRunner,
+	type TaskOutput,
 } from "@drawers/core";
 import { createWorkflowRun } from "./index";
 import { createSchemaRegistry } from "./structured/registry";
@@ -207,5 +212,107 @@ describe("createWorkflowRun — budget default", () => {
 		);
 		expect(result.status).toBe("completed");
 		expect(result.returnValue).toEqual([null, Number.POSITIVE_INFINITY, 0]);
+	});
+});
+
+/**
+ * A recording runner that captures every launch so the inert H.1 directory seam
+ * can be observed end-to-end: WorkflowRunDeps.directory → createAgentPrimitive →
+ * runner.launch. Every launch settles "completed" immediately.
+ */
+function recordingRunner(): {
+	runner: SessionRunner;
+	launches: LaunchRequest[];
+} {
+	const launches: LaunchRequest[] = [];
+	let seq = 0;
+	const runner: SessionRunner = {
+		async launch(req) {
+			launches.push(req);
+			seq += 1;
+			return {
+				id: `bg_rec${seq}`,
+				sessionID: `ses_rec${seq}`,
+				parentSessionID: req.parentSessionID,
+				description: req.description,
+				agent: req.agent,
+				status: "completed",
+				createdAt: 1000,
+				depth: req.depth,
+				concurrencyKey: "k",
+			} satisfies BgTask;
+		},
+		async awaitCompletion(taskId): Promise<BgTask> {
+			return {
+				id: taskId,
+				parentSessionID: "ses_p",
+				description: "d",
+				agent: "build",
+				status: "completed",
+				createdAt: 1000,
+				depth: 0,
+				concurrencyKey: "k",
+			};
+		},
+		async cancel(taskId): Promise<BgTask> {
+			return {
+				id: taskId,
+				parentSessionID: "ses_p",
+				description: "d",
+				agent: "build",
+				status: "cancelled",
+				createdAt: 1000,
+				depth: 0,
+				concurrencyKey: "k",
+			};
+		},
+		async resume(taskId): Promise<BgTask> {
+			return {
+				id: taskId,
+				parentSessionID: "ses_p",
+				description: "d",
+				agent: "build",
+				status: "completed",
+				createdAt: 1000,
+				depth: 0,
+				concurrencyKey: "k",
+			};
+		},
+		async readOutput(_taskId, _opts?: ReadOpts): Promise<TaskOutput> {
+			return { status: "completed", summaryText: "ok" };
+		},
+		list: () => [],
+		handleEvent: async () => undefined,
+		dispose: async () => undefined,
+	};
+	return { runner, launches };
+}
+
+describe("createWorkflowRun — directory seam (Epic H.1, inert)", () => {
+	test("WorkflowRunDeps.directory reaches runner.launch", async () => {
+		const { runner, launches } = recordingRunner();
+		const run = createWorkflowRun({
+			runner,
+			parentSessionID: "ses_p",
+			runId: "run_dir",
+			directory: "/tmp/wt-xyz",
+		});
+		const result = await run.run(`${META}await agent("do it");\nreturn 1;\n`);
+		expect(result.status).toBe("completed");
+		expect(launches).toHaveLength(1);
+		expect(launches[0]?.directory).toBe("/tmp/wt-xyz");
+	});
+
+	test("absent directory → runner.launch carries no directory", async () => {
+		const { runner, launches } = recordingRunner();
+		const run = createWorkflowRun({
+			runner,
+			parentSessionID: "ses_p",
+			runId: "run_nodir",
+		});
+		const result = await run.run(`${META}await agent("do it");\nreturn 1;\n`);
+		expect(result.status).toBe("completed");
+		expect(launches).toHaveLength(1);
+		expect(launches[0]?.directory).toBeUndefined();
 	});
 });

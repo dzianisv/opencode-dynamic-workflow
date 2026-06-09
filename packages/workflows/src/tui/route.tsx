@@ -17,7 +17,8 @@
  * (every run in the feed dir, settled or live, freshest first — the cross-session
  * switcher: two opencode sessions running two workflows in the same repo flip between
  * each other's runs here); `q`/`esc` quit the viewer (back to the return route); `x`
- * writes the cancel sentinel for the open run (the 8.2 external touch). Single-key specs only —
+ * prompts a confirm dialog and writes the cancel sentinel for the open run (the 8.2
+ * external touch) ONLY on confirm — a dismiss is a no-op. Single-key specs only —
  * `@opentui/keymap` does NOT comma-split a binding `key`, so each alternate is its own
  * entry.
  *
@@ -36,12 +37,15 @@ import {
 	createMemo,
 	createSignal,
 	For,
+	Match,
 	onCleanup,
 	onMount,
 	Show,
+	Switch,
 } from "solid-js";
 import {
 	formatDuration,
+	formatRelativeTime,
 	formatTokens,
 	shortModel,
 	statusMarker,
@@ -69,6 +73,14 @@ const FEED_SUFFIX = ".jsonl";
  * cheap (no per-file reduce — the route only needs the ids, not their summaries).
  */
 const RUN_POLL_MS = 1500;
+
+/**
+ * How often the header's relative-age segment (`· 3m`) re-ticks. The reducer holds no
+ * clock, so the route owns "now": a 1s interval bumps a `nowMs` signal the header reads,
+ * advancing the age while a run sits idle (no feed event would otherwise re-render it).
+ * 1s is the finest band {@link formatRelativeTime} shows, so a faster tick buys nothing.
+ */
+const NOW_TICK_MS = 1000;
 
 /** One rendered tree line: a phase header, or an agent at a flat selection index. */
 type TreeRow =
@@ -143,6 +155,13 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 	const [runIds, setRunIds] = createSignal<string[]>([]);
 	// Selection is a flat index across ALL agents of ALL phases (the tree is one list).
 	const [selected, setSelected] = createSignal(0);
+	// "Now" for the header's relative-age segment — ticked on an interval (the reducer
+	// holds no clock) so the age advances even while a run sits idle with no new event.
+	const [nowMs, setNowMs] = createSignal(Date.now());
+	// Auto-follow latch: false means the view follows the running agent (CC's sticky-
+	// bottom intent); the first ↑/↓ flips it true and selection takes over. Reset per
+	// run in `openRun` so a run-switch re-arms auto-follow on the freshest live agent.
+	const [userHasScrolled, setUserHasScrolled] = createSignal(false);
 
 	// 0-based position of the open run within `runIds` (the freshest is 0); -1 collapses
 	// to 0 so the header reads `run 1/N` before the first scan binds an index.
@@ -155,6 +174,20 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 	// Flat agent list (phase order preserved) — the selection space.
 	const flatAgents = createMemo<AgentView[]>(() =>
 		phases().flatMap((p) => p.agents),
+	);
+	// The flat index of the first RUNNING agent occurrence, or undefined when none is
+	// live. A running occurrence is precisely `status === undefined` (the reducer never
+	// sets a status until `agent:end`; `statusMarker(undefined)` → the `…` marker) —
+	// the existing snapshot field IS the queryable signal, no reducer change needed.
+	const runningIndex = createMemo<number | undefined>(() => {
+		const at = flatAgents().findIndex((a) => a.status === undefined);
+		return at === -1 ? undefined : at;
+	});
+	// The row the view follows + highlights. Until the user scrolls we track the live
+	// agent (falling back to `selected` when nothing is running, e.g. a settled run or
+	// pre-first-event); after the first ↑/↓ the user's `selected` wins outright.
+	const followedIndex = createMemo<number>(() =>
+		userHasScrolled() ? selected() : (runningIndex() ?? selected()),
 	);
 	// The interleaved render rows: a phase header, then its agents (carrying the flat
 	// index so a row can tell whether it is the selected one).
@@ -175,33 +208,33 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		if (list.length === 0) {
 			return undefined;
 		}
-		return list[clamp(selected(), 0, list.length - 1)];
+		return list[clamp(followedIndex(), 0, list.length - 1)];
 	});
 
-	// Tree rows are ONE line each (truncated, never wrapped), so a row's index in
-	// `rows()` IS its line offset in the scroll content — the scroll-follow math below
-	// is exact. The selected agent's line is where the viewport must keep in view.
-	const selectedLine = createMemo<number>(() => {
-		const list = rows();
-		for (let i = 0; i < list.length; i += 1) {
-			const row = list[i];
-			if (row?.kind === "agent" && row.index === selected()) {
-				return i;
-			}
-		}
-		return 0;
-	});
+	// Stable per-agent row id (`row-<flatIndex>`). The scroll-follow effect looks the
+	// selected row up by this id in the scrollbox's real children and reads its laid-out
+	// geometry — no index→line assumption, so wrapping or spacer rows never desync it.
+	const rowId = (index: number): string => `row-${index}`;
 	// Column budget for a tree row: the tree pane is flexGrow 3 of 5 (≈60% of width),
 	// less its padding and the scrollbar gutter. Truncating to this keeps every row on
 	// ONE line (the full stats live in the Detail pane); a small right gap is harmless.
 	const treeWidth = createMemo<number>(() =>
 		Math.max(8, Math.floor((dimensions().width * 3) / 5) - 4),
 	);
+	// Width budget for the header's run-identity segment: the terminal width less the
+	// fixed segments ("Workflows " ≈ 10 + the bounded status/run i/N/age tail ≈ 30) and
+	// the box padding. Keeps the identity on the header's single row instead of letting a
+	// long name word-wrap the whole header onto a second line.
+	const headerIdentityWidth = createMemo<number>(() =>
+		Math.max(8, dimensions().width - 42),
+	);
 
 	let tailer: ReturnType<typeof createFeedTailer> | undefined;
 	let disposeLayer: (() => void) | undefined;
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
-	// The tree's scroll viewport — its `scrollY` is driven by the follow effect so the
+	// Ticks `nowMs` so the header's relative-age segment advances between feed events.
+	let nowTimer: ReturnType<typeof setInterval> | undefined;
+	// The tree's scroll viewport — its `scrollTop` is driven by the follow effect so the
 	// selected row stays visible as `↑/↓` walks past the fold.
 	let scrollRef: ScrollBoxRenderable | undefined;
 	// Set in onCleanup. The mount IIFE awaits an async dir scan before it can assign and
@@ -225,6 +258,9 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		reducer = createRunStateReducer();
 		setRunId(id);
 		setSelected(0);
+		// Re-arm auto-follow: a freshly opened run should track its live agent until the
+		// user takes over, even if they had scrolled in the previously open run.
+		setUserHasScrolled(false);
 		setVersion((v) => v + 1);
 		const next = createFeedTailer({
 			path: join(props.feedDir, `${id}${FEED_SUFFIX}`),
@@ -283,6 +319,10 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		pollTimer = setInterval(() => {
 			void refreshRuns();
 		}, RUN_POLL_MS);
+		// Advance "now" so the header age re-renders on a live run with no new events.
+		nowTimer = setInterval(() => {
+			setNowMs(Date.now());
+		}, NOW_TICK_MS);
 
 		disposeLayer = props.api.keymap.registerLayer({
 			priority: 2000,
@@ -292,7 +332,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ name: "workflows.nextRun", run: () => switchRun(1) },
 				{ name: "workflows.prevRun", run: () => switchRun(-1) },
 				{ name: "workflows.quit", run: () => quit() },
-				{ name: "workflows.cancel", run: () => void cancelSelected() },
+				{ name: "workflows.cancel", run: () => cancelSelected() },
 			],
 			// One entry PER key — `@opentui/keymap` does not comma-split a binding key.
 			bindings: [
@@ -307,7 +347,6 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{ key: "q", cmd: "workflows.quit" },
 				{ key: "escape", cmd: "workflows.quit" },
 				{ key: "x", cmd: "workflows.cancel" },
-				{ key: "s", cmd: "workflows.cancel" },
 			],
 		});
 	});
@@ -318,35 +357,48 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		if (pollTimer !== undefined) {
 			clearInterval(pollTimer);
 		}
+		if (nowTimer !== undefined) {
+			clearInterval(nowTimer);
+		}
 		disposeLayer?.();
 	});
 
 	// Scroll-follow: keep the selected row inside the viewport — scroll up to it when it
-	// drifts above the fold, down when it falls below. Re-runs on selection or resize.
+	// drifts above the fold, down when it falls below. Re-runs on selection, on each
+	// applied event (rows grow live), and on resize. Delegated to the scrollbox's built-in
+	// `scrollChildIntoView` (real-geometry lookup by row id), not an index→line guess.
 	createEffect(() => {
 		const sb = scrollRef;
-		const line = selectedLine();
+		// Follow the SAME row the highlight + Detail pane track: the live agent until the
+		// user scrolls, then their selection. As agents settle and the next one starts,
+		// `runningIndex` advances and the viewport auto-scrolls to the new live row.
+		const idx = followedIndex();
+		version(); // re-follow as rows stream in
 		dimensions(); // re-follow when the terminal resizes
 		if (sb === undefined) {
 			return;
 		}
-		// `scrollTop` is in rows (1 cell = 1 line); `viewport.height` is the visible row
-		// count (the scrollbox box minus its scrollbar gutter). Both line-based, so the
-		// clamp keeps the selected line within [top, top + viewport).
-		const viewport = sb.viewport.height;
-		if (viewport <= 0) {
-			return;
-		}
-		const top = sb.scrollTop;
-		if (line < top) {
-			sb.scrollTop = line;
-		} else if (line >= top + viewport) {
-			sb.scrollTop = line - viewport + 1;
-		}
+		// Defer to opentui's built-in scroll-follow: it finds the row by id and scrolls
+		// the minimal delta to bring it fully into view. Hand-rolling the math is wrong
+		// here — a child's `.y` is SCREEN-ABSOLUTE (it recursively sums each ancestor's
+		// position + translateY; @opentui/core Renderable `get y()`), NOT a content-
+		// relative row offset, so comparing it directly against `scrollTop` over-scrolls
+		// by the scrollbox's own screen offset. `scrollChildIntoView` compares `child.y`
+		// against `viewport.y` (same space) and drives `scrollBy` with the delta, which
+		// is the only correct framing (mirrors opencode's session scrollbox idiom).
+		sb.scrollChildIntoView(rowId(idx));
 	});
 
 	/** `↑/↓` move the selection through the flat agent list, clamped to its length. */
 	function moveSelection(delta: number): void {
+		// The first manual move ends auto-follow: from here `followedIndex` tracks the
+		// user's `selected`, not the running agent. Seed `selected` from the currently
+		// followed row so the move steps off WHERE THE EYE IS (the live agent), not a
+		// stale `selected(0)` left from before auto-follow scrolled the view away.
+		if (!userHasScrolled()) {
+			setUserHasScrolled(true);
+			setSelected(followedIndex());
+		}
 		const max = flatAgents().length - 1;
 		setSelected((i) => clamp(i + delta, 0, max));
 	}
@@ -365,15 +417,42 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 	}
 
 	/**
-	 * `x` writes the cancel sentinel for the open run (the exact 8.2 external touch). A
-	 * failed sentinel write is surfaced as an error toast and never allowed to become an
-	 * unhandled rejection — mirroring the tailer's `onError` fencing.
+	 * `x` asks before cancelling — cancel is destructive and `x` is a bare letter, so it
+	 * is guarded by a confirm dialog (the TUI UX rule: never wire a destructive action to
+	 * a muscle-memory key). The sentinel is written ONLY on confirm; dismissing the dialog
+	 * is a no-op. The dialog names the run by its display identity (name, else runId).
 	 */
-	async function cancelSelected(): Promise<void> {
+	function cancelSelected(): void {
 		const id = runId();
 		if (id === undefined) {
 			return;
 		}
+		const label = view().name ?? id;
+		// Pass `onClose` too: an ESC/overlay dismiss routes through the dialog stack's
+		// onClose, NOT onCancel, so without it a dismissed dialog would leave the mode on
+		// the stack. The sentinel is written ONLY on explicit confirm — both cancel and a
+		// bare dismiss are no-ops beyond clearing the dialog.
+		props.api.ui.dialog.replace(
+			() =>
+				props.api.ui.DialogConfirm({
+					title: "Cancel run?",
+					message: `Cancel "${label}"? This writes the cancel sentinel the engine consumes — the run stops at its next checkpoint.`,
+					onConfirm: () => {
+						props.api.ui.dialog.clear();
+						void writeCancel(id);
+					},
+					onCancel: () => props.api.ui.dialog.clear(),
+				}),
+			() => props.api.ui.dialog.clear(),
+		);
+	}
+
+	/**
+	 * Write the cancel sentinel for the open run (the exact 8.2 external touch). A failed
+	 * write is surfaced as an error toast and never allowed to become an unhandled
+	 * rejection — mirroring the tailer's `onError` fencing.
+	 */
+	async function writeCancel(id: string): Promise<void> {
 		try {
 			await writeCancelSentinel({ controlDir: props.controlDir, runId: id });
 		} catch (err) {
@@ -416,14 +495,33 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 			backgroundColor={theme().background}
 			flexDirection="column"
 		>
-			{/* Header: title + run id + status, with a full-width rule below it. */}
+			{/* Header: title + run identity (name, falling back to runId) + status + run
+			    i/N + relative age, with a full-width rule below it. The age segment ticks
+			    off `nowMs` and only renders once the run has a `startedAt` stamp. The
+			    identity is the only unbounded segment, so it is truncated to a width budget
+			    (mirroring the tree rows) — a long run name clips instead of word-wrapping the
+			    header onto a second row and pushing the panes down. */}
 			<box flexDirection="row" flexShrink={0} paddingLeft={1} paddingRight={1}>
-				<text fg={theme().text}>Workflows </text>
-				<text fg={theme().textMuted}>{runId() ?? "no active run"}</text>
-				<text fg={statusColor()}>{`  ·  ${statusLabel(view().status)}`}</text>
+				<text flexShrink={0} fg={theme().text}>
+					Workflows{" "}
+				</text>
+				<text flexShrink={0} fg={theme().textMuted}>
+					{truncateLine(
+						view().name ?? runId() ?? "no active run",
+						headerIdentityWidth(),
+					)}
+				</text>
+				<text flexShrink={0} fg={statusColor()}>
+					{`  ·  ${statusLabel(view().status)}`}
+				</text>
 				<Show when={runIds().length > 1}>
-					<text fg={theme().textMuted}>
+					<text flexShrink={0} fg={theme().textMuted}>
 						{`  ·  run ${runIndex() + 1}/${runIds().length}`}
+					</text>
+				</Show>
+				<Show when={view().startedAt !== undefined}>
+					<text flexShrink={0} fg={theme().textMuted}>
+						{`  ·  ${formatRelativeTime(view().startedAt ?? 0, nowMs())}`}
 					</text>
 				</Show>
 			</box>
@@ -442,34 +540,46 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 						scrollRef = el as unknown as ScrollBoxRenderable;
 					}}
 					flexGrow={3}
+					// Let the pane shrink below its rows' min-content width so flexGrow splits
+					// the row cleanly with the Detail pane — keeps the scrollbar flush to the
+					// right of the agent rows instead of drifting to the screen edge.
+					minWidth={0}
 					flexDirection="column"
+					// Render every row (no background-culling of off-fold rows): the tree is at
+					// most a few dozen lines, and culling was dropping in-box rows to black.
+					viewportCulling={false}
 					paddingLeft={1}
 					paddingRight={1}
 				>
 					<Show
 						when={rows().length > 0}
 						fallback={
-							<text fg={theme().textMuted}>
-								(waiting for the run to start…)
-							</text>
+							<TreeFallback
+								theme={theme()}
+								hasRuns={runIds().length > 0}
+								hasRun={runId() !== undefined}
+								status={view().status}
+							/>
 						}
 					>
 						<For each={rows()}>
 							{(row) =>
 								row.kind === "phase" ? (
-									<text fg={theme().text}>
+									<text flexShrink={0} fg={theme().text}>
 										{truncateLine(phaseHeaderText(row.phase), treeWidth())}
 									</text>
 								) : (
 									<text
+										id={rowId(row.index)}
+										flexShrink={0}
 										fg={
-											row.index === selected()
+											row.index === followedIndex()
 												? theme().primary
 												: theme().textMuted
 										}
 									>
 										{truncateLine(
-											`${row.index === selected() ? "▸ " : "  "}${agentRowText(row.agent)}`,
+											`${row.index === followedIndex() ? "▸ " : "  "}${agentRowText(row.agent)}`,
 											treeWidth(),
 										)}
 									</text>
@@ -482,6 +592,7 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 				{/* Detail pane: the selected agent, with a left border as the divider. */}
 				<box
 					flexGrow={2}
+					minWidth={0}
 					flexDirection="column"
 					paddingLeft={2}
 					paddingRight={1}
@@ -506,65 +617,178 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 			</box>
 			<box flexShrink={0} paddingLeft={1}>
 				<text fg={theme().textMuted}>
-					↑↓ agent · ←→ run · x cancel · q/esc quit
+					↑↓ agent · ←→ run · x cancel run · q/esc quit
 				</text>
 			</box>
 		</box>
 	);
 }
 
-/** The Detail pane body for one agent — status, tokens, tools, note, sessionID. */
+/** True for a SETTLED agent whose terminal status is a failure (not completed/cached). */
+function isFailure(status: string | undefined): boolean {
+	return status !== undefined && status !== "completed" && status !== "cached";
+}
+
+/**
+ * The Detail pane body for one agent. Every field is LABELLED (`session …`, `note: …`)
+ * so it identifies by name, not bare id, and the field ORDER is status-aware:
+ *
+ * - RUNNING (`status === undefined`): lead with the live signal — the running marker,
+ *   live tokens, and the tool activity ring — since that is what a glance wants while
+ *   the agent works.
+ * - SETTLED: lead with the terminal stats (status, tokens, tool calls, duration) and
+ *   surface the note prominently — in {@link theme.error} for a failure, where the note
+ *   IS the failure reason — before the long prompt.
+ *
+ * The whole body is wrapped in a `<scrollbox>` so a long prompt or tool ring stays
+ * readable without pushing the labelled stats off-screen; it is display-only (the route
+ * keymap owns ↑/↓ for the tree, so this scrollbox takes no focus) and `viewportCulling`
+ * is off with `flexShrink={0}` rows, matching the tree pane's clipping discipline.
+ */
 function AgentDetail(props: {
 	agent: AgentView;
 	theme: TuiPluginApi["theme"]["current"];
 }) {
 	const t = props.theme;
-	return (
-		<box flexDirection="column">
-			<text fg={t.text}>{props.agent.label}</text>
-			<Show when={props.agent.model}>
-				{(model) => <text fg={t.textMuted}>{shortModel(model())}</text>}
-			</Show>
-			<Show when={props.agent.status}>
-				{(status) => (
-					<text
-						fg={t.textMuted}
-					>{`${statusMarker(status())} ${status()}`}</text>
-				)}
-			</Show>
-			<Show when={props.agent.tokens !== undefined}>
-				<text fg={t.textMuted}>
-					{`${formatTokens(props.agent.tokens ?? 0)} tok`}
+	const running = () => props.agent.status === undefined;
+	const failed = () => isFailure(props.agent.status);
+
+	const StatusLine = () => (
+		<Show when={props.agent.status}>
+			{(status) => (
+				<text fg={failed() ? t.error : t.textMuted}>
+					{`status: ${statusMarker(status())} ${status()}`}
 				</text>
-			</Show>
-			<Show when={props.agent.toolCalls !== undefined}>
-				<text fg={t.textMuted}>{`${props.agent.toolCalls} tool calls`}</text>
-			</Show>
-			<Show when={props.agent.durationMs !== undefined}>
-				<text fg={t.textMuted}>
-					{formatDuration(props.agent.durationMs ?? 0)}
-				</text>
-			</Show>
-			<Show when={props.agent.prompt}>
-				{(prompt) => (
-					<box flexDirection="column" paddingTop={1}>
-						<text fg={t.border}>── prompt</text>
-						<text fg={t.textMuted}>{prompt()}</text>
-					</box>
-				)}
-			</Show>
-			<Show when={props.agent.lastTools && props.agent.lastTools.length > 0}>
+			)}
+		</Show>
+	);
+	const Tokens = () => (
+		<Show when={props.agent.tokens !== undefined}>
+			<text fg={t.textMuted}>
+				{`tokens: ${formatTokens(props.agent.tokens ?? 0)}`}
+			</text>
+		</Show>
+	);
+	const ToolCalls = () => (
+		<Show when={props.agent.toolCalls !== undefined}>
+			<text fg={t.textMuted}>{`tool calls: ${props.agent.toolCalls}`}</text>
+		</Show>
+	);
+	const Duration = () => (
+		<Show when={props.agent.durationMs !== undefined}>
+			<text fg={t.textMuted}>
+				{`duration: ${formatDuration(props.agent.durationMs ?? 0)}`}
+			</text>
+		</Show>
+	);
+	const Note = () => (
+		<Show when={props.agent.note}>
+			{(note) => (
+				<box flexShrink={0} flexDirection="column" paddingTop={1}>
+					<text fg={failed() ? t.error : t.textMuted}>{`note: ${note()}`}</text>
+				</box>
+			)}
+		</Show>
+	);
+	const Tools = () => (
+		<Show when={props.agent.lastTools && props.agent.lastTools.length > 0}>
+			<box flexShrink={0} flexDirection="column" paddingTop={1}>
+				<text fg={t.border}>── tools</text>
 				<For each={props.agent.lastTools ?? []}>
-					{(tool) => <text fg={t.textMuted}>{`· ${tool}`}</text>}
+					{(tool) => <text flexShrink={0} fg={t.textMuted}>{`· ${tool}`}</text>}
 				</For>
-			</Show>
-			<Show when={props.agent.note}>
-				{(note) => <text fg={t.textMuted}>{note()}</text>}
-			</Show>
-			<Show when={props.agent.sessionID}>
-				{(id) => <text fg={t.textMuted}>{id()}</text>}
-			</Show>
-		</box>
+			</box>
+		</Show>
+	);
+	const Prompt = () => (
+		<Show when={props.agent.prompt}>
+			{(prompt) => (
+				<box flexShrink={0} flexDirection="column" paddingTop={1}>
+					<text fg={t.border}>── prompt</text>
+					<text fg={t.textMuted}>{prompt()}</text>
+				</box>
+			)}
+		</Show>
+	);
+
+	return (
+		<scrollbox flexGrow={1} minWidth={0} minHeight={0} viewportCulling={false}>
+			<box flexShrink={0} flexDirection="column">
+				<text flexShrink={0} fg={t.text}>
+					{props.agent.label}
+				</text>
+				<Show when={props.agent.model}>
+					{(model) => (
+						<text flexShrink={0} fg={t.textMuted}>
+							{`model: ${shortModel(model())}`}
+						</text>
+					)}
+				</Show>
+				<Show when={props.agent.sessionID}>
+					{(id) => (
+						<text flexShrink={0} fg={t.textMuted}>
+							{`session: ${id()}`}
+						</text>
+					)}
+				</Show>
+				{/* Status-aware ordering: a running agent leads with its live signal; a
+				    settled one leads with terminal stats + the (error-prominent) note. */}
+				<Show
+					when={running()}
+					fallback={
+						<>
+							<StatusLine />
+							<Tokens />
+							<ToolCalls />
+							<Duration />
+							<Note />
+							<Tools />
+							<Prompt />
+						</>
+					}
+				>
+					<text
+						fg={t.primary}
+					>{`status: ${statusMarker(undefined)} running`}</text>
+					<Tokens />
+					<Tools />
+					<ToolCalls />
+					<Prompt />
+				</Show>
+			</box>
+		</scrollbox>
+	);
+}
+
+/**
+ * The tree-pane fallback when no agent rows render yet — three DISTINCT states, never a
+ * single generic "waiting…": no runs in the feed dir at all, a run selected but its first
+ * event not yet tailed, and a run that ended in error. Non-contradictory with the header
+ * (which carries the run identity + status separately).
+ */
+function TreeFallback(props: {
+	theme: TuiPluginApi["theme"]["current"];
+	hasRuns: boolean;
+	hasRun: boolean;
+	status: RunViewState["status"];
+}) {
+	const t = props.theme;
+	return (
+		<Switch
+			fallback={<text fg={t.textMuted}>(waiting for the first event…)</text>}
+		>
+			<Match when={!props.hasRuns}>
+				<text fg={t.textMuted}>
+					No workflow runs yet — launch one with the workflow tool.
+				</text>
+			</Match>
+			<Match when={props.status === "error"}>
+				<text fg={t.error}>Run failed before reporting any agents.</text>
+			</Match>
+			<Match when={!props.hasRun}>
+				<text fg={t.textMuted}>(no run selected)</text>
+			</Match>
+		</Switch>
 	);
 }
 

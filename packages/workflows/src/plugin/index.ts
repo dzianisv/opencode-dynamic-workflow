@@ -16,6 +16,10 @@
  *     stores — without it the watcher timer leaks for the process lifetime;
  *   - `event` → `engine.handleEvent` so the runner's completion gate sees the
  *     live session.idle / session.error stream the workflow children ride on;
+ *   - `tool.execute.before` → denies destructive git (`restore`/`checkout --`/
+ *     `reset`/`stash`/`clean`) on LIVE worker sessions by throw (Epic 0.3), so a
+ *     worker cannot clobber the uncommitted work the engine owns; the parent and
+ *     read-only/constructive git pass untouched;
  *   - `chat.message` → prepends a one-line digest per LIVE run owned by the parent
  *     (Task 6.2.4), then drains the per-parent TERMINAL notice queue into the
  *     parent's next message (core's `createChatMessageHook`, wrapped by
@@ -47,13 +51,14 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { createStructuredOutputTool } from "../runtime/structured/tool";
 import { createWorkflowChatMessageHook } from "./digest-hook";
 import { createWorkflowEngine, type EngineLogger } from "./engine";
+import { createGitDenyHook } from "./git-deny-hook";
 import { createWorkflowTool } from "./tools/workflow";
 import { createWorkflowStatusTool } from "./tools/workflow-status";
 import { createWorkflowStopTool } from "./tools/workflow-stop";
 
 const SERVICE = "opencode-drawer-workflows";
 
-export const WorkflowsPlugin: Plugin = async ({ client, directory }) => {
+export const WorkflowsPlugin: Plugin = async ({ client, directory, $ }) => {
 	const logger: EngineLogger = {
 		debug: (message, extra) => {
 			void client.app.log({
@@ -94,6 +99,10 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory }) => {
 		directory,
 		onNotify,
 		logger,
+		// The host BunShell (Epic 2.1): the engine binds the repo root via
+		// `$.cwd(directory)` and owns per-agent git checkpoints. `$` is a host
+		// primitive sibling to `client` — never routed through adaptSdkClient.
+		shell: $,
 	});
 	await engine.ready();
 
@@ -118,6 +127,11 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory }) => {
 		event: async ({ event }) => {
 			await engine.handleEvent(event);
 		},
+		// Deny destructive git on live worker sessions (Epic 0.3): a worker's Bash
+		// call running restore/checkout --/reset/stash/clean is blocked by throw so it
+		// cannot clobber the uncommitted work the engine owns. Parent sessions,
+		// read-only/constructive git, and non-Bash tools pass untouched.
+		"tool.execute.before": createGitDenyHook(engine),
 		"chat.message": createWorkflowChatMessageHook(engine, engine.queue, logger),
 		tool: {
 			structured_output: createStructuredOutputTool(engine.registry),

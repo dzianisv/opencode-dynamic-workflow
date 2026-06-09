@@ -31,10 +31,12 @@ import type {
 	AgentOpts,
 	BudgetView,
 	DiagnosticEmitter,
+	IntentJournalEntry,
 	JournalEntry,
 	ProgressEmitter,
 	ProgressEvent,
 	RuntimeApi,
+	SettledJournalEntry,
 } from "./types";
 
 /**
@@ -90,8 +92,18 @@ export interface WorkflowRunDeps {
 	 * `entries` is the prior run's journal (replayed per-key + occurrence,
 	 * position-independent), `onRecord` captures each settled non-null live result
 	 * for the new journal.
+	 *
+	 * `onIntent` (Phase 3) write-aheads a "dispatched-but-not-settled" marker before
+	 * each LIVE agent launch; the engine wires it to a journal append that is awaited
+	 * before dispatch. Optional so child runs and the standalone library are
+	 * unaffected. Only the agent primitive consumes it — a `workflow()` boundary
+	 * writes no intent.
 	 */
-	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
+	replay?: {
+		entries: JournalEntry[];
+		onRecord: (e: SettledJournalEntry) => void;
+		onIntent?: (e: IntentJournalEntry) => Promise<void> | void;
+	};
 	/**
 	 * Structured-output schema/result registry. When provided (Phase 4: a single
 	 * plugin-level registry behind the global `structured_output` tool, shared
@@ -116,6 +128,50 @@ export interface WorkflowRunDeps {
 	 * liveTasks, and abort latch. ABSENT (a top-level run) → the run mints its own.
 	 */
 	shared?: SharedRunBoxes;
+	/**
+	 * Pre-launch checkpoint barrier (Task 2.1.5), threaded straight to the `agent()`
+	 * primitive. The engine resolves it when the per-run commit chain has drained, so
+	 * the next agent's launch blocks behind the prior agent's commit. OPAQUE to the
+	 * runtime — it never learns what a checkpoint is, preserving the runtime's
+	 * zero-plugin-knowledge layering. ABSENT → no blocking.
+	 */
+	awaitCheckpointClear?: () => Promise<void>;
+	/**
+	 * Resolve the engine-computed real git diff (since run start) for an
+	 * `agent({ contextDiff:true })` review (Epic 4.1), threaded straight to the
+	 * `agent()` primitive. The engine wires it to its per-run checkpointer's
+	 * `diff()`; ABSENT (the standalone library, child runs without it) → no diff is
+	 * injected and no review is refused. OPAQUE to the runtime — it never learns what
+	 * a diff is, preserving the zero-plugin-knowledge layering.
+	 */
+	resolveContextDiff?: () => Promise<{
+		text: string;
+		isEmpty: boolean;
+		available: boolean;
+	}>;
+	/**
+	 * Verify an `agent({ verifyDiff })` post-condition after it settles (Epic 4.2),
+	 * threaded straight to the `agent()` primitive. The engine wires it to its per-run
+	 * checkpointer + repo-bound shell; ABSENT (the standalone library) → no
+	 * verification. OPAQUE to the runtime — it never learns what a git diff or a check
+	 * command is.
+	 */
+	verifyResult?: (opts: {
+		verifyDiff: boolean | { check?: string };
+		sessionId?: string;
+	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
+	/**
+	 * Per-agent project/worktree directory (Epic H.1, inert seam), threaded
+	 * straight to the `agent()` primitive (`AgentPrimitiveDeps.directory`) and
+	 * inherited by child sub-workflow runs (a child runs in the same project
+	 * today). OPAQUE to the runtime — it never learns what the directory is. It is
+	 * a DIFFERENT layer from the engine-wide {@link CreateWorkflowEngineOptions}
+	 * `directory` (the single project dir used for saved-workflow lookup): this is
+	 * the FUTURE per-agent worktree dir that re-roots one worker's cwd. ABSENT
+	 * (the standalone library, and ALWAYS so today — the engine supplies no
+	 * per-agent value yet) → the engine-wide directory applies as today.
+	 */
+	directory?: string;
 }
 
 /** The terminal outcome of a workflow run (spec §2.3, §3.3). */
@@ -251,6 +307,18 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		registry,
 		replay: deps.replay,
 		callIndex,
+		...(deps.awaitCheckpointClear !== undefined
+			? { awaitCheckpointClear: deps.awaitCheckpointClear }
+			: {}),
+		...(deps.resolveContextDiff !== undefined
+			? { resolveContextDiff: deps.resolveContextDiff }
+			: {}),
+		...(deps.verifyResult !== undefined
+			? { verifyResult: deps.verifyResult }
+			: {}),
+		// Epic 4.2 + H.1: thread the inert per-agent directory seam straight to the
+		// primitive when present; absent → identical primitive as today.
+		...(deps.directory !== undefined ? { directory: deps.directory } : {}),
 	});
 
 	// Wrap the primitive so that after abort(), NEW calls resolve null immediately
@@ -287,6 +355,26 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				// Task 7.2.1: a child's agent diagnostics flow to the SAME engine sink
 				// as the parent's, so a sub-workflow's null/empty is post-mortem-visible.
 				onDiagnostic: emitDiagnostic,
+				// Task 2.1.5: a child's agents ride the SAME per-run commit barrier as
+				// the parent's (they share the gate/run), so the checkpoint serialization
+				// holds across the sub-workflow boundary too.
+				...(deps.awaitCheckpointClear !== undefined
+					? { awaitCheckpointClear: deps.awaitCheckpointClear }
+					: {}),
+				// Epic 4.1: a child's contextDiff reviews ride the SAME per-run
+				// checkpointer diff as the parent's (they share the run/git tree).
+				...(deps.resolveContextDiff !== undefined
+					? { resolveContextDiff: deps.resolveContextDiff }
+					: {}),
+				// Epic 4.2: a child's verifyDiff post-conditions ride the SAME per-run
+				// checkpointer + shell as the parent's.
+				...(deps.verifyResult !== undefined
+					? { verifyResult: deps.verifyResult }
+					: {}),
+				// Epic H.1 (inert seam): a child sub-workflow inherits the parent's
+				// per-agent directory by default — a child runs in the same project
+				// today; a future worktree epic can override per-child.
+				...(deps.directory !== undefined ? { directory: deps.directory } : {}),
 				// No resolver → child workflow() throws NestingError (depth 1).
 				// No replay → the boundary entry in the PARENT journal covers the child.
 			});

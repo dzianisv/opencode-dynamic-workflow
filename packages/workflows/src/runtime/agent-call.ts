@@ -11,8 +11,11 @@ import {
 	type BudgetView,
 	type DiagnosticEmitter,
 	type DiagnosticReason,
+	type IntentJournalEntry,
+	IsolationUnsupportedError,
 	type JournalEntry,
 	type ProgressEmitter,
+	type SettledJournalEntry,
 } from "./types";
 
 /**
@@ -94,8 +97,19 @@ export interface AgentPrimitiveDeps {
 	 * position-independent: editing one item no longer voids later unchanged items
 	 * (field finding R4). Every settled non-null live result is reported via
 	 * `onRecord` for the new journal.
+	 *
+	 * `onIntent` (Phase 3) is the write-ahead seam: a LIVE call reports its intent
+	 * BEFORE dispatch and AWAITS it, so a crash in the launch window leaves a durable
+	 * "dispatched-but-not-settled" marker. The engine wires it to a journal append
+	 * that is also awaited; absent (the standalone library / child runs) → no
+	 * write-ahead. Intent entries in `entries` are NEVER replayed — they are filtered
+	 * out of the per-key cache below.
 	 */
-	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
+	replay?: {
+		entries: JournalEntry[];
+		onRecord: (e: SettledJournalEntry) => void;
+		onIntent?: (e: IntentJournalEntry) => Promise<void> | void;
+	};
 	/**
 	 * Run-level deterministic call ordinal. Counts EVERY `agent()` invocation in
 	 * order — cached or live — so the new journal's `index` field and the progress
@@ -104,6 +118,61 @@ export interface AgentPrimitiveDeps {
 	 * key — matching is by key+occurrence — it is purely the ordering anchor.
 	 */
 	callIndex: { value: number };
+	/**
+	 * Pre-launch checkpoint barrier (Task 2.1.5). Awaited AFTER `gate.acquire` and
+	 * BEFORE `runner.launch`, so the NEXT agent's launch blocks until the PRIOR
+	 * agent's per-unit commit has drained — making "commit-before-next-unit" a real
+	 * guarantee, not just commit ORDERING (the gate slot is freed in the prior
+	 * agent's `finally` BEFORE its `agent:end`-driven commit even starts, so without
+	 * this barrier the next acquire could win the race). OPAQUE to the runtime: it
+	 * never learns what a checkpoint is, it just awaits the thunk. ABSENT (the
+	 * default, and always so in the standalone library) → no blocking.
+	 */
+	awaitCheckpointClear?: () => Promise<void>;
+	/**
+	 * Resolve the engine-computed real git diff (since run start) for an
+	 * `agent({ contextDiff:true })` review (Epic 4.1). The engine wires it to its
+	 * per-run checkpointer's `diff()`; ABSENT (the standalone library, in-memory
+	 * tests) → no diff is injected and no review is ever refused (behaves exactly as
+	 * today). The diff is injected as a SYNTHETIC contextPart (NOT the prompt) so it
+	 * never perturbs {@link computeCallKey} — a reviewer replays its journaled verdict
+	 * on resume rather than re-diffing a now-different tree. `available:false`
+	 * (no-shell / non-git) means emptiness is UNPROVABLE: the review runs with no diff
+	 * part and is never refused.
+	 */
+	resolveContextDiff?: () => Promise<{
+		text: string;
+		isEmpty: boolean;
+		available: boolean;
+	}>;
+	/**
+	 * Verify an agent's git/command post-condition AFTER it settles non-null (Epic
+	 * 4.2). The engine wires it to the per-run checkpointer: `verifyDiff:true` asserts
+	 * the working-tree diff vs baseline is non-empty (valid PRE-commit, so no commit-
+	 * ordering dance); `{check}` runs the command via the repo-bound shell and asserts
+	 * exit 0. Returns `{passed, available, reason?}`: on `available && !passed` the
+	 * settled result is downgraded to `null` (re-runs on resume, NOT journaled).
+	 * `available:false` (no-shell / non-git) → the check is INERT, the result passes
+	 * through unchanged — NEVER a fabricated failure. ABSENT → no verification. Note:
+	 * a downgrade nulls the RESULT only; it does NOT un-commit (the bytes are on disk,
+	 * P2 commit-for-recovery still applies — the engine still checkpoints this agent).
+	 */
+	verifyResult?: (opts: {
+		verifyDiff: boolean | { check?: string };
+		sessionId?: string;
+	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
+	/**
+	 * Per-agent project/worktree directory (Epic H.1, inert seam), forwarded
+	 * straight to `runner.launch` → `session.create`'s `query.directory`, which
+	 * re-roots the worker's Bash/tool cwd (host-probed green 2026-06-08). This is
+	 * an ENGINE-OWNED dep, NOT an `AgentOpts` field — no script can request it and
+	 * it is deliberately ABSENT from {@link computeCallKey}/`CallKeyInput` (a
+	 * worktree path would re-key every cached agent on resume and re-run settled
+	 * work), exactly like the `contextDiff`/`verifyDiff` exclusion. UNUSED until
+	 * the future worktree-lifecycle code MINTS a per-agent directory; ABSENT → the
+	 * engine-wide directory applies as today.
+	 */
+	directory?: string;
 }
 
 /** The single nudge sent when a child completes without a structured result. */
@@ -145,6 +214,10 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		registry,
 		replay,
 		callIndex,
+		awaitCheckpointClear,
+		resolveContextDiff,
+		verifyResult,
+		directory,
 	} = deps;
 
 	/**
@@ -169,6 +242,12 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 	function diagnosticNote(reason: DiagnosticReason, rawLen?: number): string {
 		if (reason === "empty_output") {
 			return "empty output";
+		}
+		if (reason === "empty_diff") {
+			return "review refused — empty diff for the unit under review";
+		}
+		if (reason === "verify_failed") {
+			return "null — verify_failed (git/command post-condition failed)";
 		}
 		const raw =
 			rawLen !== undefined ? `; raw ${humanizeChars(rawLen)} preserved` : "";
@@ -221,9 +300,18 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 	// `workflow()` boundary's `workflow:`-prefixed keys land in this same map, no
 	// special-casing. N identical keys → N replays; the N+1th finds an empty queue
 	// and runs live (preserves CC's adversarial-verify N-byte-identical refuters).
-	const byKey = new Map<string, JournalEntry[]>();
+	//
+	// Phase 3 HIGH-BLAST FILTER: skip any non-settled (intent) entry. An intent has
+	// no result, so if it entered a key's queue a resumed call would shift it and
+	// replay garbage — or consume the occurrence slot the genuine `ok` belongs to.
+	// Filtering here keeps only settled results in the queue (the resolveResume
+	// load-filter is the primary guard; this is the in-runtime backstop).
+	const byKey = new Map<string, SettledJournalEntry[]>();
 	if (replay !== undefined) {
 		for (const entry of replay.entries) {
+			if (entry.status !== "ok") {
+				continue;
+			}
 			const queue = byKey.get(entry.key);
 			if (queue === undefined) {
 				byKey.set(entry.key, [entry]);
@@ -297,13 +385,31 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		const compiled =
 			opts.schema !== undefined ? compileSchema(opts.schema) : undefined;
 
-		// 4. Worktree isolation has no OpenCode session primitive — honest no-op.
+		// 4. Worktree isolation has no OpenCode session primitive (Epic 0.4). The old
+		// no-op silently ran the agent UNISOLATED, giving false safety. Now it fails
+		// loudly: a warn on the progress stream, a typed post-mortem diagnostic, and a
+		// visible agent:start/agent:end pair — then the call DEGRADES to `null`. We do
+		// NOT throw: this branch runs BEFORE gate.acquire, and a throw here would
+		// detonate the whole parallel() batch rather than failing just this agent
+		// (degrade, don't detonate). The rest of the batch survives; this agent does
+		// not run unisolated.
 		if (opts.isolation === "worktree") {
+			const message = new IsolationUnsupportedError().message;
+			emit({ type: "warn", message });
 			emit({
-				type: "warn",
-				message:
-					"isolation:'worktree' is not supported (no worktree session primitive); running without isolation",
+				type: "agent:start",
+				label,
+				phase,
+				promptPreview: promptPreviewOf(prompt),
 			});
+			onDiagnostic?.({ label, index, reason: "isolation_unsupported" });
+			emit({
+				type: "agent:end",
+				label,
+				status: "error",
+				note: diagnosticNote("isolation_unsupported"),
+			});
+			return null;
 		}
 
 		// With a schema, the child returns its result by calling structured_output;
@@ -315,6 +421,38 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 
 		// 5. Gate the launch on the run's concurrency slots.
 		await gate.acquire(runId);
+
+		// 5a. Pre-launch checkpoint barrier (Task 2.1.5): with the slot held, block
+		// until the PRIOR agent's per-unit commit has drained. The gate slot was freed
+		// in the prior agent's `finally` BEFORE its `agent:end`-driven commit even
+		// kicked off, so this barrier — not the gate — is what makes the next launch
+		// wait for the commit. Opaque + optional; ABSENT adds ZERO microtask hops (the
+		// guard avoids an `await undefined` tick that would shift launch timing). Fenced
+		// like the rest of this body — a barrier rejection must never crash the call.
+		if (awaitCheckpointClear !== undefined) {
+			try {
+				await awaitCheckpointClear();
+			} catch {
+				// The checkpoint chain is fenced engine-side and never rejects; guard
+				// defensively so a surprise rejection degrades to "launch anyway", never
+				// a thrown agent() (degrade, don't detonate).
+			}
+		}
+
+		// 5b. Write-ahead the intent (Phase 3): record a durable "dispatched-but-not
+		// -settled" marker BEFORE launch, sharing this call's index+key with the
+		// eventual completion. AWAITED so the marker hits disk before the launch
+		// window opens — a crash there then leaves a visible intent with no `ok`.
+		// FENCED like the barrier above: a journal append failure degrades to
+		// launch-anyway, never throws (degrade, don't detonate). The cap/budget are
+		// already charged; the intent is purely observational write-ahead.
+		if (replay?.onIntent !== undefined) {
+			try {
+				await replay.onIntent({ index, key, status: "intent", label });
+			} catch {
+				// A failed intent append must not detonate the call — launch anyway.
+			}
+		}
 
 		let taskId: string | undefined;
 		let sessionId: string | undefined;
@@ -331,6 +469,42 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				promptPreview: promptPreviewOf(prompt),
 			});
 
+			// 6b. contextDiff (Epic 4.1): resolve the engine-computed real git diff
+			// (since run start) for a review. The diff rides a SYNTHETIC contextPart, not
+			// the prompt, so it never perturbs computeCallKey (resume replays the verdict).
+			// REFUSAL (#7 fix): when the diff is PROVABLY empty (available — a live work
+			// tree), degrade to null BEFORE launch rather than reviewing narrative-only
+			// claims. The gate slot is freed by the finally on this return, so a sibling
+			// in the same parallel() batch is unaffected (degrade, don't detonate). When
+			// `available:false` (no shell / non-git) emptiness is unprovable → run the
+			// review with NO diff part; never refuse. A rejecting/absent thunk is fenced
+			// to launch-anyway with no diff part.
+			let contextParts: { type: "text"; text: string; synthetic: true }[] = [];
+			if (opts.contextDiff === true && resolveContextDiff !== undefined) {
+				let diff:
+					| { text: string; isEmpty: boolean; available: boolean }
+					| undefined;
+				try {
+					diff = await resolveContextDiff();
+				} catch {
+					// A thunk rejection degrades to launch-anyway with no diff part.
+					diff = undefined;
+				}
+				if (diff !== undefined && diff.available) {
+					if (diff.isEmpty) {
+						emit({
+							type: "warn",
+							message: `review '${label}' refused: the git diff for the unit under review is empty`,
+						});
+						endNote = diagnosticNote("empty_diff");
+						onDiagnostic?.({ label, index, reason: "empty_diff" });
+						status = "error";
+						return null;
+					}
+					contextParts = [{ type: "text", text: diff.text, synthetic: true }];
+				}
+			}
+
 			// 7. Launch the subagent. For structured output, register the compiled
 			// schema against the child sessionID the instant it exists (synchronous
 			// onSessionCreated hook), before the child's first turn can call the tool.
@@ -341,6 +515,10 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				agent: opts.agentType ?? defaults.agent,
 				model: opts.model,
 				depth: 0,
+				// Epic H.1 (inert seam): forward the engine-owned per-agent directory
+				// when present so it re-roots the worker cwd; absent → identical launch.
+				...(directory !== undefined ? { directory } : {}),
+				...(contextParts.length > 0 ? { contextParts } : {}),
 				...(compiled !== undefined
 					? {
 							onSessionCreated: (sid: string) =>
@@ -429,6 +607,47 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
 				};
 				onDiagnostic?.(diagnostic);
+			}
+
+			// verifyDiff post-condition (Epic 4.2): for an agent that settled NON-NULL,
+			// verify its git/command post-condition AFTER it settles but BEFORE
+			// journaling. On a PROVABLE failure (available && !passed), downgrade the
+			// result to null so it RE-RUNS on resume (a hollow success is never
+			// journaled) — the #7 fix against a settled-but-empty unit. available:false
+			// (no-shell / non-git) is INERT: the result survives, never a fabricated
+			// failure. The downgrade nulls the RESULT only; it does NOT un-commit — the
+			// engine still checkpoints this agent (the bytes are on disk; agent:end still
+			// carries the sessionID), so P2 recovery holds. Fenced: a thrown verify
+			// degrades to pass-through, never a thrown agent() (degrade, don't detonate).
+			// Runs only when the agent itself produced a result to verify.
+			if (
+				opts.verifyDiff !== undefined &&
+				verifyResult !== undefined &&
+				result !== null &&
+				result !== undefined
+			) {
+				let verdict:
+					| { passed: boolean; available: boolean; reason?: string }
+					| undefined;
+				try {
+					verdict = await verifyResult({
+						verifyDiff: opts.verifyDiff,
+						...(sessionId !== undefined ? { sessionId } : {}),
+					});
+				} catch {
+					// A thrown verify degrades to pass-through (treated as inert).
+					verdict = undefined;
+				}
+				if (verdict !== undefined && verdict.available && !verdict.passed) {
+					endNote = diagnosticNote("verify_failed");
+					onDiagnostic?.({
+						label,
+						index,
+						reason: "verify_failed",
+						...(sessionId !== undefined ? { childSessionID: sessionId } : {}),
+					});
+					return null;
+				}
 			}
 
 			// Spec §7: only SETTLED non-null results are journaled — a failed/null

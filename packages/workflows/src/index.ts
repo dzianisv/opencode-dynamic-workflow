@@ -64,11 +64,13 @@ export {
 	type AgentOpts,
 	BudgetExhaustedError,
 	type BudgetView,
+	type IntentJournalEntry,
 	type JournalEntry,
 	NestingError,
 	NotYetSupportedError,
 	type ProgressEmitter,
 	type ProgressEvent,
 	type RuntimeApi,
+	type SettledJournalEntry,
 	type WorkflowFn,
 } from "./runtime/types";

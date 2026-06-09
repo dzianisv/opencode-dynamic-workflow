@@ -227,7 +227,7 @@ The body below the meta runs in an async context: use top-level await freely; a 
 
 ## Script API (the only globals available)
 
-- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType. isolation:'worktree' is recognized but NOT yet supported (the agent runs without isolation).
+- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, contextDiff. isolation:'worktree' is not supported; passing it fails the agent (the call degrades to null with a loud diagnostic rather than running unisolated). contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
 - pipeline(items, stage1, stage2, ...) → Promise<any[]> — run each item through all stages with NO barrier between stages: item A can be in stage 3 while item B is in stage 1. DEFAULT to this for multi-stage work. Each stage receives (prevResult, originalItem, index). A throwing stage drops that item to null.
 - parallel(thunks) → Promise<any[]> — run thunks (() => Promise) concurrently with a BARRIER: awaits all before returning; a failed thunk yields null, the call never rejects. Use ONLY when a later step genuinely needs ALL results together (dedup, cross-item comparison, early-exit on count).
 - phase(title) — start a progress group for subsequent agent() calls.
@@ -254,10 +254,18 @@ Every successful agent() result is journaled. Relaunch with resume_from_run_id a
   const FINDINGS = { type: 'object', properties: { issues: { type: 'array', items: { type: 'string' } } }, required: ['issues'] }
   const results = await pipeline(
     args.files,
-    (f) => agent('Review ' + f + ' for bugs. Return issues.', { phase: 'Review', schema: FINDINGS }),
+    (f) => agent('Review ' + f + ' for bugs. Return issues.', { phase: 'Review', schema: FINDINGS, contextDiff: true }),
     (r, f) => r && parallel(r.issues.map((i) => () => agent('Verify in ' + f + ': ' + i, { phase: 'Verify' }))),
   )
-  return { verified: results.flat().filter(Boolean) }`;
+  return { verified: results.flat().filter(Boolean) }
+
+## Fix-and-verify example (verifyDiff)
+
+  export const meta = { name: 'fix', description: 'Fix files, verify each lands on disk' }
+  const fixed = await parallel(args.files.map((f) =>
+    () => agent('Fix the failing tests in ' + f + '.', { label: 'fix ' + f, verifyDiff: { check: 'bun test ' + f } }),
+  ))
+  return { fixed: fixed.filter(Boolean) }`;
 
 export function createWorkflowTool(
 	engine: WorkflowEngine,
@@ -357,7 +365,14 @@ export function createWorkflowTool(
 				}
 				source = loaded.source;
 			} else if (scriptPath !== undefined) {
-				const abs = joinPath(directory, scriptPath);
+				// An absolute path (the exact path the launch message returns) loads
+				// verbatim; a relative path resolves under the project directory (Epic
+				// 1.2). `joinPath` strips a leading `/`, so without this guard an absolute
+				// path would be re-rooted under `directory` → ENOENT. POSIX-only by the
+				// `startsWith("/")` idiom, matching `resolve-source.ts`.
+				const abs = scriptPath.startsWith("/")
+					? scriptPath
+					: joinPath(directory, scriptPath);
 				try {
 					source = await fs.readFile(abs, "utf-8");
 				} catch (err) {
@@ -371,7 +386,11 @@ export function createWorkflowTool(
 			try {
 				result = await engine.startRun({
 					source,
-					args: argsResult.value,
+					// Spread `args` ONLY when present (Epic 1.1): the engine inherits the
+					// prior run's persisted args on resume via `"args" in args`, so passing
+					// `args: undefined` unconditionally would always set the key and defeat
+					// inheritance. An explicit value still overrides the prior.
+					...(argsResult.value !== undefined ? { args: argsResult.value } : {}),
 					parentSessionID: context.sessionID,
 					...(resumeFrom !== undefined ? { resumeFromRunId: resumeFrom } : {}),
 					...(budgetTokens !== undefined ? { budgetTokens } : {}),

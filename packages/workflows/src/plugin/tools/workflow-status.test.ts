@@ -773,6 +773,63 @@ describe("createWorkflowStatusTool — live elapsed + counts (Task 6.2.1)", () =
 		expect(out).not.toContain("running ");
 		expect(out).not.toContain(" running / ");
 	});
+
+	test("a recovered run with rehydrated record.agents renders the real per-agent table (Phase 3.2.3)", async () => {
+		// 3.2.2 rehydrates record.agents from the feed at recovery time. This locks the
+		// contract that landing data on record.agents surfaces through the existing
+		// settledAgentRows render — with progress:[] and no now/settled/budget views.
+		const agents: AgentSummary[] = [
+			{
+				label: "writer",
+				phase: "draft",
+				sessionID: "ses_w",
+				model: "claude-x",
+				agentType: "build",
+				status: "completed",
+				toolCalls: 2,
+				durationMs: 6_000,
+				tokens: {
+					input: 100,
+					output: 200,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+			},
+			{ label: "verify", phase: "review", status: "cached" },
+		];
+		const handle: RunHandle = {
+			record: makeRecord({
+				id: "wf_rehy0001",
+				status: "error",
+				completedAt: 2_000,
+				error:
+					"interrupted by restart — agents may have mutated the working tree " +
+					"before the interrupt; inspect `git status` before resume or relaunch",
+				agentCount: 2,
+				agents,
+			}),
+			progress: [],
+		};
+		const engine = fakeEngine([handle]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_rehy0001" }, ctx());
+
+		// The real per-agent table renders from record.agents: both labels + phases.
+		expect(out).toContain("writer");
+		expect(out).toContain("verify");
+		expect(out).toContain("draft");
+		expect(out).toContain("review");
+		// Recovery invariants preserved: the error string renders, no elapsed header,
+		// no live-counts line.
+		expect(out).toContain("interrupted by restart");
+		expect(out).not.toContain("running ");
+		expect(out).not.toContain(" running / ");
+		// Under option (a): the terminal cached/live tally line is PRESENT and reads
+		// 0/0 (handle.progress is empty for a recovered run — the per-agent TABLE is the
+		// operator-meaningful artifact, the one-liner is a resume-efficiency stat).
+		expect(out).toContain("0 cached / 0 live agent calls");
+	});
 });
 
 describe("createWorkflowStatusTool — live TUI title during wait_ms (Task 6.2.3)", () => {
@@ -1103,9 +1160,55 @@ describe("createWorkflowStatusTool — CC-style agent tree, LIVE run (Task 8.1.5
 		expect(out).toContain("impl:a");
 		expect(out).toContain("opus-4-8");
 		expect(out).not.toContain("anthropic/"); // provider prefix stripped
-		expect(out).toContain("112.7k tok"); // 100000 + 12700 = 112700
+		// Epic 1.3: input → output+reasoning split, not one flattened total.
+		expect(out).toContain("100.0k→12.7k tok"); // input 100000 → out+reason 12700
 		expect(out).toContain("51 tools");
 		expect(out).toContain("7m 8s"); // 428000ms
+	});
+
+	test("renders the input→output token split (Epic 1.3), not a flattened total", async () => {
+		const progress = enriched([
+			{ type: "agent:start", label: "ctx", phase: "Load", at: 1_000 },
+			{
+				type: "agent:launched",
+				label: "ctx",
+				phase: "Load",
+				sessionID: "ses_ctx",
+				model: "anthropic/claude-opus-4-8",
+				at: 1_010,
+			},
+			{
+				type: "agent:end",
+				label: "ctx",
+				status: "completed",
+				sessionID: "ses_ctx",
+				at: 9_010,
+				durationMs: 8_000,
+				// Big input (repeated context-loading), small output — the #8 case the
+				// split exists to make legible.
+				tokens: {
+					input: 950_000,
+					output: 4_000,
+					reasoning: 1_000,
+					cacheRead: 200_000,
+					cacheWrite: 0,
+				},
+				toolCalls: 2,
+				model: "anthropic/claude-opus-4-8",
+			} as EnrichedProgressEvent,
+		]);
+		const handle: RunHandle = {
+			record: makeRecord({ id: "wf_split001", createdAt: 1_000 }),
+			progress,
+			now: () => 20_000,
+		};
+		const engine = fakeEngineWithStats([handle], {});
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_split001" }, ctx());
+		// 950k input → 5k output+reasoning; cache is excluded from the split.
+		expect(out).toContain("950.0k→5.0k tok");
+		// The old flattened total (1.1M) must NOT appear as the token segment.
+		expect(out).not.toContain("1.2M tok");
 	});
 
 	test("a running agent pulls live token/tool numbers from the engine snapshot", async () => {
@@ -1141,8 +1244,8 @@ describe("createWorkflowStatusTool — CC-style agent tree, LIVE run (Task 8.1.5
 		});
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_tree0002" }, ctx());
-		// 40000 + 2000 = 42000 → "42.0k"; live tool count from the snapshot.
-		expect(out).toContain("42.0k tok");
+		// Epic 1.3 split: 40000 input → 2000 output; live tool count from the snapshot.
+		expect(out).toContain("40.0k→2.0k tok");
 		expect(out).toContain("7 tools");
 		expect(out).toContain("live:b");
 	});
@@ -1283,14 +1386,14 @@ describe("createWorkflowStatusTool — CC-style agent tree, LIVE run (Task 8.1.5
 
 		// Both occurrences appear as distinct rows under the phase (2 total, 0 done).
 		expect(out).toMatch(/Fan\s+0\/2/);
-		// First occurrence: opus model + ses_1 live stats (31000 → 31.0k, 5 tools).
+		// First occurrence: opus model + ses_1 split (30k input → 1k output, 5 tools).
 		expect(out).toContain("opus-4-8");
-		expect(out).toContain("31.0k tok");
+		expect(out).toContain("30.0k→1.0k tok");
 		expect(out).toContain("5 tools");
-		// Second occurrence: haiku model + ses_2 live stats (7500 → 7.5k, 2 tools) —
-		// NOT a duplicate of the first row's model/stats.
+		// Second occurrence: haiku model + ses_2 split (7k input → 500 output, 2 tools)
+		// — NOT a duplicate of the first row's model/stats.
 		expect(out).toContain("haiku-4-5");
-		expect(out).toContain("7.5k tok");
+		expect(out).toContain("7.0k→500 tok");
 		expect(out).toContain("2 tools");
 	});
 });
@@ -1343,7 +1446,8 @@ describe("createWorkflowStatusTool — CC-style agent tree, SETTLED run (Task 8.
 		expect(out).toMatch(/Implement\s+2\/2/);
 		expect(out).toContain("impl:kadm-leaf");
 		expect(out).toContain("opus-4-8");
-		expect(out).toContain("112.7k tok");
+		// Epic 1.3 split, rendered from RunRecord.agents after restart.
+		expect(out).toContain("100.0k→12.7k tok");
 		expect(out).toContain("51 tools");
 		expect(out).toContain("7m 8s");
 		// The cached sibling renders `cached`, no stats.

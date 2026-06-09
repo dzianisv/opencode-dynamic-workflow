@@ -20,6 +20,7 @@ import {
 	type AgentDiagnostic,
 	BudgetExhaustedError,
 	type BudgetView,
+	type IntentJournalEntry,
 	type JournalEntry,
 	type ProgressEvent,
 } from "./types";
@@ -191,9 +192,21 @@ interface HarnessOverrides {
 	replay?: {
 		entries: JournalEntry[];
 		onRecord: (e: JournalEntry) => void;
+		onIntent?: (e: IntentJournalEntry) => Promise<void> | void;
 	};
 	callIndex?: { value: number };
 	onDiagnostic?: (d: AgentDiagnostic) => void;
+	awaitCheckpointClear?: () => Promise<void>;
+	resolveContextDiff?: () => Promise<{
+		text: string;
+		isEmpty: boolean;
+		available: boolean;
+	}>;
+	verifyResult?: (opts: {
+		verifyDiff: boolean | { check?: string };
+		sessionId?: string;
+	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
+	directory?: string;
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -222,6 +235,18 @@ function harness(overrides: HarnessOverrides = {}) {
 		callIndex,
 		onDiagnostic:
 			overrides.onDiagnostic ?? ((d: AgentDiagnostic) => diags.push(d)),
+		...(overrides.awaitCheckpointClear !== undefined
+			? { awaitCheckpointClear: overrides.awaitCheckpointClear }
+			: {}),
+		...(overrides.resolveContextDiff !== undefined
+			? { resolveContextDiff: overrides.resolveContextDiff }
+			: {}),
+		...(overrides.verifyResult !== undefined
+			? { verifyResult: overrides.verifyResult }
+			: {}),
+		...(overrides.directory !== undefined
+			? { directory: overrides.directory }
+			: {}),
 	});
 	return {
 		agent,
@@ -353,6 +378,20 @@ describe("createAgentPrimitive — structured output (schema)", () => {
 		// Prompt carries the schema-instruction suffix.
 		expect(launch?.prompt).toContain("structured_output");
 		expect(launch?.prompt).toContain(JSON.stringify(SCHEMA));
+	});
+
+	test("deps.directory forwards onto runner.launch (Epic H.1 inert seam)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent } = harness({ runner, directory: "/tmp/wt-abc" });
+		await agent("do it");
+		expect(runner.launches[0]?.directory).toBe("/tmp/wt-abc");
+	});
+
+	test("absent deps.directory leaves runner.launch directory undefined", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent } = harness({ runner });
+		await agent("do it");
+		expect(runner.launches[0]?.directory).toBeUndefined();
 	});
 
 	test("resolves the stored object when a result is present", async () => {
@@ -787,12 +826,387 @@ describe("createAgentPrimitive — launch wiring and live tasks", () => {
 		expect(liveTasks.size).toBe(0);
 	});
 
-	test("isolation:worktree emits a warn but still runs", async () => {
+	test("isolation:worktree fails loud: degrades to null, warns + diagnoses, never launches (Epic 0.4)", async () => {
 		const runner = new FakeRunner({ summaryText: "OK" });
-		const { agent, events } = harness({ runner });
-		expect(await agent("p", { isolation: "worktree" })).toBe("OK");
-		expect(events.some((e) => e.type === "warn")).toBe(true);
+		const { agent, events, diags } = harness({ runner });
+
+		// The agent degrades to null rather than running unisolated.
+		expect(await agent("p", { isolation: "worktree" })).toBeNull();
+
+		// Loud on the progress stream: a warn naming the unsupported isolation, and a
+		// visible start/end pair with status error (no silent vanish).
+		const warn = events.find((e) => e.type === "warn");
+		expect(warn).toBeDefined();
+		expect((warn as { message: string }).message).toContain("worktree");
+		const end = events.find((e) => e.type === "agent:end");
+		expect((end as { status: string }).status).toBe("error");
+		expect((end as { note?: string }).note).toContain("isolation_unsupported");
+
+		// A typed post-mortem diagnostic is recorded.
+		expect(diags).toHaveLength(1);
+		expect(diags[0]?.reason).toBe("isolation_unsupported");
+
+		// Crucially: NO child session was launched (it did not run unisolated), and
+		// no agent:launched event was emitted before the degrade.
+		expect(runner.launches.length).toBe(0);
+		expect(events.some((e) => e.type === "agent:launched")).toBe(false);
+	});
+
+	test("a worktree request does NOT detonate its parallel() batch — a sibling completes (Epic 0.4)", async () => {
+		const runner = new FakeRunner({ summaryText: "SIBLING_OK" });
+		const { agent } = harness({ runner });
+
+		// Both run in the same batch (degrade, don't detonate): the worktree request
+		// resolves null, the sibling resolves its real result — neither rejects.
+		const [bad, good] = await Promise.all([
+			agent("needs-isolation", { isolation: "worktree" }),
+			agent("plain-sibling"),
+		]);
+		expect(bad).toBeNull();
+		expect(good).toBe("SIBLING_OK");
+	});
+});
+
+// ---- Task 2.1.5: pre-launch checkpoint barrier ---------------------------
+
+describe("createAgentPrimitive — awaitCheckpointClear barrier (Task 2.1.5)", () => {
+	test("the barrier blocks runner.launch until it resolves (commit-before-next-unit)", async () => {
+		const runner = new FakeRunner({ summaryText: "OK" });
+		// A controllable deferred barrier: launch must NOT fire until release() runs.
+		let release!: () => void;
+		const barrier = new Promise<void>((r) => {
+			release = r;
+		});
+		const { agent } = harness({
+			runner,
+			awaitCheckpointClear: () => barrier,
+		});
+
+		const call = agent("p");
+		// Drain microtasks: the call has passed gate.acquire and is parked on the
+		// barrier — it must NOT have launched yet.
+		await flush();
+		expect(runner.launches.length).toBe(0);
+
+		// Releasing the barrier lets the launch proceed.
+		release();
+		expect(await call).toBe("OK");
 		expect(runner.launches.length).toBe(1);
+	});
+
+	test("absent barrier → launch proceeds immediately (optional, existing tests green)", async () => {
+		const runner = new FakeRunner({ summaryText: "OK" });
+		const { agent } = harness({ runner });
+		expect(await agent("p")).toBe("OK");
+		expect(runner.launches.length).toBe(1);
+	});
+
+	test("the barrier is awaited AFTER gate.acquire, not before (it holds a slot while draining)", async () => {
+		// A limit-1 gate. The barrier resolves immediately; correctness here is just
+		// that the call completes and releases the slot for a second call.
+		const gate = new ConcurrencyManager({ defaultConcurrency: 1 });
+		const runner = new FakeRunner({ summaryText: "OK" });
+		let cleared = 0;
+		const { agent } = harness({
+			runner,
+			gate,
+			awaitCheckpointClear: async () => {
+				cleared += 1;
+			},
+		});
+		expect(await agent("a")).toBe("OK");
+		expect(await agent("b")).toBe("OK");
+		// The barrier was consulted on each launch.
+		expect(cleared).toBe(2);
+		expect(gate.runningCount("run-1")).toBe(0);
+	});
+});
+
+// ---- Epic 4.1: contextDiff injection + empty-diff refusal -----------------
+
+describe("createAgentPrimitive — contextDiff injection (Task 4.1.2)", () => {
+	const okDiff = (text: string) => async () => ({
+		text,
+		isEmpty: text.trim().length === 0,
+		available: true,
+	});
+
+	test("contextDiff:true + non-empty diff → launches with a synthetic contextPart carrying the diff", async () => {
+		const runner = new FakeRunner({ summaryText: "REVIEWED" });
+		const { agent } = harness({
+			runner,
+			resolveContextDiff: okDiff("diff --git a/x b/x\n+line"),
+		});
+		expect(await agent("review the unit", { contextDiff: true })).toBe(
+			"REVIEWED",
+		);
+		const launch = runner.launches[0];
+		expect(launch?.contextParts).toEqual([
+			{ type: "text", text: "diff --git a/x b/x\n+line", synthetic: true },
+		]);
+	});
+
+	test("computeCallKey is byte-identical with and without contextDiff (replay identity stable)", async () => {
+		const a = computeCallKey({ prompt: "review the unit" });
+		// The key the live path computes for a contextDiff call must match a plain call:
+		// contextDiff is NOT a CallKeyInput field, and the diff rides a contextPart, not
+		// the prompt. Assert via the journaled key.
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ summaryText: "R" });
+		const { agent } = harness({
+			runner,
+			resolveContextDiff: okDiff("some diff"),
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		await agent("review the unit", { contextDiff: true });
+		expect(recorded[0]?.key).toBe(a);
+	});
+
+	test("contextDiff falsy → no diff part, resolveContextDiff never consulted", async () => {
+		let consulted = false;
+		const runner = new FakeRunner({ summaryText: "R" });
+		const { agent } = harness({
+			runner,
+			resolveContextDiff: async () => {
+				consulted = true;
+				return { text: "d", isEmpty: false, available: true };
+			},
+		});
+		await agent("plain call");
+		expect(consulted).toBe(false);
+		expect(runner.launches[0]?.contextParts).toBeUndefined();
+	});
+
+	test("resolveContextDiff absent (standalone lib) → contextDiff:true behaves as today, no diff part", async () => {
+		const runner = new FakeRunner({ summaryText: "R" });
+		const { agent } = harness({ runner });
+		expect(await agent("review", { contextDiff: true })).toBe("R");
+		expect(runner.launches[0]?.contextParts).toBeUndefined();
+	});
+
+	test("a rejecting resolveContextDiff is fenced → launches with NO diff part, never throws", async () => {
+		const runner = new FakeRunner({ summaryText: "R" });
+		const { agent } = harness({
+			runner,
+			resolveContextDiff: async () => {
+				throw new Error("git blew up");
+			},
+		});
+		expect(await agent("review", { contextDiff: true })).toBe("R");
+		expect(runner.launches[0]?.contextParts).toBeUndefined();
+	});
+});
+
+describe("createAgentPrimitive — empty-diff refusal (Task 4.1.3)", () => {
+	test("contextDiff:true + available + empty diff → refuses (null, diagnostic, no launch)", async () => {
+		const runner = new FakeRunner({ summaryText: "SHOULD NOT RUN" });
+		const { agent, events, diags } = harness({
+			runner,
+			resolveContextDiff: async () => ({
+				text: "",
+				isEmpty: true,
+				available: true,
+			}),
+		});
+		expect(await agent("review the unit", { contextDiff: true })).toBeNull();
+		// Did NOT launch.
+		expect(runner.launches.length).toBe(0);
+		// Emitted the degrade lifecycle: warn + start + end(error, note~='empty diff').
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+		expect(events.some((e) => e.type === "agent:start")).toBe(true);
+		const end = events.find((e) => e.type === "agent:end") as Extract<
+			ProgressEvent,
+			{ type: "agent:end" }
+		>;
+		expect(end.status).toBe("error");
+		expect(end.note).toContain("empty diff");
+		// Fired the typed diagnostic.
+		expect(diags.some((d) => d.reason === "empty_diff")).toBe(true);
+	});
+
+	test("contextDiff:true + non-empty diff → launches normally (no refusal)", async () => {
+		const runner = new FakeRunner({ summaryText: "REVIEWED" });
+		const { agent, diags } = harness({
+			runner,
+			resolveContextDiff: async () => ({
+				text: "real diff",
+				isEmpty: false,
+				available: true,
+			}),
+		});
+		expect(await agent("review", { contextDiff: true })).toBe("REVIEWED");
+		expect(runner.launches.length).toBe(1);
+		expect(diags.some((d) => d.reason === "empty_diff")).toBe(false);
+	});
+
+	test("contextDiff:true + available:false (no shell / non-git) → launches normally, does NOT refuse", async () => {
+		const runner = new FakeRunner({ summaryText: "REVIEWED" });
+		const { agent, diags } = harness({
+			runner,
+			resolveContextDiff: async () => ({
+				text: "",
+				isEmpty: true,
+				available: false,
+			}),
+		});
+		// Emptiness is UNPROVABLE without git → run the review, inject NO diff part.
+		expect(await agent("review", { contextDiff: true })).toBe("REVIEWED");
+		expect(runner.launches.length).toBe(1);
+		expect(runner.launches[0]?.contextParts).toBeUndefined();
+		expect(diags.some((d) => d.reason === "empty_diff")).toBe(false);
+	});
+
+	test("a refused review does not hold a gate slot (a sibling still completes)", async () => {
+		// A limit-1 gate: if the refusal leaked a held slot, the second call would hang.
+		const gate = new ConcurrencyManager({ defaultConcurrency: 1 });
+		const runner = new FakeRunner({ summaryText: "OK" });
+		const { agent } = harness({
+			runner,
+			gate,
+			resolveContextDiff: async () => ({
+				text: "",
+				isEmpty: true,
+				available: true,
+			}),
+		});
+		expect(await agent("refused", { contextDiff: true })).toBeNull();
+		// The slot is free → a normal call (no contextDiff) launches and completes.
+		expect(await agent("sibling")).toBe("OK");
+		expect(gate.runningCount("run-1")).toBe(0);
+	});
+});
+
+// ---- Epic 4.2: verifyDiff post-condition downgrade ------------------------
+
+describe("createAgentPrimitive — verifyDiff downgrade (Task 4.2.2)", () => {
+	test("verifyDiff:true that settles non-null but FAILS verify → downgrades to null, not journaled", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent, events, diags } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+			verifyResult: async () => ({
+				passed: false,
+				available: true,
+				reason: "empty git diff",
+			}),
+		});
+		expect(await agent("fix the bug", { verifyDiff: true })).toBeNull();
+		// The agent DID launch and settle (verify is post-settle).
+		expect(runner.launches.length).toBe(1);
+		// Downgraded result is NOT journaled (re-runs on resume).
+		expect(recorded).toEqual([]);
+		// agent:end carries a verify note + a typed diagnostic fires.
+		const end = events.find((e) => e.type === "agent:end") as Extract<
+			ProgressEvent,
+			{ type: "agent:end" }
+		>;
+		expect(end.note).toContain("verify_failed");
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(true);
+	});
+
+	test("verifyDiff:{check:'false'} (exit != 0) → same downgrade", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent, diags } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+			verifyResult: async (o) => ({
+				passed:
+					typeof o.verifyDiff === "object" && o.verifyDiff.check === "true",
+				available: true,
+			}),
+		});
+		expect(
+			await agent("fix it", { verifyDiff: { check: "false" } }),
+		).toBeNull();
+		expect(recorded).toEqual([]);
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(true);
+	});
+
+	test("verifyDiff:{check:'true'} (exit 0) → result preserved + journaled", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent, diags } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+			verifyResult: async (o) => ({
+				passed:
+					typeof o.verifyDiff === "object" && o.verifyDiff.check === "true",
+				available: true,
+			}),
+		});
+		expect(await agent("fix it", { verifyDiff: { check: "true" } })).toBe(
+			"DONE",
+		);
+		expect(recorded.length).toBe(1);
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(false);
+	});
+
+	test("available:false (no shell / non-git) → result passes through unchanged, no fabricated failure", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent, diags } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+			verifyResult: async () => ({ passed: false, available: false }),
+		});
+		// available:false → the check is inert; the result survives even though passed
+		// is false (we cannot PROVE a failure without git).
+		expect(await agent("fix it", { verifyDiff: true })).toBe("DONE");
+		expect(recorded.length).toBe(1);
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(false);
+	});
+
+	test("verifyResult absent → verifyDiff:true behaves as today (no downgrade)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent } = harness({ runner });
+		expect(await agent("fix it", { verifyDiff: true })).toBe("DONE");
+	});
+
+	test("verifyDiff unset → verifyResult never consulted", async () => {
+		let consulted = false;
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent } = harness({
+			runner,
+			verifyResult: async () => {
+				consulted = true;
+				return { passed: true, available: true };
+			},
+		});
+		expect(await agent("fix it")).toBe("DONE");
+		expect(consulted).toBe(false);
+	});
+
+	test("a thrown verify check is fenced → result passes through (no thrown agent())", async () => {
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "DONE" });
+		const { agent, diags } = harness({
+			runner,
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+			verifyResult: async () => {
+				throw new Error("shell exploded");
+			},
+		});
+		// A thrown verify degrades to available:false pass-through, never a thrown agent.
+		expect(await agent("fix it", { verifyDiff: true })).toBe("DONE");
+		expect(recorded.length).toBe(1);
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(false);
+	});
+
+	test("a null-settling agent (failed) is not re-verified (verify only runs on non-null)", async () => {
+		let consulted = false;
+		const runner = new FakeRunner({ status: "error" });
+		const { agent } = harness({
+			runner,
+			verifyResult: async () => {
+				consulted = true;
+				return { passed: true, available: true };
+			},
+		});
+		expect(await agent("fix it", { verifyDiff: true })).toBeNull();
+		// Nothing on disk to verify when the agent itself degraded to null.
+		expect(consulted).toBe(false);
 	});
 });
 
@@ -839,7 +1253,8 @@ describe("createAgentPrimitive — live path records non-null results", () => {
 		const out = await agent("prompt", { schema: SCHEMA });
 		expect(out).toEqual({ n: 5 });
 		expect(recorded.length).toBe(1);
-		expect(recorded[0]?.result).toEqual({ n: 5 });
+		const settled = recorded[0];
+		expect(settled?.status === "ok" && settled.result).toEqual({ n: 5 });
 	});
 
 	test("a null result (failed agent) is NOT journaled", async () => {
@@ -1081,6 +1496,124 @@ describe("createAgentPrimitive — cached replay path (key + occurrence, Task 7.
 		expect(await agent("a")).toBe("cached-a"); // key present → cached
 		expect(await agent("never-journaled")).toBe("LIVE"); // absent key → live
 		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+});
+
+// ---- Phase 3.1.2: write-ahead intent + replay-cache poison guard ----------
+
+describe("createAgentPrimitive — write-ahead intent (Phase 3)", () => {
+	test("a live call AWAITS the intent write BEFORE launch (durability)", async () => {
+		// onIntent resolves only after we release it; launch must not have happened
+		// while the intent is still pending — proving the await sits before dispatch.
+		let releaseIntent: (() => void) | undefined;
+		const intentGate = new Promise<void>((res) => {
+			releaseIntent = res;
+		});
+		const intents: IntentJournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const { agent } = harness({
+			runner,
+			replay: {
+				entries: [],
+				onRecord: () => {},
+				onIntent: async (e) => {
+					intents.push(e);
+					await intentGate;
+				},
+			},
+		});
+		const pending = agent("do work", { label: "L" });
+		await flush();
+		// Intent was emitted, but launch is still blocked behind the intent await.
+		expect(intents).toHaveLength(1);
+		expect(intents[0]).toEqual({
+			index: 0,
+			key: computeCallKey({ prompt: "do work", label: "L" }),
+			status: "intent",
+			label: "L",
+		});
+		expect((runner as FakeRunner).launches.length).toBe(0);
+		// Release the intent → the launch proceeds and the call settles.
+		releaseIntent?.();
+		expect(await pending).toBe("LIVE");
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("a cached replay writes NO intent (it never launches)", async () => {
+		const intents: IntentJournalEntry[] = [];
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const { agent } = harness({
+			runner,
+			replay: {
+				entries: [
+					{
+						index: 0,
+						key: computeCallKey({ prompt: "a" }),
+						status: "ok",
+						result: "cached-a",
+					},
+				],
+				onRecord: () => {},
+				onIntent: (e) => {
+					intents.push(e);
+				},
+			},
+		});
+		expect(await agent("a")).toBe("cached-a");
+		expect(intents).toHaveLength(0);
+		expect((runner as FakeRunner).launches.length).toBe(0);
+	});
+
+	test("a throwing onIntent degrades to launch-anyway (fenced, never detonates)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const { agent } = harness({
+			runner,
+			replay: {
+				entries: [],
+				onRecord: () => {},
+				onIntent: () => {
+					throw new Error("journal append failed");
+				},
+			},
+		});
+		// The intent append blew up; the call must still launch and resolve.
+		expect(await agent("do work")).toBe("LIVE");
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("an intent in replay.entries is excluded from byKey — a resumed call runs LIVE", async () => {
+		// HIGH-BLAST guard (3.1.2): a crashed prior run's intent line carries no
+		// result. If it entered the key's replay queue, a resumed call would shift it
+		// and replay garbage. The filter keeps it out → the call runs live.
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const key = computeCallKey({ prompt: "K" });
+		const entries: JournalEntry[] = [
+			{ index: 0, key, status: "intent", label: "K" },
+		];
+		const { agent } = harness({
+			runner,
+			replay: { entries, onRecord: () => {}, onIntent: () => {} },
+		});
+		expect(await agent("K")).toBe("LIVE");
+		expect((runner as FakeRunner).launches.length).toBe(1);
+	});
+
+	test("an intent before its settled completion does NOT consume the settled queue slot", async () => {
+		// A resumed run's OWN journal interleaves intent + ok for the same key. The
+		// settled `ok` must still replay; the intent must not occupy the occurrence
+		// slot (else the call would run live and re-do settled work).
+		const runner = new FakeRunner({ status: "completed", summaryText: "LIVE" });
+		const key = computeCallKey({ prompt: "K" });
+		const entries: JournalEntry[] = [
+			{ index: 0, key, status: "intent", label: "K" },
+			{ index: 0, key, status: "ok", result: "settled-K" },
+		];
+		const { agent } = harness({
+			runner,
+			replay: { entries, onRecord: () => {}, onIntent: () => {} },
+		});
+		expect(await agent("K")).toBe("settled-K");
+		expect((runner as FakeRunner).launches.length).toBe(0);
 	});
 });
 
