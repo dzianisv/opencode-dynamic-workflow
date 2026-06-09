@@ -1,3 +1,11 @@
+# [1.2.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.1.0...v1.2.0) (2026-06-09)
+
+
+### Features
+
+* **core:** add per-launch directory query for worktree isolation ([b536347](https://github.com/fredcamaral/opencode-drawers/commit/b5363476c551394e6ce63837b737437cfe2b60d0))
+* **workflows:** harden workflow runtime with git checkpointing, deny hooks, and TUI improvements ([f976661](https://github.com/fredcamaral/opencode-drawers/commit/f9766613d8514e7a448b948dd23340866b2365a3))
+
 # [1.1.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.0.0...v1.1.0) (2026-06-08)
 
 
