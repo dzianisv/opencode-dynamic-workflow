@@ -33,6 +33,7 @@ import {
 	NestingError,
 	type ProgressEmitter,
 	type ProgressEvent,
+	type SettledJournalEntry,
 	type WorkflowFn,
 } from "./types";
 
@@ -77,8 +78,15 @@ export interface SubWorkflowDeps {
 	/**
 	 * Deterministic-resume seam (spec §7/§8). When present, a matching boundary key
 	 * at this index replays the journaled child result; every live boundary records.
+	 * Intent entries (Phase 3) are never replayed — they are filtered out of the
+	 * per-key cache below (a `workflow()` boundary writes no intent, but a crashed
+	 * prior run's agent intents share this `entries` array, so the guard holds here
+	 * too).
 	 */
-	replay?: { entries: JournalEntry[]; onRecord: (e: JournalEntry) => void };
+	replay?: {
+		entries: JournalEntry[];
+		onRecord: (e: SettledJournalEntry) => void;
+	};
 }
 
 /** A short display name for the child, from a name string or a `{ scriptPath }`. */
@@ -118,9 +126,17 @@ export function createSubWorkflowPrimitive(deps: SubWorkflowDeps): WorkflowFn {
 	// position-independent — editing one boundary no longer voids later unchanged
 	// ones (field finding R4). Entries queue in journal-file (completion) order;
 	// for byte-identical boundaries the cached child results are interchangeable.
-	const byKey = new Map<string, JournalEntry[]>();
+	//
+	// Phase 3: skip non-settled (intent) entries — identical to agent-call.ts. A
+	// boundary never writes an intent, but the shared `entries` array can carry a
+	// crashed prior run's agent intents, so the same `status !== "ok"` filter keeps
+	// the boundary's queue settled-only (the resolveResume load-filter is primary).
+	const byKey = new Map<string, SettledJournalEntry[]>();
 	if (replay !== undefined) {
 		for (const entry of replay.entries) {
+			if (entry.status !== "ok") {
+				continue;
+			}
 			const queue = byKey.get(entry.key);
 			if (queue === undefined) {
 				byKey.set(entry.key, [entry]);

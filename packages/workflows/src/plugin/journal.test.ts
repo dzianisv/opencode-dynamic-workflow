@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JournalEntry } from "../runtime/types";
+import type { IntentJournalEntry, JournalEntry } from "../runtime/types";
 import { computeCallKey, createJournal, type JournalFs } from "./journal";
 
 // ---- helpers --------------------------------------------------------------
@@ -30,6 +30,17 @@ function makeLogger() {
 
 function entry(over: Partial<JournalEntry> = {}): JournalEntry {
 	return { index: 0, key: "k0", status: "ok", result: "r0", ...over };
+}
+
+/**
+ * A write-ahead intent entry (Phase 3). A sibling of {@link entry} rather than a
+ * `Partial<JournalEntry>` overload: after the union, a Partial distributes over
+ * both members and the spread no longer narrows to one cleanly.
+ */
+function intentEntry(
+	over: Partial<IntentJournalEntry> = {},
+): IntentJournalEntry {
+	return { index: 0, key: "k0", status: "intent", ...over };
 }
 
 // ---- computeCallKey -------------------------------------------------------
@@ -176,6 +187,63 @@ describe("createJournal", () => {
 			expect(lines.length).toBe(2);
 			const parsed = lines.map((l) => JSON.parse(l));
 			expect(parsed.map((p) => p.index).sort()).toEqual([0, 1]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	// ---- Phase 3: write-ahead intent records ----------------------------------
+
+	test("an intent entry round-trips through record/load intact", async () => {
+		const { path, dir } = await tmpFile();
+		try {
+			const j = createJournal({ path });
+			await j.record(intentEntry({ index: 0, key: "k0", label: "do work" }));
+			const loaded = await j.load();
+			expect(loaded).toEqual([
+				{ index: 0, key: "k0", status: "intent", label: "do work" },
+			]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an intent WITHOUT a matching completion is a valid line, NOT dropped as corruption", async () => {
+		// A crash leaves an intent with no `ok`. It is a fully-formed line, unlike a
+		// truncated final line — load() must retain it (any future validation must not
+		// treat a missing completion as corruption).
+		const { path, dir } = await tmpFile();
+		try {
+			const j = createJournal({ path });
+			await j.record(entry({ index: 0, key: "k0", result: "r0" }));
+			await j.record(
+				intentEntry({ index: 1, key: "k1", label: "interrupted" }),
+			);
+			const loaded = await j.load();
+			expect(loaded).toEqual([
+				{ index: 0, key: "k0", status: "ok", result: "r0" },
+				{ index: 1, key: "k1", status: "intent", label: "interrupted" },
+			]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a mixed journal loads both members; filtering to status==='ok' drops intents", async () => {
+		// The replay-cache-poison guard, asserted at the data level: a journal with a
+		// settled ok(0) and an intent(1) loads both, but the resume load-filter keeps
+		// only the settled entry — the intent never reaches the replay cache.
+		const { path, dir } = await tmpFile();
+		try {
+			const j = createJournal({ path });
+			await j.record(entry({ index: 0, key: "k0", result: "settled-0" }));
+			await j.record(intentEntry({ index: 1, key: "k1", label: "K1" }));
+			const loaded = await j.load();
+			expect(loaded).toHaveLength(2);
+			const settled = loaded.filter((e) => e.status === "ok");
+			expect(settled).toEqual([
+				{ index: 0, key: "k0", status: "ok", result: "settled-0" },
+			]);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

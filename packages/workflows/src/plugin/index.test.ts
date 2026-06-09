@@ -14,6 +14,7 @@ import {
 import type { Hooks } from "@opencode-ai/plugin";
 import { createWorkflowChatMessageHook } from "./digest-hook";
 import type { RunHandle, WorkflowEngine } from "./engine";
+import { createGitDenyHook } from "./git-deny-hook";
 import * as entry from "./index";
 import { WorkflowsPlugin } from "./index";
 
@@ -387,5 +388,92 @@ describe("workflows plugin entry — dispose wiring (Epic 8.2)", () => {
 		// a second call must remain safe (dispose is idempotent on a torn-down engine).
 		await hooks.dispose?.();
 		await hooks.dispose?.();
+	});
+
+	test("the factory wires a tool.execute.before deny hook", async () => {
+		const hooks = await WorkflowsPlugin({
+			client: fakeClient(),
+			directory: "/proj",
+			// biome-ignore lint/suspicious/noExplicitAny: PluginInput carries more than the factory reads.
+		} as any);
+		expect(typeof hooks["tool.execute.before"]).toBe("function");
+		await hooks.dispose?.();
+	});
+});
+
+// ---- Epic 0.3: deny destructive git on worker sessions ------------------
+//
+// The hook denies BY THROW (there is no `deny` field): when the Bash tool is run
+// by a LIVE worker session AND the command is destructive git, the throw surfaces
+// to the worker as a tool error ("you may not do this") while the turn survives.
+// The matcher (isDestructiveGit) is table-tested in git-deny.test.ts; here the
+// engine is faked so the worker/parent lineage is controllable.
+
+type ExecuteBeforeHook = NonNullable<Hooks["tool.execute.before"]>;
+
+/** Fake engine exposing only the lineage predicate the deny hook reads. */
+function denyEngine(workerIds: string[]): WorkflowEngine {
+	const live = new Set(workerIds);
+	return {
+		isWorkerSession: (id: string) => live.has(id),
+	} as unknown as WorkflowEngine;
+}
+
+function callBefore(
+	hook: ExecuteBeforeHook,
+	tool: string,
+	sessionID: string,
+	command: string,
+): Promise<void> {
+	return hook({ tool, sessionID, callID: "call_1" }, { args: { command } });
+}
+
+describe("createGitDenyHook — deny destructive git on workers (Epic 0.3)", () => {
+	const WORKER = "ses_worker";
+	const PARENT = "ses_parent";
+
+	test("(a) worker + `git restore .` → throws", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			callBefore(hook, "bash", WORKER, "git restore ."),
+		).rejects.toThrow(/destructive git/i);
+	});
+
+	test("(b) worker + `git checkout -- src/x.tsx` → throws", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			callBefore(hook, "bash", WORKER, "git checkout -- src/x.tsx"),
+		).rejects.toThrow(/destructive git/i);
+	});
+
+	test("(c) worker + `git commit -m x` → resolves", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			callBefore(hook, "bash", WORKER, "git commit -m x"),
+		).resolves.toBeUndefined();
+	});
+
+	test("(d) worker + `git checkout feature` → resolves", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			callBefore(hook, "bash", WORKER, "git checkout feature"),
+		).resolves.toBeUndefined();
+	});
+
+	test("(e) PARENT + `git restore .` → resolves", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			callBefore(hook, "bash", PARENT, "git restore ."),
+		).resolves.toBeUndefined();
+	});
+
+	test("(f) worker + tool='read' → resolves", async () => {
+		const hook = createGitDenyHook(denyEngine([WORKER]));
+		await expect(
+			hook(
+				{ tool: "read", sessionID: WORKER, callID: "call_1" },
+				{ args: { command: "git restore ." } },
+			),
+		).resolves.toBeUndefined();
 	});
 });

@@ -22,7 +22,7 @@
  * retention is out of scope for Task 8.1.2.
  */
 
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProgressEvent, StampedProgressEvent } from "../runtime/types";
 import type { SessionTokenSnapshot } from "./session-stats";
@@ -67,6 +67,15 @@ export interface RunStartLine {
 	 * alone (the prior behavior).
 	 */
 	phases?: string[];
+	/**
+	 * The workflow's human name from `meta.name` (Task 8.3.x) — the run's display
+	 * identity in the viewer header (so a glance reads "My Workflow", not the raw
+	 * `wf_…` id). Optional so OLD feeds (written before this field existed) parse and
+	 * reduce unchanged; a viewer then falls back to the runId. The engine always sets
+	 * it in practice — `extractName` falls back to `"workflow"` — so the absence is a
+	 * pure backward-compat concern, not a live one.
+	 */
+	name?: string;
 	at: number;
 }
 
@@ -118,17 +127,38 @@ export interface AgentStatsLine {
 }
 
 /**
+ * A per-agent checkpoint line (Epic 2.1) — FEED-ONLY, like {@link AgentStatsLine}
+ * (never pushed to `handle.progress`). The engine appends it after a live agent's
+ * `agent:end` commit lands, so a TUI viewer tailing the feed can later surface the
+ * forensic checkpoint (sha + the exact paths committed) without the engine widening
+ * the runtime progress vocabulary. Absent on cached/degraded ends (no commit) and on
+ * empty-diff or operator-refused checkpoints (`committed: false` → no line emitted).
+ */
+export interface AgentCheckpointLine {
+	type: "agent:checkpoint";
+	label: string;
+	sessionID: string;
+	/** The new commit sha the checkpoint created. */
+	sha?: string;
+	/** The exact pathspecs committed (workflow-touched, baseline-excluded). */
+	paths: string[];
+	at: number;
+}
+
+/**
  * One line in the feed file: an engine-stamped (and, for live `agent:end`,
- * enriched) progress event, one of the two run-lifecycle lines, or a throttled
- * per-agent stats line. Every member carries `at` (engine wall-clock), so a tail
- * reader can order by emission time without a separate timestamp column.
+ * enriched) progress event, one of the two run-lifecycle lines, a throttled
+ * per-agent stats line, or a per-agent checkpoint line. Every member carries `at`
+ * (engine wall-clock), so a tail reader can order by emission time without a
+ * separate timestamp column.
  */
 export type FeedEvent =
 	| EnrichedProgressEvent
 	| RunStartLine
 	| RunCancelRequestedLine
 	| RunEndLine
-	| AgentStatsLine;
+	| AgentStatsLine
+	| AgentCheckpointLine;
 
 /** The minimal fs surface the feed writer uses. Defaults to `node:fs/promises`. */
 export interface FeedFs {
@@ -217,4 +247,188 @@ export function createFeedWriter(opts: FeedWriterOptions): FeedWriter {
 	}
 
 	return { append, settled };
+}
+
+// ---- feed recovery counter (Phase 3.2.1) ----------------------------------
+
+/** The minimal read fs the recovery counter needs. Defaults to `node:fs/promises`. */
+export interface FeedReadFs {
+	readFile(path: string, enc: "utf-8"): Promise<string>;
+}
+
+const defaultReadFs: FeedReadFs = {
+	readFile: (path, enc) => readFile(path, enc),
+};
+
+/**
+ * A per-agent rollup reconstructed from a persisted feed (Phase 3.2). Structurally
+ * identical to the engine's `AgentSummary` so a recovered run's `record.agents`
+ * can be set directly from it — defined HERE (not imported from engine) to keep
+ * the dependency one-way (engine → feed), never a cycle.
+ */
+export interface FeedAgentSummary {
+	label: string;
+	phase?: string;
+	sessionID?: string;
+	model?: string;
+	agentType?: string;
+	status: string;
+	tokens?: SessionTokenSnapshot;
+	toolCalls?: number;
+	durationMs?: number;
+	note?: string;
+}
+
+/** The outcome counts a recovered run rehydrates from its feed (Phase 3.2.1). */
+export interface FeedCounts {
+	/** Total `agent:end` lines (every agent-call outcome). */
+	agentCount: number;
+	/** Live launches (`agent:end` with a status other than `cached`). */
+	live: number;
+	/** Replayed-from-journal calls (`agent:end` with status `cached`). */
+	cached: number;
+	/** Per-agent rollup, one entry per `agent:end`, in feed order. */
+	agents: FeedAgentSummary[];
+}
+
+/** The launch metadata carried from `agent:launched` to its matching `agent:end`. */
+interface FeedLaunchMeta {
+	phase?: string;
+	model?: string;
+	agentType?: string;
+}
+
+/**
+ * The enriched `agent:end` shape as the counter reads it. A narrow on
+ * `type === "agent:end"` collapses the plain stamped end and the enriched end to
+ * their COMMON fields (the enriched extras are optional members of only one arm),
+ * so the counter views a confirmed-enriched end through this alias to read the
+ * stats the engine wrote at the choke point. Mirrors the enrichment in
+ * {@link EnrichedProgressEvent}'s `agent:end` member.
+ */
+type EnrichedAgentEnd = Extract<ProgressEvent, { type: "agent:end" }> & {
+	durationMs?: number;
+	tokens?: SessionTokenSnapshot;
+	toolCalls?: number;
+	model?: string;
+	agentType?: string;
+};
+
+/**
+ * Tally agent-call outcomes from a persisted feed file (Phase 3.2.1). Used at
+ * engine recovery to rehydrate a crashed run's per-agent table from disk — the
+ * record itself carries no per-agent data on a real crash (persisted only at
+ * settle), so the feed is the only source of truth.
+ *
+ * MUST mirror the engine choke point's pairing: a LIVE `agent:end`'s phase lives
+ * on its `agent:launched` (NOT the enriched end), and a CACHED end's phase on its
+ * `agent:start` — so the reader walks and pairs start/launched → end to recover
+ * phase (and model/agentType). Direct-pairing on the end alone would collapse
+ * every recovered agent into the single `(no phase)` group.
+ *
+ * FENCED — recovery runs inside the engine's `readyPromise`, where a throw poisons
+ * startup for ALL runs. So: a missing file → empty result (mirrors journal.load's
+ * ENOENT→[]); a truncated FINAL line is dropped (crash mid-append); and — DIVERGING
+ * from journal.load, which throws on interior corruption — an interior bad line is
+ * dropped-and-continued. This function never throws.
+ */
+export async function readFeedCounts(
+	path: string,
+	fs: FeedReadFs = defaultReadFs,
+): Promise<FeedCounts> {
+	const empty: FeedCounts = { agentCount: 0, live: 0, cached: 0, agents: [] };
+
+	let raw: string;
+	try {
+		raw = await fs.readFile(path, "utf-8");
+	} catch {
+		// Missing/unreadable feed (ENOENT or a dead writer that wrote nothing) → 0/0.
+		return empty;
+	}
+
+	const lines = raw.split("\n").filter((l) => l.length > 0);
+	const events: FeedEvent[] = [];
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i] as string;
+		try {
+			events.push(JSON.parse(line) as FeedEvent);
+		} catch {
+			// A truncated FINAL line is a crash mid-append; an interior bad line is
+			// corruption. Both are dropped (recovery never throws) — unlike journal.load,
+			// which throws on interior lines (it runs on the resume path, not startup).
+		}
+	}
+
+	// Pair start/launched → end to recover phase + launch meta, exactly like the
+	// engine choke point. `startQueue` is a label-keyed FIFO so a CACHED end (no
+	// session) recovers its phase from the matching synchronous start.
+	const launchMeta = new Map<string, FeedLaunchMeta>();
+	const startQueue: Array<{ label: string; phase?: string }> = [];
+	const claimStartPhase = (label: string): string | undefined => {
+		const idx = startQueue.findIndex((s) => s.label === label);
+		if (idx === -1) {
+			return undefined;
+		}
+		const [claimed] = startQueue.splice(idx, 1);
+		return claimed?.phase;
+	};
+
+	const agents: FeedAgentSummary[] = [];
+	let live = 0;
+	let cached = 0;
+
+	for (const e of events) {
+		if (e.type === "agent:start") {
+			startQueue.push({ label: e.label, phase: e.phase });
+		} else if (e.type === "agent:launched") {
+			launchMeta.set(e.sessionID, {
+				phase: e.phase,
+				model: e.model,
+				agentType: e.agentType,
+			});
+			// The launched start is now live — drop it from the cached-start queue.
+			claimStartPhase(e.label);
+		} else if (e.type === "agent:end") {
+			if (e.sessionID !== undefined) {
+				// LIVE agent: phase/model/agentType from agent:launched; stats from the
+				// enriched end (it carries tokens/toolCalls/durationMs/model/agentType).
+				const end = e as EnrichedAgentEnd;
+				const meta = launchMeta.get(e.sessionID);
+				launchMeta.delete(e.sessionID);
+				const model = end.model ?? meta?.model;
+				const agentType = end.agentType ?? meta?.agentType;
+				agents.push({
+					label: e.label,
+					...(meta?.phase !== undefined ? { phase: meta.phase } : {}),
+					sessionID: e.sessionID,
+					...(model !== undefined ? { model } : {}),
+					...(agentType !== undefined ? { agentType } : {}),
+					status: e.status,
+					...(end.tokens !== undefined ? { tokens: end.tokens } : {}),
+					...(end.toolCalls !== undefined ? { toolCalls: end.toolCalls } : {}),
+					...(end.durationMs !== undefined
+						? { durationMs: end.durationMs }
+						: {}),
+					...(e.note !== undefined ? { note: e.note } : {}),
+				});
+				live += 1;
+			} else {
+				// CACHED / degraded-pre-launch end (no session): phase from the start.
+				const phase = claimStartPhase(e.label);
+				agents.push({
+					label: e.label,
+					...(phase !== undefined ? { phase } : {}),
+					status: e.status,
+					...(e.note !== undefined ? { note: e.note } : {}),
+				});
+				if (e.status === "cached") {
+					cached += 1;
+				} else {
+					live += 1;
+				}
+			}
+		}
+	}
+
+	return { agentCount: agents.length, live, cached, agents };
 }

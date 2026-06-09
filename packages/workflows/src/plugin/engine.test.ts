@@ -8,6 +8,7 @@ import { createStructuredOutputTool } from "../runtime/structured/tool";
 import { compileSchema } from "../runtime/structured/validate";
 import type { JournalEntry } from "../runtime/types";
 import { createWorkflowEngine } from "./engine";
+import type { FeedEvent } from "./feed";
 import { computeCallKey } from "./journal";
 
 /**
@@ -180,6 +181,849 @@ describe("createWorkflowEngine — startRun returns immediately", () => {
 		expect(handle.name).toBe("workflow");
 		const status = engine.statusOf("wf_bbbb2222");
 		expect(status?.record.description).toBe("workflow");
+
+		await engine.dispose();
+	});
+});
+
+// ---- Epic 2.1: the host BunShell ($) threads into the engine options --------
+
+/**
+ * A minimal tagged-template BunShell fake (Epic 2.1). The host `$` is a callable
+ * `(strings, ...exprs) => Promise<BunShellOutput>` plus chainable `.cwd()/.nothrow()`.
+ * This fake answers every `git` command with a canned success/empty output, and
+ * records the reconstructed command strings so a test can assert the git argv shape.
+ */
+function makeShell(
+	reply: (cmd: string) => {
+		stdout?: string;
+		stderr?: string;
+		exitCode?: number;
+	},
+) {
+	const commands: string[] = [];
+	const recon = (strings: TemplateStringsArray, exprs: unknown[]): string => {
+		let out = strings[0] ?? "";
+		for (let i = 0; i < exprs.length; i += 1) {
+			out += String(exprs[i]) + (strings[i + 1] ?? "");
+		}
+		return out.trim();
+	};
+	const shell = (strings: TemplateStringsArray, ...exprs: unknown[]) => {
+		const cmd = recon(strings, exprs);
+		commands.push(cmd);
+		const r = reply(cmd);
+		const text = r.stdout ?? "";
+		return Promise.resolve({
+			stdout: { toString: () => text },
+			stderr: { toString: () => r.stderr ?? "" },
+			exitCode: r.exitCode ?? 0,
+			text: () => text,
+		});
+	};
+	const chain = Object.assign(shell, {
+		cwd: () => chain,
+		nothrow: () => chain,
+		env: () => chain,
+		braces: (p: string) => [p],
+		escape: (s: string) => s,
+		throws: () => chain,
+	});
+	// biome-ignore lint/suspicious/noExplicitAny: structural BunShell fake.
+	return { shell: chain as any, commands };
+}
+
+/**
+ * A stateful git-repo fake (Epic 2.1) over the tagged-template BunShell. It models
+ * a single working tree: `dirty` is the set of currently-modified paths,
+ * `setDirty()` simulates an agent's edit, and `commits` records every checkpoint the
+ * engine makes (sha + the staged paths + the message). `commitGate`, when set, makes
+ * each `git commit` await a deferred so a test can prove the pre-launch barrier holds
+ * the NEXT agent until the PRIOR commit resolves — slow in MICROTASK terms (an awaited
+ * promise), never wall-clock, so the synchronous `flush()` can observe the block.
+ */
+function makeGitRepo(opts: { isRepo?: boolean } = {}) {
+	const isRepo = opts.isRepo ?? true;
+	const dirty = new Set<string>();
+	const commits: Array<{ sha: string; paths: string[]; message: string }> = [];
+	let head = "base0000";
+	let seq = 0;
+	let staged: string[] = [];
+	let commitGate: (() => Promise<void>) | undefined;
+	// The text `git diff <base>` (Task 4.1.1) returns; a test sets it to exercise
+	// contextDiff injection (non-empty) and verifyDiff/contextDiff refusal (empty).
+	let diffText = "";
+	// Exit code returned for a verifyDiff `{check}` command (Task 4.2.x) — any non-git
+	// command that isn't matched above. Default 0 (pass); a test sets non-zero to fail.
+	let checkExit = 0;
+
+	const recon = (strings: TemplateStringsArray, exprs: unknown[]): string => {
+		let out = strings[0] ?? "";
+		for (let i = 0; i < exprs.length; i += 1) {
+			const e = exprs[i];
+			// Bun's `${{ raw: cmd }}` escape hatch injects an unescaped command string;
+			// mirror it so a verifyDiff `{check}` reconstructs to its real command.
+			const piece =
+				e !== null && typeof e === "object" && "raw" in e
+					? String((e as { raw: unknown }).raw)
+					: String(e);
+			out += piece + (strings[i + 1] ?? "");
+		}
+		return out.trim();
+	};
+	const result = (stdout: string, exitCode = 0) =>
+		Promise.resolve({
+			stdout: { toString: () => stdout },
+			stderr: { toString: () => "" },
+			exitCode,
+			text: () => stdout,
+		});
+
+	const commands: string[] = [];
+	const shell = (strings: TemplateStringsArray, ...exprs: unknown[]) => {
+		const cmd = recon(strings, exprs);
+		commands.push(cmd);
+		if (cmd.includes("is-inside-work-tree")) {
+			return isRepo ? result("true") : result("", 128);
+		}
+		if (cmd.includes("status --porcelain")) {
+			const lines = [...dirty].map((p) => ` M ${p}`).join("\n");
+			return result(lines);
+		}
+		if (cmd === "git rev-parse HEAD") {
+			return result(head);
+		}
+		if (cmd.startsWith("git diff")) {
+			return result(diffText);
+		}
+		if (cmd.startsWith("git add -- ")) {
+			staged.push(cmd.slice("git add -- ".length));
+			return result("");
+		}
+		if (cmd.includes("commit --no-verify")) {
+			const message = cmd.slice(cmd.indexOf("-m ") + 3);
+			const doCommit = () => {
+				seq += 1;
+				head = `sha_${seq}`;
+				commits.push({ sha: head, paths: [...staged], message });
+				for (const p of staged) {
+					dirty.delete(p);
+				}
+				staged = [];
+				return result("");
+			};
+			if (commitGate !== undefined) {
+				return commitGate().then(doCommit);
+			}
+			return doCommit();
+		}
+		// A non-git command is a verifyDiff `{check}`: its exit code is the verdict.
+		if (!cmd.startsWith("git ")) {
+			return result("", checkExit);
+		}
+		return result("");
+	};
+	const chain = Object.assign(shell, {
+		cwd: () => chain,
+		nothrow: () => chain,
+		env: () => chain,
+		braces: (p: string) => [p],
+		escape: (s: string) => s,
+		throws: () => chain,
+	});
+	return {
+		// biome-ignore lint/suspicious/noExplicitAny: structural BunShell fake.
+		shell: chain as any,
+		commits,
+		commands,
+		setDirty: (path: string) => dirty.add(path),
+		setClean: (path: string) => dirty.delete(path),
+		setCommitGate: (gate: (() => Promise<void>) | undefined) => {
+			commitGate = gate;
+		},
+		setDiff: (text: string) => {
+			diffText = text;
+		},
+		setCheckExit: (code: number) => {
+			checkExit = code;
+		},
+	};
+}
+
+/**
+ * A completing client whose assistant message timestamps track the LIVE clock
+ * (Epic 2.1). The default {@link makeCompletingClient} hardcodes `created: NOW`, so
+ * a SECOND sequential agent — launched after the clock has been bumped past the idle
+ * grace several times — has a turn watermark ABOVE that fixed timestamp and its
+ * message is rejected as stale (the turn never completes). Tracking the live clock
+ * lets every sequential agent complete on `driveIdle`, which the multi-agent
+ * checkpoint tests require.
+ */
+function makeClockedCompletingClient(now: () => number, reply = "DONE") {
+	const sessions: string[] = [];
+	let seq = 0;
+	return {
+		sessions,
+		client: {
+			session: {
+				create: async () => {
+					seq += 1;
+					const id = `ses_child_${seq}`;
+					sessions.push(id);
+					return { data: { id } };
+				},
+				promptAsync: async () => undefined,
+				abort: async () => undefined,
+				messages: async () => ({
+					data: [
+						{
+							info: {
+								role: "assistant" as const,
+								time: { created: now(), completed: now() },
+							},
+							parts: [{ type: "text", text: reply }],
+						},
+					],
+				}),
+				get: async () => ({ data: { id: "ses_child" } }),
+				status: async () => ({ data: {} }),
+			},
+		},
+	};
+}
+
+/**
+ * A clocked completing client that ALSO records the `parts` array each
+ * `promptAsync` was dispatched with, keyed by sessionID (Epic 4.1). Lets a test
+ * assert that a `contextDiff:true` reviewer's launch carried the engine-computed
+ * synthetic git-diff contextPart BEFORE the task prompt.
+ */
+function makeClockedCapturingClient(now: () => number, reply = "DONE") {
+	const sessions: string[] = [];
+	const promptParts = new Map<string, unknown[]>();
+	let seq = 0;
+	return {
+		sessions,
+		promptParts,
+		client: {
+			session: {
+				create: async () => {
+					seq += 1;
+					const id = `ses_child_${seq}`;
+					sessions.push(id);
+					return { data: { id } };
+				},
+				promptAsync: async (opts: {
+					path: { id: string };
+					body: { parts: unknown[] };
+				}) => {
+					promptParts.set(opts.path.id, opts.body.parts);
+					return undefined;
+				},
+				abort: async () => undefined,
+				messages: async () => ({
+					data: [
+						{
+							info: {
+								role: "assistant" as const,
+								time: { created: now(), completed: now() },
+							},
+							parts: [{ type: "text", text: reply }],
+						},
+					],
+				}),
+				get: async () => ({ data: { id: "ses_child" } }),
+				status: async () => ({ data: {} }),
+			},
+		},
+	};
+}
+
+describe("createWorkflowEngine — host shell ($) threading (Epic 2.1)", () => {
+	test("constructs WITH a shell handle and still starts a run", async () => {
+		const { facade } = makeFs();
+		const { shell } = makeShell(() => ({ exitCode: 0, stdout: "true" }));
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_shell001"),
+			shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: HANGING,
+			parentSessionID: "ses_parent",
+		});
+		expect(handle.runId).toBe("wf_shell001");
+		await engine.dispose();
+	});
+
+	test("constructs WITHOUT a shell handle (feature no-ops, no throw)", async () => {
+		const { facade } = makeFs();
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_noshell01"),
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: INSTANT,
+			args: { ok: true },
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+		await engine.dispose();
+	});
+});
+
+const TWO_AGENTS_P2 = `${META}const a = await agent("edit A", { label: "one", phase: "P" });\nconst b = await agent("overwrite A", { label: "two", phase: "P" });\nreturn [a, b];\n`;
+
+describe("createWorkflowEngine — per-agent git checkpoints (Epic 2.1)", () => {
+	test("a live completed agent's workflow-touched edit is committed; a later overwrite stays RECOVERABLE", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ckpt001"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: TWO_AGENTS_P2,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		// Agent one edits src/A.ts, then idles → its agent:end fires a checkpoint.
+		repo.setDirty("src/A.ts");
+		await driveIdle(engine, sessions[0] as string, bump);
+		await flush();
+
+		// Agent two overwrites src/A.ts, then idles → second checkpoint.
+		expect(sessions.length).toBe(2);
+		repo.setDirty("src/A.ts");
+		await driveIdle(engine, sessions[1] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		// TWO commits landed, in agent:end order, each holding src/A.ts.
+		expect(repo.commits).toHaveLength(2);
+		expect(repo.commits[0]?.paths).toEqual(["src/A.ts"]);
+		expect(repo.commits[1]?.paths).toEqual(["src/A.ts"]);
+		// Agent one's work is recoverable from the FIRST commit's sha even though
+		// agent two later overwrote the same path (HEAD advanced; tree never reset).
+		expect(repo.commits[0]?.sha).toBe("sha_1");
+		expect(repo.commits[1]?.sha).toBe("sha_2");
+		// The commit messages are forensically traceable to each agent's session.
+		expect(repo.commits[0]?.message).toContain(sessions[0] as string);
+		expect(repo.commits[1]?.message).toContain(sessions[1] as string);
+
+		// The feed carries a per-agent checkpoint line per commit, before run:end.
+		const feed = readFeed(files, "wf_ckpt001");
+		const ckpts = feed.filter((l) => l.type === "agent:checkpoint");
+		expect(ckpts).toHaveLength(2);
+		const lastCkptIdx = feed.lastIndexOf(
+			ckpts[ckpts.length - 1] as Record<string, unknown>,
+		);
+		const runEndIdx = feed.findIndex((l) => l.type === "run:end");
+		expect(runEndIdx).toBeGreaterThan(lastCkptIdx);
+
+		await engine.dispose();
+	});
+
+	test("the pre-launch barrier holds agent two's launch until agent one's commit drains", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		// Gate agent one's commit on a deferred resolved only by the test.
+		let releaseCommit!: () => void;
+		const commitDone = new Promise<void>((r) => {
+			releaseCommit = r;
+		});
+		let gated = true;
+		repo.setCommitGate(() => (gated ? commitDone : Promise.resolve()));
+
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ckpt002"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		await engine.startRun({
+			source: TWO_AGENTS_P2,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		repo.setDirty("src/A.ts");
+		// Drive agent one idle → its commit STARTS but is parked on commitDone.
+		await driveIdle(engine, sessions[0] as string, bump);
+		await flush();
+
+		// Agent two must NOT have launched: its acquire won a slot, but the pre-launch
+		// barrier is blocked behind agent one's still-draining commit.
+		expect(sessions.length).toBe(1);
+
+		// Release agent one's commit → the barrier clears → agent two launches.
+		gated = false;
+		releaseCommit();
+		await flush();
+		expect(sessions.length).toBe(2);
+
+		await engine.dispose();
+	});
+
+	test("an operator-dirty path is NEVER committed end-to-end (refuse-don't-stomp)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const repo = makeGitRepo();
+		// The operator already has uncommitted work in operator.ts BEFORE the run.
+		repo.setDirty("operator.ts");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ckpt003"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		// The agent ALSO touches operator.ts (a collision) — and nothing else.
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		// operator.ts was dirty at baseline → refused → no commit at all.
+		expect(repo.commits).toHaveLength(0);
+		// The operator's path is STILL dirty (never swept into an engine commit).
+		await engine.dispose();
+	});
+
+	test("two concurrent runs keep INDEPENDENT operator baselines — run B's baseline never clobbers run A's refuse-set", async () => {
+		// The bug: a SINGLE engine-scoped checkpointer holds ONE `preexistingDirty`
+		// baseline. With two live runs, run B's baseline() (taken at B's startRun)
+		// overwrites run A's, so run A loses the protection for the operator path it
+		// captured at its OWN start — and then commits the operator's uncommitted work
+		// under run A's session (the #5 class, by the engine). Fix: each run gets its
+		// OWN checkpointer instance, so baselines are run-scoped and never clobber.
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		// The operator has uncommitted work in operatorA.ts BEFORE run A starts. Run A's
+		// baseline MUST capture it as off-limits for the whole life of run A.
+		repo.setDirty("operatorA.ts");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_runA", "wf_runB"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		// Run A baselines with operatorA.ts dirty → it is off-limits for run A.
+		const a = await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+
+		// The operator's path leaves the dirty set BEFORE run B baselines (e.g. the
+		// operator committed it). Run B therefore baselines with a CLEAN tree. A single
+		// shared baseline would now hold `{}` — clobbering run A's `{operatorA.ts}`.
+		repo.setClean("operatorA.ts");
+		await engine.startRun({
+			source: ONE_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+
+		// Run A's agent now re-touches operatorA.ts (still the operator's uncommitted
+		// work from run A's perspective). With an independent baseline run A REFUSES it;
+		// with the shared (clobbered) baseline run A sweeps it into a commit.
+		repo.setDirty("operatorA.ts");
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(a.runId)?.settled;
+
+		// No commit anywhere contains operatorA.ts — run A's baseline survived run B's.
+		expect(repo.commits.some((c) => c.paths.includes("operatorA.ts"))).toBe(
+			false,
+		);
+
+		await engine.dispose();
+	});
+
+	test("a non-repo directory yields zero commits and warns ONCE (no per-agent noise)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo({ isRepo: false });
+		const warns: string[] = [];
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: { ...noopLogger, warn: (m: string) => warns.push(m) },
+			ids: fixedIds("wf_ckpt004"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: TWO_AGENTS_P2,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		repo.setDirty("src/A.ts");
+		await driveIdle(engine, sessions[0] as string, bump);
+		await flush();
+		repo.setDirty("src/A.ts");
+		await driveIdle(engine, sessions[1] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		expect(repo.commits).toHaveLength(0);
+		// Exactly one "not a git work tree" warn for the whole run — no per-agent spam.
+		const repoWarns = warns.filter((w) =>
+			w.includes("git checkpoint disabled"),
+		);
+		expect(repoWarns).toHaveLength(1);
+
+		await engine.dispose();
+	});
+});
+
+// ---- Task 4.1.4: engine wires resolveContextDiff from the per-run checkpointer --
+
+const REVIEW_AGENT = `${META}const r = await agent("review the unit", { label: "rev", contextDiff: true });\nreturn r;\n`;
+
+describe("createWorkflowEngine — contextDiff review injection (Task 4.1.4)", () => {
+	test("a contextDiff reviewer launches with the engine-computed git diff as a synthetic contextPart", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions, promptParts } = makeClockedCapturingClient(
+			mclock.now,
+			"REVIEWED",
+		);
+		const repo = makeGitRepo();
+		repo.setDiff("diff --git a/src/A.ts b/src/A.ts\n+real change");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctxdiff01"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: REVIEW_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const parts = promptParts.get(sessions[0] as string) as Array<{
+			type: string;
+			text: string;
+			synthetic?: boolean;
+		}>;
+		expect(parts).toBeDefined();
+		// The synthetic diff part comes FIRST, the task prompt LAST.
+		expect(parts[0]).toEqual({
+			type: "text",
+			text: "diff --git a/src/A.ts b/src/A.ts\n+real change",
+			synthetic: true,
+		});
+		expect(parts.some((p) => p.text === "review the unit")).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("an empty git diff refuses the reviewer (null result + empty_diff diagnostic on the record)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock } = bumpClock(NOW);
+		const { client, sessions, promptParts } = makeClockedCapturingClient(
+			mclock.now,
+			"SHOULD NOT RUN",
+		);
+		const repo = makeGitRepo();
+		repo.setDiff(""); // a genuinely empty diff for the unit under review
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctxdiff02"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: REVIEW_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+
+		// The reviewer never launched (no session created, no prompt dispatched).
+		expect(sessions.length).toBe(0);
+		expect(promptParts.size).toBe(0);
+		// The run completed with a null reviewer result.
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		expect(rec?.returnValue).toBeNull();
+		// The empty_diff degrade is recorded as a typed diagnostic.
+		expect(rec?.diagnostics?.some((d) => d.reason === "empty_diff")).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("the no-shell engine path is unchanged: a contextDiff reviewer runs normally with no diff part", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions, promptParts } = makeClockedCapturingClient(
+			mclock.now,
+			"REVIEWED",
+		);
+		// No shell → the checkpointer is a documented no-op (available:false), so the
+		// review must run and inject NO diff part (emptiness is unprovable).
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ctxdiff03"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: REVIEW_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		expect(engine.statusOf(handle.runId)?.record.returnValue).toBe("REVIEWED");
+		const parts = promptParts.get(sessions[0] as string) as Array<{
+			text: string;
+			synthetic?: boolean;
+		}>;
+		expect(parts.some((p) => p.synthetic === true)).toBe(false);
+
+		await engine.dispose();
+	});
+});
+
+// ---- Task 4.2.3: engine wires verifyResult from the per-run checkpointer + shell --
+
+const VERIFY_DIFF_AGENT = `${META}const r = await agent("fix the bug", { label: "fix", verifyDiff: true });\nreturn r;\n`;
+const VERIFY_CHECK_AGENT = `${META}const r = await agent("fix the bug", { label: "fix", verifyDiff: { check: "bun test x" } });\nreturn r;\n`;
+
+describe("createWorkflowEngine — verifyDiff post-condition (Task 4.2.3)", () => {
+	test("verifyDiff:true with an EMPTY git diff downgrades the settled agent to null (verify_failed)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setDiff(""); // the agent claims a fix but nothing is on disk
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_verify01"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: VERIFY_DIFF_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		// The agent settled but its empty-diff post-condition failed → null result.
+		expect(rec?.returnValue).toBeNull();
+		expect(rec?.diagnostics?.some((d) => d.reason === "verify_failed")).toBe(
+			true,
+		);
+
+		await engine.dispose();
+	});
+
+	test("verifyDiff:true with a NON-EMPTY git diff preserves the result", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setDirty("src/A.ts");
+		repo.setDiff("diff --git a/src/A.ts b/src/A.ts\n+real fix");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_verify02"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: VERIFY_DIFF_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.returnValue).toBe("DONE");
+		expect(
+			rec?.diagnostics?.some((d) => d.reason === "verify_failed"),
+		).toBeFalsy();
+
+		await engine.dispose();
+	});
+
+	test("verifyDiff:{check} that exits non-zero downgrades; exit 0 preserves", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setCheckExit(1); // the verification command FAILS
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_verify03"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: VERIFY_CHECK_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.returnValue).toBeNull();
+		expect(rec?.diagnostics?.some((d) => d.reason === "verify_failed")).toBe(
+			true,
+		);
+
+		await engine.dispose();
+	});
+
+	test("the no-shell engine path is unchanged: verifyDiff is inert, the result survives", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		// No shell → checkpointer dead → verify available:false → inert pass-through.
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_verify04"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: VERIFY_DIFF_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.returnValue).toBe("DONE");
+		expect(
+			rec?.diagnostics?.some((d) => d.reason === "verify_failed"),
+		).toBeFalsy();
 
 		await engine.dispose();
 	});
@@ -523,7 +1367,10 @@ describe("createWorkflowEngine — default-install resolution (no dataDir, no en
 				.filter((l) => l.length > 0)
 				.map((l) => JSON.parse(l) as JournalEntry);
 			expect(lines).toHaveLength(1);
-			expect(lines[0]?.result).toBe("CACHED_RESULT");
+			const settled0 = lines[0];
+			expect(settled0?.status === "ok" && settled0.result).toBe(
+				"CACHED_RESULT",
+			);
 			expect(engine.statusOf(h2.runId)?.record.status).toBe("completed");
 
 			await engine.dispose();
@@ -622,8 +1469,11 @@ describe("createWorkflowEngine — journal is drained before settle (Task 4.3.2)
 				.filter((l) => l.length > 0)
 				.map((l) => JSON.parse(l) as JournalEntry);
 			expect(lines).toHaveLength(1);
-			expect(lines[0]?.key).toBe(key);
-			expect(lines[0]?.result).toBe("CACHED_RESULT");
+			const replayed0 = lines[0];
+			expect(replayed0?.key).toBe(key);
+			expect(replayed0?.status === "ok" && replayed0.result).toBe(
+				"CACHED_RESULT",
+			);
 			// The resumed run completed with the cached value (fully replayed).
 			expect(engine.statusOf(h2.runId)?.record.status).toBe("completed");
 			expect(engine.statusOf(h2.runId)?.record.returnValue).toBe(
@@ -678,6 +1528,15 @@ describe("createWorkflowEngine — startup recovery", () => {
 		expect(stale?.record.error).toContain("interrupted by restart");
 		expect(stale?.progress).toEqual([]);
 
+		// Epic 1.4: the recovery warning tells the operator the working tree may carry
+		// uncommitted agent edits and to inspect `git status` before resuming — and
+		// carries NO fabricated agent count (record.agents is empty on a real crash,
+		// so any count would be a lie).
+		const recoveryError = stale?.record.error ?? "";
+		expect(recoveryError).toContain("working tree");
+		expect(recoveryError).toContain("git status");
+		expect(recoveryError).not.toMatch(/\d+\s*agent/i);
+
 		// Terminal record remains readable, unchanged.
 		const done = engine.statusOf("wf_done0001");
 		expect(done?.record.status).toBe("completed");
@@ -689,6 +1548,123 @@ describe("createWorkflowEngine — startup recovery", () => {
 			.map((n) => n.taskId)
 			.sort();
 		expect(pendingIds).toContain("wf_done0001");
+
+		await engine.dispose();
+	});
+
+	test("recovery rehydrates record.agents + agentCount from the persisted feed (Phase 3.2.2)", async () => {
+		const runsDir = `${BASE}/workflow-runs`;
+		const staleRecord = {
+			id: "wf_rehy0001",
+			parentSessionID: "ses_parent",
+			status: "running",
+			description: "crashed mid-run",
+			createdAt: NOW - 5000,
+			scriptPath: `${BASE}/workflow-scripts/wf_rehy0001.js`,
+		};
+		// A feed with one LIVE agent (phase on agent:launched) and one CACHED agent
+		// (phase on agent:start). The crash record carries no agents — only the feed
+		// holds the real per-agent shape.
+		const feedEvents: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_rehy0001", parentSessionID: "p", at: 1 },
+			{ type: "agent:start", label: "writer", phase: "draft", at: 2 },
+			{
+				type: "agent:launched",
+				label: "writer",
+				phase: "draft",
+				sessionID: "ses_w",
+				model: "claude-x",
+				agentType: "build",
+				at: 3,
+			},
+			{
+				type: "agent:end",
+				label: "writer",
+				status: "completed",
+				sessionID: "ses_w",
+				at: 9,
+				durationMs: 6,
+				toolCalls: 2,
+			} as FeedEvent,
+			{ type: "agent:start", label: "verify", phase: "review", at: 10 },
+			{ type: "agent:end", label: "verify", status: "cached", at: 11 },
+		];
+		const { facade } = makeFs({
+			[`${runsDir}/wf_rehy0001.json`]: JSON.stringify(staleRecord),
+			[FEED("wf_rehy0001")]: `${feedEvents
+				.map((e) => JSON.stringify(e))
+				.join("\n")}\n`,
+		});
+
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+		});
+		await engine.ready();
+
+		const handle = engine.statusOf("wf_rehy0001");
+		// Recovery invariants preserved.
+		expect(handle?.record.status).toBe("error");
+		expect(handle?.record.error).toContain("interrupted by restart");
+		// The error string carries NO fabricated count (the count lives on the record
+		// fields, not the message — the existing :1168 invariant).
+		expect(handle?.record.error ?? "").not.toMatch(/\d+\s*agent/i);
+		// Rehydrated from the feed.
+		expect(handle?.record.agentCount).toBe(2);
+		expect(handle?.record.agents).toHaveLength(2);
+		expect(handle?.record.agents?.[0]).toMatchObject({
+			label: "writer",
+			phase: "draft",
+			sessionID: "ses_w",
+			model: "claude-x",
+			agentType: "build",
+			status: "completed",
+			toolCalls: 2,
+		});
+		expect(handle?.record.agents?.[1]).toMatchObject({
+			label: "verify",
+			phase: "review",
+			status: "cached",
+		});
+		// progress stays empty — no fabricated progress events.
+		expect(handle?.progress).toEqual([]);
+
+		await engine.dispose();
+	});
+
+	test("recovery with a missing feed stays 0/0 and never throws (Phase 3.2.2)", async () => {
+		const runsDir = `${BASE}/workflow-runs`;
+		const staleRecord = {
+			id: "wf_nofeed01",
+			parentSessionID: "ses_parent",
+			status: "running",
+			description: "crashed before any agent",
+			createdAt: NOW - 5000,
+			scriptPath: `${BASE}/workflow-scripts/wf_nofeed01.js`,
+		};
+		const { facade } = makeFs({
+			[`${runsDir}/wf_nofeed01.json`]: JSON.stringify(staleRecord),
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+		});
+		await engine.ready();
+
+		const handle = engine.statusOf("wf_nofeed01");
+		expect(handle?.record.status).toBe("error");
+		expect(handle?.record.error).toContain("interrupted by restart");
+		// No feed → no agents rehydrated (honest 0/0).
+		expect(handle?.record.agents).toBeUndefined();
+		expect(handle?.record.agentCount).toBeUndefined();
 
 		await engine.dispose();
 	});
@@ -963,9 +1939,16 @@ describe("createWorkflowEngine — fresh run journals to disk", () => {
 		expect(status?.record.status).toBe("completed");
 		expect(status?.record.returnValue).toBe("HELLO");
 
+		// Phase 3: a live agent write-aheads an intent BEFORE launch, then the settled
+		// ok line. Both share index+key; the intent precedes the completion.
 		const entries = readJournal(files, "wf_fresh001");
-		expect(entries.length).toBe(1);
+		expect(entries.length).toBe(2);
 		expect(entries[0]).toMatchObject({
+			index: 0,
+			key: computeCallKey({ prompt: "do work" }),
+			status: "intent",
+		});
+		expect(entries[1]).toMatchObject({
 			index: 0,
 			key: computeCallKey({ prompt: "do work" }),
 			status: "ok",
@@ -1590,7 +2573,10 @@ describe("createWorkflowEngine — resume across restart", () => {
 		await flush();
 		await driveIdle(engine1, sessions[0] as string, bump);
 		expect(engine1.statusOf("wf_restart01")?.record.status).toBe("completed");
-		expect(readJournal(files, "wf_restart01").length).toBe(1);
+		// Phase 3: a live agent journals an intent (pre-launch) AND a settled ok line.
+		const restartEntries = readJournal(files, "wf_restart01");
+		expect(restartEntries.filter((e) => e.status === "ok").length).toBe(1);
+		expect(restartEntries.some((e) => e.status === "intent")).toBe(true);
 		await engine1.dispose();
 
 		let creates2 = 0;
@@ -1631,6 +2617,103 @@ describe("createWorkflowEngine — resume across restart", () => {
 		expect(creates2).toBe(0);
 
 		await engine2.dispose();
+	});
+});
+
+describe("createWorkflowEngine — write-ahead intent journal (Phase 3.1.3)", () => {
+	test("a live agent writes a durable intent line BEFORE its settled ok line", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("WROTE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_intent001"),
+		});
+		await engine.ready();
+		await engine.startRun({ source: ONE_AGENT, parentSessionID: "ses_parent" });
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf("wf_intent001")?.settled;
+		expect(engine.statusOf("wf_intent001")?.record.status).toBe("completed");
+
+		// The journal carries BOTH the write-ahead intent AND the settled completion,
+		// sharing index+key. The intent must precede its ok (written before launch).
+		const lines = readJournal(files, "wf_intent001");
+		const intent = lines.find((l) => l.status === "intent");
+		const settled = lines.find((l) => l.status === "ok");
+		expect(intent).toBeDefined();
+		expect(settled).toBeDefined();
+		expect(intent?.index).toBe(settled?.index as number);
+		expect(intent?.key).toBe(settled?.key as string);
+		const intentPos = lines.findIndex((l) => l.status === "intent");
+		const settledPos = lines.findIndex((l) => l.status === "ok");
+		expect(intentPos).toBeLessThan(settledPos);
+
+		await engine.dispose();
+	});
+
+	test("resume filters out an intent-only prior journal — the call re-runs LIVE", async () => {
+		// An interrupted prior run left ONLY an intent line (crash before settle). On
+		// resume the load-filter drops it, so the unsettled call runs live (a real
+		// child is created), never replaying a nonexistent result.
+		const key = computeCallKey({ prompt: "do work" });
+		const priorRecord = {
+			id: "wf_crash0001",
+			parentSessionID: "ses_parent",
+			status: "error",
+			description: "crashed",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/wf_crash0001.js`,
+		};
+		const intentOnly: JournalEntry[] = [{ index: 0, key, status: "intent" }];
+		const warns: Array<{ msg: string }> = [];
+		const captureLogger = {
+			debug: () => {},
+			info: () => {},
+			warn: (msg: string) => warns.push({ msg }),
+			error: () => {},
+		};
+		const { facade } = makeFs({
+			[`${BASE}/workflow-scripts/wf_crash0001.js`]: ONE_AGENT,
+			[JOURNALS("wf_crash0001")]: jsonl(intentOnly),
+			[`${BASE}/workflow-runs/wf_crash0001.json`]: JSON.stringify(priorRecord),
+		});
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("RERUN");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: captureLogger,
+			ids: fixedIds("wf_resume_x1"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			resumeFromRunId: "wf_crash0001",
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		// A live child WAS created — the unsettled call did not replay.
+		expect(sessions.length).toBe(1);
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+		expect(engine.statusOf(handle.runId)?.record.returnValue).toBe("RERUN");
+
+		// Post-filter the prior journal is empty (the lone intent was dropped), so the
+		// "running live" warn fires — there are no settled results to replay.
+		expect(warns.some((w) => /running live/.test(w.msg))).toBe(true);
+
+		await engine.dispose();
 	});
 });
 
@@ -1685,6 +2768,10 @@ describe("createWorkflowEngine — live progress feed (Task 8.1.2)", () => {
 		expect(lines[0]?.runId).toBe("wf_feed0001");
 		expect(lines[0]?.parentSessionID).toBe("ses_parent");
 		expect(lines[0]?.scriptPath).toBe(handle.scriptPath);
+		// The producer seam: the engine stamps `name` from the script META
+		// (`name: "demo"`) onto run:start — every TUI header read of the run name
+		// depends on this. Without it the viewer silently falls back to the raw runId.
+		expect(lines[0]?.name).toBe("demo");
 		expect(lines.at(-1)?.type).toBe("run:end");
 		expect(lines.at(-1)?.status).toBe("completed");
 
@@ -2402,5 +3489,51 @@ describe("createWorkflowEngine — external control channel (Task 8.2.2)", () =>
 
 		// dispose() must stop the watcher, clearing the same handle setInterval returned.
 		expect(cleared).toEqual([1]);
+	});
+});
+
+// ---- Epic 0.1: live worker-session identity (isWorkerSession) --------------
+
+describe("createWorkflowEngine — isWorkerSession (Epic 0.1)", () => {
+	test("true between agent:launched and agent:end, false before/after and for unrelated ids", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeCompletingClient("DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_worker01"),
+		});
+		await engine.ready();
+
+		// Before any launch: the parent and an unrelated id are never workers.
+		expect(engine.isWorkerSession("ses_parent")).toBe(false);
+		expect(engine.isWorkerSession("ses_unrelated")).toBe(false);
+
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("do work", { label: "worker" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		// After flush the child has emitted agent:launched through the choke point.
+		await flush();
+		const child = sessions[0] as string;
+
+		// LIVE window: the worker is a worker; the parent and unrelated ids are not.
+		expect(engine.isWorkerSession(child)).toBe(true);
+		expect(engine.isWorkerSession("ses_parent")).toBe(false);
+		expect(engine.isWorkerSession("ses_unrelated")).toBe(false);
+
+		// Settle the child (agent:end fires through the sessionID-bearing branch).
+		await driveIdle(engine, child, bump);
+		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+
+		// AFTER settle: the worker window has closed.
+		expect(engine.isWorkerSession(child)).toBe(false);
+
+		await engine.dispose();
 	});
 });

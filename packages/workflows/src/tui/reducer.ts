@@ -127,6 +127,13 @@ export interface PhaseView {
  */
 export interface RunViewState {
 	runId?: string;
+	/**
+	 * The workflow's human name from the `run:start` line (`meta.name`). The view
+	 * renders it as the run's identity in the header, falling back to {@link runId}
+	 * when it is absent — which happens for OLD feeds written before the engine
+	 * stamped `name`. A clean degrade, not an error.
+	 */
+	name?: string;
 	status: "running" | "cancelling" | RunStatus;
 	startedAt?: number;
 	endedAt?: number;
@@ -198,6 +205,7 @@ export function summarize(state: RunViewState, now: number): RunSummary {
  */
 export function createRunStateReducer(): RunStateReducer {
 	let runId: string | undefined;
+	let name: string | undefined;
 	let status: RunViewState["status"] = "running";
 	let startedAt: number | undefined;
 	let endedAt: number | undefined;
@@ -334,6 +342,7 @@ export function createRunStateReducer(): RunStateReducer {
 		switch (event.type) {
 			case "run:start":
 				runId = event.runId;
+				name = event.name;
 				startedAt = event.at;
 				if (event.phases !== undefined) {
 					declaredPhases = event.phases;
@@ -418,6 +427,7 @@ export function createRunStateReducer(): RunStateReducer {
 		});
 		return {
 			...(runId !== undefined ? { runId } : {}),
+			...(name !== undefined ? { name } : {}),
 			status,
 			...(startedAt !== undefined ? { startedAt } : {}),
 			...(endedAt !== undefined ? { endedAt } : {}),

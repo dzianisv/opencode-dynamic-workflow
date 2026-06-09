@@ -1,9 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StampedProgressEvent } from "../runtime/types";
-import { createFeedWriter, type FeedEvent, type FeedFs } from "./feed";
+import {
+	createFeedWriter,
+	type FeedEvent,
+	type FeedFs,
+	type FeedReadFs,
+	readFeedCounts,
+} from "./feed";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -206,5 +212,221 @@ describe("createFeedWriter", () => {
 		await w.settled();
 		expect(written).toHaveLength(0);
 		expect(errors).toHaveLength(1);
+	});
+});
+
+// ---- readFeedCounts (Phase 3.2.1) -----------------------------------------
+
+/** Build a string feed file from a list of events, JSONL. */
+function feedFile(events: FeedEvent[]): string {
+	return `${events.map((e) => JSON.stringify(e)).join("\n")}\n`;
+}
+
+/** A read fs serving one path from raw text (ENOENT for anything else). */
+function readFs(path: string, raw: string | undefined): FeedReadFs {
+	return {
+		readFile: async (p) => {
+			if (p !== path || raw === undefined) {
+				const err = new Error("ENOENT") as Error & { code: string };
+				err.code = "ENOENT";
+				throw err;
+			}
+			return raw;
+		},
+	};
+}
+
+describe("readFeedCounts", () => {
+	test("counts live vs cached agent:end lines and rebuilds AgentSummary[] with phase", async () => {
+		// A LIVE agent's phase lives on agent:launched, NOT on its enriched agent:end —
+		// so the reader must PAIR launched→end to recover phase (blocker fix).
+		const events: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_r", parentSessionID: "p", at: 1 },
+			{ type: "agent:start", label: "writer", phase: "draft", at: 2 },
+			{
+				type: "agent:launched",
+				label: "writer",
+				phase: "draft",
+				sessionID: "ses_1",
+				model: "claude-x",
+				agentType: "build",
+				at: 3,
+			},
+			{
+				type: "agent:end",
+				label: "writer",
+				status: "completed",
+				sessionID: "ses_1",
+				at: 9,
+				durationMs: 6,
+				toolCalls: 4,
+				model: "claude-x",
+				agentType: "build",
+				tokens: {
+					input: 10,
+					output: 20,
+					reasoning: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+				},
+			} as FeedEvent,
+			// A CACHED agent: agent:start carries the phase; agent:end has no sessionID.
+			{ type: "agent:start", label: "verify", phase: "review", at: 10 },
+			{ type: "agent:end", label: "verify", status: "cached", at: 11 },
+			{ type: "run:end", status: "completed", agentCount: 2, at: 12 },
+		];
+		const path = "/feed/wf_r.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts.agentCount).toBe(2);
+		expect(counts.live).toBe(1);
+		expect(counts.cached).toBe(1);
+		expect(counts.agents).toHaveLength(2);
+		// LIVE agent: phase recovered from agent:launched, stats from the enriched end.
+		expect(counts.agents[0]).toMatchObject({
+			label: "writer",
+			phase: "draft",
+			sessionID: "ses_1",
+			model: "claude-x",
+			agentType: "build",
+			status: "completed",
+			toolCalls: 4,
+			durationMs: 6,
+		});
+		expect(counts.agents[0]?.tokens?.input).toBe(10);
+		// CACHED agent: phase recovered from agent:start, no stats.
+		expect(counts.agents[1]).toMatchObject({
+			label: "verify",
+			phase: "review",
+			status: "cached",
+		});
+		expect(counts.agents[1]?.sessionID).toBeUndefined();
+	});
+
+	test("carries the degrade note from a degraded live agent:end", async () => {
+		const events: FeedEvent[] = [
+			{ type: "agent:start", label: "x", phase: "p1", at: 1 },
+			{
+				type: "agent:launched",
+				label: "x",
+				phase: "p1",
+				sessionID: "ses_x",
+				at: 2,
+			},
+			{
+				type: "agent:end",
+				label: "x",
+				status: "error",
+				sessionID: "ses_x",
+				note: "null — status_error",
+				at: 3,
+			} as FeedEvent,
+		];
+		const path = "/feed/wf_n.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts.agentCount).toBe(1);
+		expect(counts.live).toBe(1);
+		expect(counts.cached).toBe(0);
+		expect(counts.agents[0]).toMatchObject({
+			label: "x",
+			phase: "p1",
+			status: "error",
+			note: "null — status_error",
+		});
+	});
+
+	test("a missing feed file → empty result, never throws", async () => {
+		const counts = await readFeedCounts(
+			"/feed/missing.jsonl",
+			readFs("/feed/other.jsonl", undefined),
+		);
+		expect(counts).toEqual({ agentCount: 0, live: 0, cached: 0, agents: [] });
+	});
+
+	test("drops a truncated FINAL line (crash mid-append)", async () => {
+		const good = JSON.stringify({
+			type: "agent:end",
+			label: "a",
+			status: "completed",
+			sessionID: "s",
+			at: 1,
+		});
+		const truncated = '{"type":"agent:end","label":"b","stat';
+		const path = "/feed/wf_t.jsonl";
+		const counts = await readFeedCounts(
+			path,
+			readFs(path, `${good}\n${truncated}`),
+		);
+		// Only the intact line counts; the truncated tail is dropped, not thrown.
+		expect(counts.agentCount).toBe(1);
+		expect(counts.live).toBe(1);
+	});
+
+	test("an INTERIOR bad line degrades gracefully (drop-and-continue, never throws)", async () => {
+		// Diverges from journal.load (which throws on interior corruption): recovery
+		// runs inside readyPromise, so a throw would poison engine startup for ALL runs.
+		const a = JSON.stringify({
+			type: "agent:end",
+			label: "a",
+			status: "completed",
+			sessionID: "s1",
+			at: 1,
+		});
+		const bad = "{not json at all";
+		const c = JSON.stringify({
+			type: "agent:end",
+			label: "c",
+			status: "completed",
+			sessionID: "s2",
+			at: 3,
+		});
+		const path = "/feed/wf_i.jsonl";
+		const counts = await readFeedCounts(
+			path,
+			readFs(path, `${a}\n${bad}\n${c}\n`),
+		);
+		// The two intact agent:end lines count; the interior garbage is skipped.
+		expect(counts.agentCount).toBe(2);
+		expect(counts.live).toBe(2);
+		expect(counts.agents.map((x) => x.label)).toEqual(["a", "c"]);
+	});
+
+	test("an empty / agent-less feed → zero counts", async () => {
+		const events: FeedEvent[] = [
+			{ type: "run:start", runId: "wf_e", parentSessionID: "p", at: 1 },
+			{ type: "run:end", status: "error", at: 2 },
+		];
+		const path = "/feed/wf_e.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts).toEqual({ agentCount: 0, live: 0, cached: 0, agents: [] });
+	});
+
+	test("reads a real on-disk feed file end-to-end", async () => {
+		const dir = await tmpDir();
+		try {
+			const path = join(dir, "wf_disk.jsonl");
+			const events: FeedEvent[] = [
+				{ type: "agent:start", label: "a", phase: "ph", at: 1 },
+				{
+					type: "agent:launched",
+					label: "a",
+					phase: "ph",
+					sessionID: "ses_a",
+					at: 2,
+				},
+				{
+					type: "agent:end",
+					label: "a",
+					status: "completed",
+					sessionID: "ses_a",
+					at: 3,
+				} as FeedEvent,
+			];
+			await writeFile(path, feedFile(events), "utf-8");
+			const counts = await readFeedCounts(path);
+			expect(counts.agentCount).toBe(1);
+			expect(counts.agents[0]).toMatchObject({ label: "a", phase: "ph" });
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });

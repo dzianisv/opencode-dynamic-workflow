@@ -27,7 +27,13 @@ function reduce(events: FeedEvent[]): RunViewState {
 describe("parseFeedLine", () => {
 	test("parses each FeedEvent member to its typed event", () => {
 		const lines: FeedEvent[] = [
-			{ type: "run:start", runId: "wf_1", parentSessionID: "ses_p", at: 1 },
+			{
+				type: "run:start",
+				runId: "wf_1",
+				parentSessionID: "ses_p",
+				name: "demo",
+				at: 1,
+			},
 			{ type: "agent:start", label: "impl", phase: "build", at: 2 },
 			{
 				type: "agent:launched",
@@ -221,6 +227,27 @@ describe("createRunStateReducer — full multi-phase feed", () => {
 		expect(s.startedAt).toBe(100);
 		expect(s.endedAt).toBe(300);
 		expect(s.status).toBe("completed");
+	});
+
+	test("carries the run:start name onto the view state", () => {
+		const s = reduce([
+			{
+				type: "run:start",
+				runId: "wf_named",
+				parentSessionID: "ses_p",
+				name: "My Workflow",
+				at: 100,
+			},
+		]);
+		expect(s.name).toBe("My Workflow");
+	});
+
+	test("degrades to undefined name on an old feed lacking it (view falls back to runId)", () => {
+		// Existing fixtures never carry `name` — the reducer must not invent one.
+		const s = reduce(feed);
+		expect(s.name).toBeUndefined();
+		// startedAt is still derived from run:start.at (the view's relative-age anchor).
+		expect(s.startedAt).toBe(100);
 	});
 
 	test("groups agents by phase with first-appearance order", () => {

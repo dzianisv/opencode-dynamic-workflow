@@ -22,6 +22,7 @@
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import {
 	formatDuration,
+	formatTokenSplit,
 	formatTokens,
 	phaseMarker,
 	shortModel,
@@ -162,6 +163,12 @@ interface AgentRow {
 	sessionID?: string;
 	/** Total tokens (already summed); absent on cached / un-tracked agents. */
 	tokens?: number;
+	/**
+	 * The raw per-field token snapshot (Epic 1.3), carried so the stats segment can
+	 * render the `<input>→<output+reasoning>` split instead of one flattened total.
+	 * Set wherever `tokens` is — present whenever a real snapshot was in hand.
+	 */
+	tokenSplit?: SessionTokenSnapshot;
 	toolCalls?: number;
 	durationMs?: number;
 	note?: string;
@@ -344,6 +351,7 @@ function liveAgentRows(
 				const snap = statsSnapshot(e.sessionID);
 				if (snap !== undefined) {
 					row.tokens = totalTokens(snap.tokens);
+					row.tokenSplit = snap.tokens;
 					row.toolCalls = snap.toolCalls;
 				}
 			}
@@ -379,6 +387,7 @@ function liveAgentRows(
 				}
 				if (end.tokens !== undefined) {
 					row.tokens = totalTokens(end.tokens);
+					row.tokenSplit = end.tokens;
 				}
 				if (end.toolCalls !== undefined) {
 					row.toolCalls = end.toolCalls;
@@ -399,7 +408,9 @@ function settledAgentRows(agents: AgentSummary[]): AgentRow[] {
 		...(a.phase !== undefined ? { phase: a.phase } : {}),
 		status: a.status,
 		...(a.model !== undefined ? { model: a.model } : {}),
-		...(a.tokens !== undefined ? { tokens: totalTokens(a.tokens) } : {}),
+		...(a.tokens !== undefined
+			? { tokens: totalTokens(a.tokens), tokenSplit: a.tokens }
+			: {}),
 		...(a.toolCalls !== undefined ? { toolCalls: a.toolCalls } : {}),
 		...(a.durationMs !== undefined ? { durationMs: a.durationMs } : {}),
 		...(a.note !== undefined ? { note: a.note } : {}),
@@ -426,7 +437,12 @@ function statsSegment(row: AgentRow): string {
 		return "cached";
 	}
 	const segments: string[] = [];
-	if (row.tokens !== undefined) {
+	// Prefer the input→output split (Epic 1.3); fall back to the flat total only when
+	// no raw per-field snapshot reached the row (it always does today, but the flat
+	// `tokens` stays the contract for any sourceless consumer).
+	if (row.tokenSplit !== undefined) {
+		segments.push(`${formatTokenSplit(row.tokenSplit)} tok`);
+	} else if (row.tokens !== undefined) {
 		segments.push(`${formatTokens(row.tokens)} tok`);
 	}
 	if (row.toolCalls !== undefined) {

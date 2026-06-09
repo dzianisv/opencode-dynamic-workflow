@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { SessionTokenSnapshot } from "../plugin/session-stats";
 import {
 	formatDuration,
+	formatRelativeTime,
+	formatTokenSplit,
 	formatTokens,
 	shortModel,
 	statusMarker,
@@ -48,6 +50,46 @@ describe("formatDuration", () => {
 	});
 });
 
+describe("formatRelativeTime", () => {
+	test("renders a single floored unit, no spaces (distinct from formatDuration)", () => {
+		// Sub-minute → seconds.
+		expect(formatRelativeTime(0, 1000)).toBe("1s");
+		expect(formatRelativeTime(0, 59_000)).toBe("59s");
+		// Minute band → floored whole minutes (90s floors to 1m, not "1m 30s").
+		expect(formatRelativeTime(0, 90_000)).toBe("1m");
+		expect(formatRelativeTime(0, 59 * 60_000)).toBe("59m");
+		// Hour band.
+		expect(formatRelativeTime(0, 3 * 3_600_000)).toBe("3h");
+		expect(formatRelativeTime(0, 23 * 3_600_000)).toBe("23h");
+		// Day band.
+		expect(formatRelativeTime(0, 2 * 86_400_000)).toBe("2d");
+		// Single-unit, no spaces — explicitly NOT formatDuration's multi-unit form.
+		expect(formatRelativeTime(0, 3_661_000)).toBe("1h");
+		expect(formatDuration(3_661_000)).toBe("1h 1m 1s");
+	});
+
+	test("pins the exact band rollovers (the strict `< 60`/`< 24` edges)", () => {
+		// The s→m, m→h, h→d boundaries are the off-by-one risk a `<`→`<=` refactor
+		// would silently break — lock them at the exact rollover input.
+		expect(formatRelativeTime(0, 60_000)).toBe("1m");
+		expect(formatRelativeTime(0, 3_600_000)).toBe("1h");
+		expect(formatRelativeTime(0, 86_400_000)).toBe("1d");
+	});
+
+	test("sub-second floors to 0s", () => {
+		expect(formatRelativeTime(0, 500)).toBe("0s");
+		expect(formatRelativeTime(0, 0)).toBe("0s");
+	});
+
+	test("negative and non-finite deltas degrade to 'just now'", () => {
+		// nowMs < thenMs (clock skew / a future stamp).
+		expect(formatRelativeTime(1000, 0)).toBe("just now");
+		expect(formatRelativeTime(0, Number.NaN)).toBe("just now");
+		expect(formatRelativeTime(Number.NaN, 1000)).toBe("just now");
+		expect(formatRelativeTime(0, Number.POSITIVE_INFINITY)).toBe("just now");
+	});
+});
+
 describe("shortModel", () => {
 	test("strips provider prefix and leading claude-", () => {
 		expect(shortModel("anthropic/claude-opus-4-8")).toBe("opus-4-8");
@@ -66,6 +108,31 @@ describe("totalTokens", () => {
 			cacheWrite: 5,
 		};
 		expect(totalTokens(t)).toBe(132);
+	});
+});
+
+describe("formatTokenSplit", () => {
+	test("renders input → output+reasoning, each via formatTokens (Epic 1.3)", () => {
+		const t: SessionTokenSnapshot = {
+			input: 112_700,
+			output: 8_000,
+			reasoning: 2_000,
+			cacheRead: 50_000,
+			cacheWrite: 1_000,
+		};
+		// Output side folds reasoning into output (output-priced), mirroring budget.
+		expect(formatTokenSplit(t)).toBe("112.7k→10.0k");
+	});
+
+	test("zero/small values use the bare-integer band", () => {
+		const t: SessionTokenSnapshot = {
+			input: 0,
+			output: 0,
+			reasoning: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		};
+		expect(formatTokenSplit(t)).toBe("0→0");
 	});
 });
 

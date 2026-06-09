@@ -376,6 +376,19 @@ describe("createWorkflowTool — script_path", () => {
 		await engine.dispose();
 	});
 
+	test("absolute path loads verbatim (not joined under directory)", async () => {
+		const absPath = "/abs/elsewhere/flow.js";
+		const { engine, facade } = makeEngine({
+			files: { [absPath]: HANGING },
+			ids: fixedIds("wf_abs00001"),
+		});
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script_path: absPath }, ctx("ses_parent"));
+		expect(out).toContain("wf_abs00001");
+		expect(engine.statusOf("wf_abs00001")?.record.status).toBe("running");
+		await engine.dispose();
+	});
+
 	test("unreadable script_path → honest error", async () => {
 		const { engine, facade } = makeEngine({});
 		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
@@ -554,6 +567,63 @@ describe("createWorkflowTool — resume", () => {
 			await facade.readFile(priorSrc, "utf-8"),
 		);
 
+		await engine.dispose();
+	});
+
+	/** Seed a completed prior run carrying persisted `args`. */
+	function seedPriorWithArgs(
+		id: string,
+		args: unknown,
+	): Record<string, string> {
+		const record = {
+			id,
+			parentSessionID: "ses_parent",
+			status: "completed",
+			description: "demo",
+			createdAt: NOW - 1000,
+			completedAt: NOW - 500,
+			scriptPath: `${BASE}/workflow-scripts/${id}.js`,
+			args,
+			returnValue: "X",
+		};
+		return {
+			[`${BASE}/workflow-runs/${id}.json`]: JSON.stringify(record),
+			[`${BASE}/workflow-scripts/${id}.js`]: ONE_AGENT,
+		};
+	}
+
+	test("resume WITHOUT args inherits the prior run's persisted args", async () => {
+		const priorArgs = { files: ["a.ts", "b.ts"], n: 3 };
+		const files = seedPriorWithArgs("wf_inherit01", priorArgs);
+		const { engine, facade } = makeEngine({
+			files,
+			ids: fixedIds("wf_inheritR1"),
+		});
+		await engine.ready();
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+
+		await run(t, { resume_from_run_id: "wf_inherit01" }, ctx("ses_parent"));
+
+		expect(engine.statusOf("wf_inheritR1")?.record.args).toEqual(priorArgs);
+		await engine.dispose();
+	});
+
+	test("resume WITH explicit args overrides the prior run's args", async () => {
+		const files = seedPriorWithArgs("wf_override01", { old: true });
+		const { engine, facade } = makeEngine({
+			files,
+			ids: fixedIds("wf_overrideR1"),
+		});
+		await engine.ready();
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+
+		await run(
+			t,
+			{ resume_from_run_id: "wf_override01", args: { fresh: 1 } },
+			ctx("ses_parent"),
+		);
+
+		expect(engine.statusOf("wf_overrideR1")?.record.args).toEqual({ fresh: 1 });
 		await engine.dispose();
 	});
 

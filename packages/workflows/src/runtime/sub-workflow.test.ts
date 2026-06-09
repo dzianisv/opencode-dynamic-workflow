@@ -213,7 +213,8 @@ describe("workflow() — synthetic journal boundary (replay)", () => {
 		expect(childRan).toBe(true);
 		// The live result is recorded under the NEW boundary key.
 		expect(recorded).toHaveLength(1);
-		expect(recorded[0]?.result).toBe("LIVE");
+		const boundary0 = recorded[0];
+		expect(boundary0?.status === "ok" && boundary0.result).toBe("LIVE");
 	});
 
 	test("position independence: a boundary key still replays after an unrelated edit before it", async () => {
