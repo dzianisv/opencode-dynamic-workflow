@@ -395,6 +395,57 @@ describe("createSessionRunner — cancel-during-acquire", () => {
 	});
 });
 
+describe("createSessionRunner — cancel during immediate-grant acquire", () => {
+	test("cancel in the gap before heldSlots is recorded does not orphan the slot", async () => {
+		const h = makeClient();
+		// Limit high enough that acquire grants immediately (never queues): the
+		// slot is committed to `active` synchronously inside launch, before the
+		// `await acquire` microtask hop that precedes `heldSlots.set`.
+		const concurrency = new ConcurrencyManager({ defaultConcurrency: 5 });
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+		});
+		const model = "anthropic/opus";
+
+		// Drain microtasks until acquire has committed the slot to `active` but
+		// launch is still suspended at `await acquire` (so `heldSlots` is not yet
+		// recorded): exactly the immediate-grant leak window. The persist hop
+		// before acquire means this is a couple of microtask turns in, not zero.
+		const launched = runner.launch(baseReq({ model }));
+		const task = at(runner.list(), 0);
+		while (concurrency.runningCount(model) === 0) {
+			await Promise.resolve();
+		}
+		expect(concurrency.runningCount(model)).toBe(1);
+		expect(task.status).toBe("pending");
+
+		// Cancel in the gap → the gate's teardown runs with heldSlots empty and an
+		// immediately-granted (never-queued) waiter, so cancelWaiter is a no-op and
+		// the release must be recovered when launch resumes past the await.
+		void runner.cancel(task.id);
+
+		const result = await launched;
+		await flush();
+
+		expect(result.status).toBe("cancelled");
+		expect(h.createCalls).toHaveLength(0);
+		expect(h.promptCalls).toHaveLength(0);
+		// The orphaned-slot regression: this returns to 0 only if the recovered
+		// release fired.
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// And a fresh launch for the same model can still acquire (no wedge).
+		const next = runner.launch(baseReq({ model, description: "next" }));
+		await flush();
+		expect(concurrency.runningCount(model)).toBe(1);
+		h.resolveCreate("ses_next");
+		await next;
+	});
+});
+
 describe("createSessionRunner — cancel-between-create-and-prompt", () => {
 	test("cancelled after create await: orphan session aborted, task cancelled, slot released, no promptAsync", async () => {
 		const h = makeClient();

@@ -205,7 +205,10 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	const tasks = new Map<string, BgTask>();
 	// Secondary index: sessionID → task, so the completion gate resolves a task by
 	// session in O(1) on every SDK event instead of linearly scanning the task map.
-	// Written wherever `task.sessionID` is assigned (launch, resume, recovery).
+	// Invariant: every NON-TERMINAL task carrying a sessionID is indexed (launch's
+	// promote-to-running, resume, recovery). Terminal-path sessionID assignments
+	// (cancel-across-create, onSessionCreated-throw) are intentionally NOT indexed —
+	// safe only because the gate filters terminal tasks out of every lookup.
 	const tasksBySession = new Map<string, BgTask>();
 	function indexSession(task: BgTask): void {
 		if (task.sessionID !== undefined) {
@@ -222,6 +225,16 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	// only after a successful acquire; the completion gate's `freeSlot` consults
 	// it to release exactly once (or cancel the still-queued waiter instead).
 	const heldSlots = new Map<string, string>();
+
+	// Release a slot recorded in `heldSlots` exactly once. Used to recover from
+	// the launch race where teardown already ran with `heldSlots` still empty.
+	function releaseHeldSlot(id: string): void {
+		const held = heldSlots.get(id);
+		if (held !== undefined) {
+			heldSlots.delete(id);
+			concurrency.release(held);
+		}
+	}
 
 	function liveIds(): ReadonlySet<string> {
 		return new Set(tasks.keys());
@@ -456,9 +469,17 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		heldSlots.set(id, modelKey);
 
 		// (4) cancel-during-acquire that lost the race to the grant: a slot is
-		// now held; the gate releases it on the cancelled flip. No session.
+		// now held. If the cancel landed in the `await acquire` gap BEFORE
+		// `heldSlots.set` above, the gate already ran teardown via a no-op
+		// `freeSlot` (heldSlots was empty; cancelWaiter found no queued waiter
+		// for an immediately-granted acquire) — so the flip here is denied and
+		// the just-recorded slot is orphaned. Release it explicitly in that case.
+		// Otherwise the cancel races in now and this flip wins; the gate's
+		// `freeSlot` releases the slot. Either way no session was created.
 		if (statusOf(id) === "cancelled") {
-			gate.tryComplete(id, "cancelled");
+			if (!gate.tryComplete(id, "cancelled")) {
+				releaseHeldSlot(id);
+			}
 			return task;
 		}
 
