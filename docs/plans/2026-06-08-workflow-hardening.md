@@ -81,7 +81,8 @@ the end. Per-task "Verification" runs tests; it does not gate on a commit.
 | **2** | The engine commits each unit; surviving drift is recoverable, not destroyed | 2.1 | **Complete** |
 | **3** | An interrupted run is detectable (write-ahead intent journal) and reports real recovered counts (feed rehydration) | 3.1, 3.2 | **Complete** |
 | **4** | Reviewers diff real code; agent success is verified against disk, not self-report | 4.1, 4.2 | **Complete** (verifyDiff git-grounded, not session-diff) |
-| **HOST** | Real per-agent worktree isolation (parallel track; does not block 0–4) | H.1 | PARTIAL — probe green, inert seam landed, lifecycle deferred |
+| **HOST** | Real per-agent worktree isolation (parallel track; does not block 0–4) | H.1 | **Complete** — lifecycle implemented (H.1.1–H.1.6), adversarially reviewed, 2 lost-work-under-contention defects fixed (2026-06-09) |
+| **TTY** | Engine-owned shell output never corrupts the host TUI (orthogonal hotfix) | T.1 | **Complete** (2026-06-09) |
 
 ---
 
@@ -655,8 +656,258 @@ isolation (worker-initiated destructive git is already denied by Epic 0.3; the r
 is the future lifecycle's engine-side stash + refs/index sharing).
 **Done when:** ~~the probe is conclusive~~ (DONE, green); the inert directory seam is
 landed and type-verified; the full worktree lifecycle (isolated agents edit only their
-worktree and the engine merges back with conflict surfacing) remains DEFERRED epic-level
-work, with P0.4 fail-loud as the shipped behavior until it lands.
+worktree and the engine merges back with conflict surfacing) is implemented per the
+tasks below; `isolation:'worktree'` mints a real worktree (P0.4 degrade-to-null becomes
+the FALLBACK for the no-repo case only).
+
+#### Locked design decisions (signed off 2026-06-09)
+
+A second host read (LayerMap architecture) **corroborates the 2026-06-08 live probe**:
+opencode binds **session → Location → runner**, where `Location.Ref` is keyed by the
+absolute `directory` and each Location owns its own runner stack (FileSystem, tools,
+bash) cached ~60 min (`.references/opencode` `location.ts` `Location.Ref`,
+`location-layer.ts:46-116`, `session/execution.ts:16` "routes execution from a Session
+ID to the runner owned by that Session's Location"). So a session created with
+`?directory=<worktree>` is **permanently bound** to that Location; prompts route to its
+runner regardless of the request's directory. **Create-time binding alone is sufficient
+and verified** — the seam's choice to keep `directory` off `resume()`/`dispatchPrompt`
+is correct, not a gap.
+
+1. **Merge-back: AUTO, not caller-managed.** On `agent:end` for a worktree agent, the
+   engine merges the scratch branch back into the main tree (serialized via the existing
+   `checkpointTail`), then the main checkpointer captures it. This DEVIATES from CC's
+   documented semantics (CC promises only isolation + cleanup-if-unchanged, silent on
+   merge-back) — chosen deliberately because the use case is "agents collaborating in
+   parallel," where caller-managed N-branch merges would be the brittle git-plumbing the
+   tool exists to remove. The deviation is intentional and recorded.
+2. **Conflict = Tier 1 (loud, first-class), NOT silent auto-resolve.** A merge conflict
+   means two agents got overlapping scope — a *decomposition* error, not a code error;
+   silently LLM-merging it would hide that signal and risk a wrong merge in a domain
+   where correctness is non-negotiable. On conflict: `git merge --abort`, preserve the
+   worktree+branch, return `{ status: 'conflict', branch, files, baseRef }` as a
+   first-class result + a `merge_conflict` diagnostic, and DO NOT detonate the
+   `parallel()` batch (same non-throwing discipline as P0.4).
+3. **Resolver-agent = Tier 2, a SCRIPT pattern, not an engine feature.** Auto-resolution
+   stays at the orchestration layer: a workflow author opts in with
+   `onConflict → agent("resolve the conflict in worktree X …")` running inside the
+   conflicted worktree (sees the `<<<<<<<` markers, resolves, commits, re-merges). This
+   keeps LLM judgment in the resumable script (spec §12 determinism), visible and
+   journaled — not buried in a non-deterministic engine merge. Not built now (YAGNI:
+   conflicts are rare in well-decomposed fan-out); enabled by Tier 1's structured result.
+
+#### Task H.1.1: Worktree lifecycle module (`git-worktree.ts`)
+
+- [x] Done
+
+**Context:** No worktree code exists (grep-confirmed). The git checkpointer
+(`git-checkpoint.ts`) is the precedent for an engine-owned, fenced, pure-by-injection
+shell module: a `git()` factory `shell.cwd(dir).nothrow()` with `.quiet()` appended per
+call (the TTY-safety fix, T.1), `exitCode`-inspected, never rejecting into the run.
+
+**Implementation vision:** New module mirroring `git-checkpoint.ts` structure (dead-latch
+on no-shell/non-repo, `CheckpointLogger`-style logger). Exports `createWorktreeManager({
+shell, directory, logger })` → `{ create, mergeBack, cleanup, sweep }`.
+- `create(key) → { dir, branch } | null`: `git worktree add -b wf/<runId>/<label> <dir> HEAD`
+  where `<dir>` is a managed root OUTSIDE the repo working tree (a checkout inside the
+  tree would become a nested status/ignore hazard, and inside `.git` is illegal for a
+  worktree checkout). Use a sibling/temp root, e.g. the OS temp dir or `<repo>/../`-rooted
+  `.wf-worktrees/<runId>/<label>`; mirror the host convention `git worktree add --detach`/`-b`
+  from `.references/opencode/.../worktree/index.ts:235`. Record the chosen root in the module.
+  **Serialized**: N concurrent agents = N concurrent `git worktree add` against one repo;
+  funnel creates through a single promise-chain mutex (the module owns it) so adds never
+  race the index lock. Returns null (→ caller degrades) on non-repo/failure.
+- `mergeBack(dir, branch) → { merged: true } | { conflict: true, files: string[] }`: from
+  the MAIN tree, `git merge --no-ff <branch>`; on non-zero with conflict markers, capture
+  `git diff --name-only --diff-filter=U`, `git merge --abort`, return conflict. Caller
+  serializes this via `checkpointTail`.
+- `isUnchanged(dir)`: `git -C <dir> status --porcelain` empty AND no commits ahead of HEAD.
+- `cleanup(dir, branch)`: `git worktree remove --force <dir>` + `git branch -D <branch>`
+  (best-effort, fenced).
+- `sweep()`: prune orphan `wf/*` worktrees+branches from a crashed prior run (called at
+  engine ready/dispose).
+
+**Files:** Create `packages/workflows/src/plugin/git-worktree.ts`; Test
+`packages/workflows/src/plugin/git-worktree.test.ts` (tagged-template shell fake exactly
+like `git-checkpoint.test.ts` — including the `.quiet()` ShellPromise model from T.1).
+
+**Verification:** `bun test packages/workflows/src/plugin/git-worktree.test.ts` — create
+serializes, mergeBack clean vs conflict both modeled, cleanup/sweep fenced. Every git
+command asserted `.quiet()` (TTY safety, reuse the T.1 `quietedCommands` pattern).
+
+**Done when:** the manager creates/merges/cleans/sweeps against a faked shell with full
+fencing + serialization, no real git.
+
+#### Task H.1.2: Mint per-agent worktree (replace P0.4 degrade-to-null)
+
+- [x] Done
+
+**Context:** `agent-call.ts:396-413` currently degrades `isolation:'worktree'` to null
+(emits `IsolationUnsupportedError`, `isolation_unsupported` diagnostic) BEFORE
+`gate.acquire` (:423). The launch already injects an optional `directory` at
+`agent-call.ts:520` (`...(directory !== undefined ? { directory } : {})`) → `session.create`
+query (`session-runner.ts:464-466`). `directory` is excluded from `computeCallKey`
+(`agent-call.ts:168-175`) so a worktree path won't re-key cached agents.
+
+**Implementation vision:** When `opts.isolation === 'worktree'` AND a worktree manager is
+threaded in (see H.1.6): call `manager.create(key)` AFTER `gate.acquire` (a created
+worktree holds a real resource — don't create one the gate would reject). On success, use
+ITS dir at the `runner.launch({ directory })` injection (overriding the run-wide
+`deps.directory`), and register the worktree for teardown in the agent's `finally`. On
+`create` returning null (non-repo) OR no manager present, KEEP the existing degrade-to-null
+fallback (loud, non-detonating). The per-agent worktree dir is minted HERE, not run-wide.
+
+**Files:** Modify `packages/workflows/src/runtime/agent-call.ts:396-413,511-529,681`
+(finally); `packages/workflows/src/runtime/types.ts:22` (isolation already there).
+
+**Verification:** `bun test packages/workflows/src/runtime/` — a worktree agent launches
+with `directory=<worktree>` in the session.create query; a non-repo worktree request still
+degrades-to-null without detonating the batch.
+
+**Done when:** an isolated agent runs in its own worktree dir (create-time bound); the
+no-repo path preserves P0.4 fail-loud.
+
+#### Task H.1.3: verifyDiff + merge-back on agent:end
+
+- [x] Done
+
+**Context:** The per-run checkpointer (`engine.ts:929` `newRunCheckpointer`) and the
+commit chain (`engine.ts:940-973` `checkpointTail`, serialized in `agent:end` order) are
+bound to the single `opts.directory`. A worktree agent's edits live in its worktree, so
+the main checkpointer is blind to them; `verifyDiff` (`engine.ts:1047-1060`) likewise
+runs in `opts.directory`.
+
+**Implementation vision:** For a worktree agent, on settle: (1) run `verifyDiff` against
+the WORKTREE dir (`shell.cwd(<worktree>)`), not the main tree — re-root the verify shell
+to the worktree; (2) enqueue merge-back on the SAME `checkpointTail` that serializes
+commits (so merges/commits never interleave): if `isUnchanged` → `cleanup`; else
+`mergeBack` from the main tree; clean → the main checkpointer's next `checkpoint` captures
+the merged result; conflict → emit the Tier 1 result (H.1.4) and SKIP cleanup (preserve for
+inspection/Tier 2). Reuse the existing `awaitCheckpointClear` barrier (`agent-call.ts:432-440`)
+so the next agent's launch waits behind the merge drain.
+
+**Files:** Modify `packages/workflows/src/plugin/engine.ts` (checkpoint/verify wiring
+~940-973, ~1010-1077, ~1047-1060); `git-worktree.ts` (consumed here).
+
+**Verification:** `bun test packages/workflows/src/plugin/engine.test.ts` — worktree-agent
+verifyDiff runs in the worktree; a clean run merges back and the merged paths appear in a
+main-tree commit; an unchanged run is cleaned up with no commit.
+
+**Done when:** isolated edits land in the main tree via serialized merge-back; verifyDiff
+judges the worktree; unchanged worktrees auto-clean.
+
+#### Task H.1.4: Conflict as a first-class result (Tier 1)
+
+- [x] Done
+
+**Context:** Agent results flow through the journal/return path; diagnostics use the
+`DiagnosticReason` union (`runtime/types.ts:155-176`, where `isolation_unsupported` lives).
+
+**Implementation vision:** Add a `merge_conflict` `DiagnosticReason`. On a merge conflict
+(H.1.3), the agent's result becomes `{ status: 'conflict', branch, files, baseRef }`
+(a structured value the script can branch on), emit the diagnostic + a loud `warn`, and
+DO NOT throw (mirror P0.4's non-detonating discipline at `agent-call.ts:388-395`). The
+worktree+branch are preserved (not cleaned) so a Tier 2 script step can resolve them.
+
+**Files:** Modify `packages/workflows/src/runtime/types.ts:155-176`;
+`packages/workflows/src/plugin/engine.ts` (merge-back result mapping).
+
+**Verification:** `bun test` — a forced conflict yields a `conflict` result + a
+`merge_conflict` diagnostic, the sibling agents in the same `parallel()` still settle, and
+the conflicted worktree survives.
+
+**Done when:** conflicts surface structurally and loudly without batch detonation; the
+worktree is preserved for opt-in Tier 2 resolution.
+
+#### Task H.1.5: Cleanup + crash-safety sweep
+
+- [x] Done
+
+**Context:** A crashed run leaves orphan `wf/*` worktrees + branches. The engine has
+`ready()`/`dispose()` lifecycle hooks.
+
+**Implementation vision:** Call `manager.sweep()` at engine `ready()` (prune orphans from a
+prior crash) and ensure agent `finally` (`agent-call.ts:681`) tears down its own worktree
+unless it is a preserved conflict. Sweep is fenced + best-effort (never blocks a run).
+
+**Files:** Modify `packages/workflows/src/plugin/engine.ts` (ready/dispose);
+`packages/workflows/src/runtime/agent-call.ts:681`.
+
+**Verification:** `bun test` — sweep removes a simulated orphan worktree/branch; a normal
+agent's worktree is cleaned on teardown; a conflict worktree is NOT swept while referenced.
+
+**Done when:** no orphan worktrees accumulate across runs or crashes; conflict worktrees
+persist until resolved.
+
+#### Task H.1.6: Engine wiring (construct + thread the manager)
+
+- [x] Done
+
+**Context:** The plugin destructures `{ client, directory, $ }` at `plugin/index.ts:61`
+and passes `shell: $` to `createWorkflowEngine` (`index.ts:105`). The engine constructs the
+per-run checkpointer; it does not construct a worktree manager. `WorkflowRunDeps`
+(`runtime/index.ts:174`) and `AgentPrimitiveDeps` (`agent-call.ts:175`) carry the inert
+`directory` seam.
+
+**Implementation vision:** Construct `createWorktreeManager({ shell: $, directory, logger })`
+in the engine (one per engine, like the checkpointer's shared probe), thread it through
+`WorkflowRunDeps`/`AgentPrimitiveDeps` to `agent-call.ts` so H.1.2 can reach it. Absent
+shell → manager is a documented no-op (isolation requests degrade-to-null, as today).
+
+**Files:** Modify `packages/workflows/src/plugin/engine.ts` (construct + pass);
+`packages/workflows/src/runtime/index.ts:174,321`; `packages/workflows/src/runtime/agent-call.ts:175,220`.
+
+**Verification:** full `bun test` + `bun run typecheck` green; an engine with `$` exposes a
+live manager, an engine without `$` no-ops isolation.
+
+**Done when:** the manager is constructed once and reachable at the isolation mint-point;
+no-shell engines behave exactly as today.
+
+#### Post-implementation adversarial review (2026-06-09)
+
+H.1.1–H.1.6 were implemented autonomously (gate green: typecheck + 875 tests). An
+independent adversarial review then found **two MEDIUM lost-work-under-contention
+defects** — both in the danger zone the epic exists to eliminate — now fixed + tested:
+
+1. **Cross-lock race (MEDIUM → fixed).** `git worktree add` was serialized on the
+   manager's own `createTail`, INDEPENDENT of the `checkpointTail` that serializes
+   merges/commits. Because `gate.release` precedes the merge-back settle, agent N+1's
+   create could race agent N's merge for the `.git` ref locks → the loser's merge exits
+   non-zero with zero unmerged files → a phantom `{failed}` → dropped work (the #5 tail
+   re-entering through a lock race, under the exact parallel load this epic makes safe).
+   **Fix:** the mint now routes `create` through `serializeOnCheckpoint`
+   (`agent-call.ts`), so create/commit/merge are one mutually-exclusive chain. Test:
+   "BOTH the create and the merge-back are serialized on serializeOnCheckpoint".
+2. **`{failed}` silently destroyed work (MEDIUM → fixed).** A non-conflict merge failure
+   fell through to `cleanup` (worktree + branch deleted) with only a debug warn — the
+   agent recorded its text result, so a resumed run replayed a false `ok` while the edits
+   were gone. **Fix:** `{failed}` now PRESERVES the worktree+branch (recoverable), emits a
+   loud `merge_failed` diagnostic (new `DiagnosticReason`), and degrades the agent to null
+   (journals nothing → resume re-attempts). Test: "a FAILED (non-conflict) merge PRESERVES
+   the worktree and degrades the agent to null". The two original tests had encoded the
+   defective behavior as intended; both were rewritten to assert the corrected behavior.
+
+Residual (accepted, low): the engine test fake shares one dirty-set across cwds (does not
+model worktree/main isolation), so lost-work assertions are weaker than a real worktree —
+test-fidelity follow-up, not a production defect.
+
+---
+
+## TTY track — Engine shell output never corrupts the host TUI — ✅ COMPLETE (2026-06-09)
+
+### Epic T.1: Quiet every engine-owned shell invocation
+
+**Goal:** the engine's `$` (git checkpointer + verifyDiff check) never echoes to the host
+TTY. **Root cause (diagnosed + adversarially verified):** the plugin host runs in the same
+OS process as the opencode opentui renderer and shares fd 1/2; Bun's `$` ECHOES each
+command's stdout/stderr unless `.quiet()` is engaged. The code awaited the ShellPromise
+then read `.text()` off the resolved buffer (`ShellOutput.text()`, no auto-quiet) — so git
+commit summaries and `tsc`/`eslint` output punched raw bytes through the TUI alt-buffer.
+**Fix:** append `.quiet()` to the ShellPromise (NOT the namespace — `$.cwd().nothrow()`
+returns the namespace, which has no `.quiet()`; `.quiet()` lives on the promise, after the
+template) at all 8 `git()` sites in `git-checkpoint.ts` and the verifyDiff check in
+`engine.ts:1057`. **ORTHOGONAL to H.1**: worktree isolation changes WHERE git runs, not
+WHETHER its output is suppressed. **Verified:** typecheck + 816 tests green; 2 regression
+tests assert the `rev-parse` probe and the verifyDiff check command are quieted.
 
 ---
 
