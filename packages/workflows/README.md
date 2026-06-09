@@ -373,8 +373,11 @@ Some workflows ship **inside the plugin** and resolve by name with no file on di
 | Name | What it does |
 |---|---|
 | `deep-research` | Fans out web searches across independent angles, extracts checkable claims with source URLs, adversarially verifies each claim against its own source (dropping the unsupported ones), and synthesizes a cited report. Invoke with `{ "name": "deep-research", "args": "{\"question\": \"…\"}" }`. |
+| `rolling-wave` | Executes a multi-phase plan in rolling waves: decomposes a goal into ordered tasks, then per task implements (with `verifyDiff` proving disk truth) → reviews against the real git diff (`contextDiff`) → fixes what the review flags and re-reviews, stopping the wave on a red gate rather than compounding onto broken work, then synthesizes a report. Invoke with `{ "name": "rolling-wave", "args": "{\"goal\": \"…\"}" }` (optionally add `"testCmd"`). |
 
 `deep-research`'s research agents request the `tools` allowlist `["websearch", "webfetch", "exa", "firecrawl"]` — names are environment-dependent, so whichever your OpenCode/MCP setup provides activates and the rest are no-ops. If your deployment names web tools differently, the built-in source is the place to adjust.
+
+`rolling-wave` is the canonical multi-phase starting point — copy its source as the skeleton for a phased-plan execution workflow. Its `agentType` triad (`planner`/`domain-engineer`/`code-reviewer`) is environment-dependent and falls back to the generalist if your deployment does not register those names; the optional `args.testCmd` becomes the implementer's `verifyDiff` command check (absent → `verifyDiff` asserts a non-empty diff instead).
 
 A `/deep-research <question>` slash-command wrapper ships at `.opencode/command/deep-research.md` in this package; copy it into your project's `.opencode/command/` to get the ergonomic invocation (OpenCode has no plugin-level command registration, so command files are project-scoped).
 

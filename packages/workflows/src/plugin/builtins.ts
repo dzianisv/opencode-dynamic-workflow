@@ -12,14 +12,16 @@
  * this registry through {@link lookupBuiltin}.
  *
  * Phase 2 shipped the mechanism with an empty registry; Phase 3 adds the
- * `deep-research` source.
+ * `deep-research` and `rolling-wave` sources.
  */
 
 import { DEEP_RESEARCH_SOURCE } from "./builtin-deep-research";
+import { ROLLING_WAVE_SOURCE } from "./builtin-rolling-wave";
 
 /** Built-in name → workflow script source. */
 export const BUILTIN_WORKFLOWS: Record<string, string> = {
 	"deep-research": DEEP_RESEARCH_SOURCE,
+	"rolling-wave": ROLLING_WAVE_SOURCE,
 };
 
 /**

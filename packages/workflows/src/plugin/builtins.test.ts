@@ -23,6 +23,20 @@ describe("built-in workflows", () => {
 		]);
 	});
 
+	test("rolling-wave is registered and parses with the expected phases", () => {
+		const source = lookupBuiltin("rolling-wave");
+		expect(source).toBeDefined();
+		const parsed = parseScript(source as string);
+		expect(parsed.meta.name).toBe("rolling-wave");
+		expect(parsed.meta.phases?.map((p) => p.title)).toEqual([
+			"Decompose",
+			"Implement",
+			"Review",
+			"Fix",
+			"Synthesize",
+		]);
+	});
+
 	test("every built-in parses and its meta.name matches its registry key", () => {
 		for (const [name, source] of Object.entries(BUILTIN_WORKFLOWS)) {
 			const parsed = parseScript(source);

@@ -166,6 +166,26 @@ function architectureEcho(source: string | undefined): string[] {
 			`${pipelines} pipeline, ${parallels} parallel, ${workflows} workflow` +
 			`${hasSchema ? "; schema present" : ""}.`,
 	);
+
+	// Advisory nudges (heuristic, best-effort, never blocking) — at most two,
+	// schema first then disk-truth. These are regex heuristics over arbitrary JS
+	// and may false-positive; they lead with "consider:" and stay advisory.
+	const gatedShape = pipelines > 0 || parallels > 0;
+	// `\bverify\b` does NOT match inside `verifyDiff` (no word boundary after
+	// `verify`), so a good script using verifyDiff/contextDiff stays silent.
+	const hasDiskTruth = /\b(contextDiff|verifyDiff)\b/.test(source);
+	const reviewShape = /\b(review|fix|verify)\b/i.test(source);
+
+	if (gatedShape && !hasSchema) {
+		lines.push(
+			"consider: no schema detected — gated stages (parallel/pipeline) that branch on a result need schemas (free text cannot be gated).",
+		);
+	}
+	if (reviewShape && !hasDiskTruth) {
+		lines.push(
+			"consider: no disk-truth review detected — review/fix/verify stages should use contextDiff/verifyDiff (see the review-against-disk-truth pattern), not a self-run `git diff`.",
+		);
+	}
 	return lines;
 }
 
@@ -237,7 +257,7 @@ The body below the meta runs in an async context: use top-level await freely; a 
 
 ## Script API (the only globals available)
 
-- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, tools (string[] — enable named platform/MCP tools for this agent, e.g. web search/fetch for research; names are environment-dependent and a no-op if the platform lacks them; omit to inherit the session's tools), contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
+- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. If later control flow branches on a result (a count, a pass/fail, a list to fan out over), that agent MUST have a schema — free text cannot be gated. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, tools (string[] — enable named platform/MCP tools for this agent, e.g. web search/fetch for research; names are environment-dependent and a no-op if the platform lacks them; omit to inherit the session's tools), contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
 - pipeline(items, stage1, stage2, ...) → Promise<any[]> — run each item through all stages with NO barrier between stages: item A can be in stage 3 while item B is in stage 1. DEFAULT to this for multi-stage work. Each stage receives (prevResult, originalItem, index). A throwing stage drops that item to null.
 - parallel(thunks) → Promise<any[]> — run thunks (() => Promise) concurrently with a BARRIER: awaits all before returning; a failed thunk yields null, the call never rejects. Use ONLY when a later step genuinely needs ALL results together (dedup, cross-item comparison, early-exit on count).
 - phase(title) — start a progress group for subsequent agent() calls.
@@ -254,13 +274,17 @@ Date.now(), Math.random(), and argless new Date() are banned — they would pois
 
 Lifetime cap of 1000 agent() calls per run (cached replays count); 4096 items max per pipeline/parallel call; concurrent agents capped at min(16, cores − 2) — excess queue. agent() failures degrade to null; cap/budget violations throw and stop the run.
 
+## Acting on failures
+
+agent() failures and failed verifyDiff/contextDiff post-conditions degrade to null — the script keeps running unless you decide otherwise. When a stage gates downstream work, DECIDE explicitly: stop the run (throw), escalate (spawn a fix/repair agent), or record-and-continue. For SEQUENTIAL phases where phase N+1 builds on phase N's code, the default is to STOP on a red gate rather than compound onto broken work; for independent fan-out, record-and-continue and report the failures in the result.
+
 ## Resume and saved workflows
 
 Every successful agent() result is journaled. Relaunch with resume_from_run_id and every agent() call whose (prompt, opts) key matches a journaled call replays from cache (instant, zero tokens), matched per-item by key + occurrence — independent of position, so editing one item still replays unchanged items (including expensive siblings) for free; only changed, new, and previously-failed calls run live. N byte-identical calls replay their N journaled results, then the N+1th runs live. Replay returns the FROZEN journaled result; a call that re-runs live may legitimately return a different answer — agents are non-deterministic. Same script + same args → full cache hit; failures are never cached (they re-run). Survives opencode restarts. Saved workflows live at .opencode/workflows/<name>.js (or .mjs) in the project and are invoked by name.
 
 ## Patterns
 
-Six composable shapes — name the pattern in the script and the orchestration sharpens. Each is "spawn isolated agents, then combine"; mix them freely.
+Seven composable shapes — name the pattern in the script and the orchestration sharpens. Each is "spawn isolated agents, then combine"; mix them freely.
 
 - classify-and-act — one agent classifies the input, then branch/route to a specialist agent per class (or classify the OUTPUT at the end to shape it). Mixed backlogs, triage.
 - fan-out-and-synthesize — split into independent steps, agent() per step (clean context each, no cross-contamination), then a BARRIER synthesis step (parallel, then merge the structured outputs). Per-file audits, multi-angle research.
@@ -268,6 +292,9 @@ Six composable shapes — name the pattern in the script and the orchestration s
 - generate-and-filter — overgenerate N candidates, then a judge agent keeps only the rubric-passers. The generator and the judge MUST be different agents — a generator grading its own output is self-preference again. Naming, design exploration.
 - tournament — N agents attempt the SAME task with different approaches; a judge compares them PAIRWISE ("is A better than B?") until one wins — comparative judgment is more reliable than absolute 1–10 scoring. The deterministic JS loop holds the bracket; only the running order stays in context. Taste-based ranking, sorting 1000+ items. There is no tournament() primitive: use agent() + a plain loop — keeping the bracket in JS is exactly what preserves resume.
 - loop-until-done — for unknown-size work, loop spawning agents until a stop condition is met (no new findings for K rounds, no errors left in the logs) instead of a fixed pass count; pair with the budget guard as a ceiling. Bug hunts, log-driven root-cause.
+- review-against-disk-truth — reviewers get contextDiff:true so they review the engine-computed REAL git diff (and the review is REFUSED when the diff is empty, so a reviewer can never pass on narrative-only claims); implement/fix agents get verifyDiff (verifyDiff:true asserts the unit wrote to disk; verifyDiff:{check:'<cmd>'} asserts a command exits 0). Never review by telling an agent to run \`git diff\` itself — contextDiff is the engine's tamper-proof channel. Code review, fix loops.
+
+Route by role with agentType: prefer a specialist (a domain engineer for implementation, dedicated reviewer agents for review, a planning agent for decomposition) over the default generalist whenever one exists; a parallel panel of distinct reviewer agentTypes catches what one generalist misses, and a narrower panel on later rounds saves tokens.
 
 ## Minimal example
 
@@ -286,7 +313,21 @@ Six composable shapes — name the pattern in the script and the orchestration s
   const fixed = await parallel(args.files.map((f) =>
     () => agent('Fix the failing tests in ' + f + '.', { label: 'fix ' + f, verifyDiff: { check: 'bun test ' + f } }),
   ))
-  return { fixed: fixed.filter(Boolean) }`;
+  return { fixed: fixed.filter(Boolean) }
+
+## Multi-phase example (sequential, disk-truth review, stop-on-red)
+
+  export const meta = { name: 'run-plan', description: 'Execute phases: implement -> review -> fix', phases: [{ title: 'Implement' }, { title: 'Review' }] }
+  const GATE = { type: 'object', properties: { gatesPass: { type: 'boolean' }, findings: { type: 'array', items: { type: 'string' } } }, required: ['gatesPass', 'findings'] }
+  for (const p of args.phases) {
+    phase('Implement')
+    await agent('Implement phase ' + p + ' per the plan. Run the gates.', { agentType: 'domain-engineer', verifyDiff: { check: args.testCmd }, phase: 'Implement' })
+    phase('Review')
+    const r = await agent('Review phase ' + p + ' against the diff.', { agentType: 'code-reviewer', schema: GATE, contextDiff: true, phase: 'Review' })
+    if (!r || !r.gatesPass) { log('Phase ' + p + ' red — stopping before the next phase.'); break }
+  }
+
+agentType names are environment-dependent — the example's \`domain-engineer\`/\`code-reviewer\` are illustrative; substitute the agentTypes your platform actually registers.`;
 
 export function createWorkflowTool(
 	engine: WorkflowEngine,

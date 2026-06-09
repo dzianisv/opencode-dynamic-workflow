@@ -307,6 +307,69 @@ return 1;
 		// Run-id-first line still intact; no detected-primitives block.
 		expect(out).toContain("wf_resumeA");
 		expect(out.toLowerCase()).not.toContain("detected");
+		// A resume emits no source-derived nudges either.
+		expect(out).not.toContain("consider:");
+		await engine.dispose();
+	});
+
+	test("schema nudge fires on a gated, schema-less script (Task 2.1.2)", async () => {
+		const SCRIPT = `export const meta = { name: "gate-untyped", description: "d" };
+const results = await parallel(args.files.map((f) => () => agent("Summarize " + f)));
+return { results };
+`;
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0004") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: SCRIPT }, ctx("ses_parent"));
+
+		expect(out).toContain("no schema detected");
+		expect(out.toLowerCase()).toContain("consider");
+		// Neutral verb + no disk-truth tokens → disk-truth nudge stays silent.
+		expect(out).not.toContain("disk-truth");
+		await engine.dispose();
+	});
+
+	test("schema nudge silent on a gated script that sets a schema (Task 2.1.2)", async () => {
+		const SCRIPT = `export const meta = { name: "gate-with-schema", description: "d" };
+const results = await parallel(args.files.map((f) => () => agent("Summarize " + f, { schema: { type: 'object' } })));
+return { results };
+`;
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0005") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: SCRIPT }, ctx("ses_parent"));
+
+		expect(out).not.toContain("no schema detected");
+		await engine.dispose();
+	});
+
+	test("disk-truth nudge fires on a review-shaped script with no disk-truth token (Task 2.1.2)", async () => {
+		const SCRIPT = `export const meta = { name: "review-no-disktruth", description: "d" };
+const results = await parallel(args.files.map((f) => () => agent("Review " + f, { schema: { type: 'object' } })));
+return { results };
+`;
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0006") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: SCRIPT }, ctx("ses_parent"));
+
+		expect(out).toContain("disk-truth");
+		expect(out).toContain("review-against-disk-truth");
+		// Schema present → schema nudge stays silent, isolating the disk-truth assertion.
+		expect(out).not.toContain("no schema detected");
+		await engine.dispose();
+	});
+
+	test("disk-truth nudge silent on a script that uses verifyDiff/contextDiff (Task 2.1.2)", async () => {
+		// No bare review/fix/verify word — the only `verify` substring is inside
+		// `verifyDiff`, proving `\bverify\b` does not falsely trip the token.
+		const SCRIPT = `export const meta = { name: "good-disktruth", description: "d" };
+const results = await parallel(args.files.map((f) => () => agent("Inspect " + f, { contextDiff: true, schema: { type: 'object' } })));
+const repaired = await agent("Repair the unit", { verifyDiff: { check: 'bun test' }, schema: { type: 'object' } });
+return { results, repaired };
+`;
+		const { engine, facade } = makeEngine({ ids: fixedIds("wf_arch0007") });
+		const t = createWorkflowTool(engine, { directory: DIRECTORY, fs: facade });
+		const out = await run(t, { script: SCRIPT }, ctx("ses_parent"));
+
+		expect(out).not.toContain("disk-truth");
 		await engine.dispose();
 	});
 });
