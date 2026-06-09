@@ -194,7 +194,9 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 		agent: "build",
 		status: opts.status ?? "running",
 		createdAt: 1000,
-		startedAt: opts.startedAt ?? 1000,
+		// Honor an explicit `startedAt: undefined` (a never-started, still-queued
+		// task) — only default to 1000 when the key is absent entirely.
+		startedAt: "startedAt" in opts ? opts.startedAt : 1000,
 		depth: 0,
 		concurrencyKey: "anthropic/opus",
 	};
@@ -457,6 +459,26 @@ describe("safety poll", () => {
 		expect(h.task.status).toBe("cancelled");
 		expect(h.task.error).toMatch(/do not create a replacement/i);
 		expect(h.sdk.abortCalls).toEqual(["ses_child"]);
+	});
+
+	test("queue timeout → never-started task gets the queue-timeout reason, not stale", async () => {
+		// A still-queued task never acquired a slot, so it never ran (no
+		// `startedAt`). The stale force-cancel must use the queue-timeout reason
+		// rather than the mid-turn "went stale" one, so retry/triage logic keyed
+		// on the reason text is not misled.
+		const h = makeHarness({
+			status: "pending",
+			startedAt: undefined,
+			pollMs: 5000,
+			staleTimeoutMs: 45 * 60 * 1000,
+		});
+		h.gate.start();
+		h.clock.set(1000 + 46 * 60 * 1000); // past stale window (measured from createdAt)
+		h.timers.tick();
+		await flush();
+		expect(h.task.status).toBe("cancelled");
+		expect(h.task.error).toMatch(/never acquired a concurrency slot/i);
+		expect(h.task.error).not.toMatch(/went stale/i);
 	});
 
 	test("poll skips tasks that are still active (last activity within poll period)", async () => {
