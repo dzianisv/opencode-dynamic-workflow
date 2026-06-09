@@ -135,10 +135,194 @@ than `git add -A` (or `git add -u`).
 
 ---
 
+## Issue 4 — `workflow_status` says “No commit was created” while checkpoint commits exist
+
+**Severity:** high (operator trust / git safety)
+
+**What happened:**
+During the Matcher UI parity execution, `workflow_status --full` for the Phase 3
+workflow reported:
+
+```
+wf_mna7lden result.notes: ["No commit was created, per request."]
+wf_mna7lden result.filesChanged: ["docs/plans/2026-06-09-matcher-ui-parity-100.md"]
+```
+
+But `git log --oneline -8` in the Matcher repo showed checkpoint commits created
+by that same workflow:
+
+```
+2c63f553 workflow checkpoint: run=wf_mna7lden agent=task-3-3-2-final-bundle ...
+29da8261 workflow checkpoint: run=wf_mna7lden agent=task-3-3-1-discovery-contract ...
+98326c4b workflow checkpoint: run=wf_mna7lden agent=task-3-2-2-fee-schedule-limits ...
+b0fcbf60 workflow checkpoint: run=wf_mna7lden agent=task-3-2-1-fee-rules-tab ...
+e13bb739 workflow checkpoint: run=wf_mna7lden agent=task-3-1-4-context-surface ...
+908ea7d3 workflow checkpoint: run=wf_mna7lden agent=task-3-1-3-schedules-tab ...
+e14df14f workflow checkpoint: run=wf_mna7lden agent=task-3-1-2-existing-tab-tests ...
+cf5c6167 workflow checkpoint: run=wf_mna7lden agent=task-3-1-1-source-contract ...
+```
+
+The workflow was explicitly prompted with “Do not commit”, so either:
+- checkpoint commits are expected engine behavior and the result note is wrong,
+- or the engine violated the requested no-commit constraint.
+
+Either way, the operator-facing status lied about the most important mutable
+state: git history.
+
+**Why it matters:**
+- “No commit was created” is a safety claim. If false, it can make an operator
+  continue work on top of unexpected history.
+- `filesChanged` being reduced to the plan file hid the actual code changes,
+  which were present in checkpoint commits rather than the working tree.
+- The only reliable way to reconcile the run was manual `git log`, `git status`,
+  file inspection, and re-running gates.
+
+**Possible directions:**
+- Make checkpoint commits explicit in `workflow_status` regardless of agent
+  prompt wording: list commit SHA, agent, phase, and whether the commit is a
+  checkpoint vs. user-requested final commit.
+- Do not allow result synthesis agents to claim “No commit was created” unless
+  the engine injects git-truth into the final status.
+- Distinguish “no final user commit was created” from “checkpoint commits were
+  created”. The current wording collapses two very different facts.
+
+---
+
+## Issue 5 — `filesChanged` in workflow results is incomplete and misleading
+
+**Severity:** high (result correctness / auditability)
+
+**What happened:**
+In multiple Matcher UI parity workflows, the final structured result claimed only
+the plan file changed:
+
+```
+wf_ff3goj56 result.filesChanged: ["docs/plans/2026-06-09-matcher-ui-parity-100.md"]
+wf_mna7lden result.filesChanged: ["docs/plans/2026-06-09-matcher-ui-parity-100.md"]
+```
+
+But the completed work included route files, UI components, tests, generated route
+tree updates, API contract tests, and docs. Examples observed on disk after the
+run:
+
+```
+ui/src/routes/matcher.studio.sources.tsx
+ui/src/routes/matcher.studio.rules.tsx
+ui/src/routes/matcher.reconciliation.contexts.new.tsx
+ui/src/components/context-setup/schedules-tab.tsx
+ui/src/components/context-setup/fee-rules-tab.tsx
+ui/src/api/sources.test.tsx
+ui/src/api/schedules.test.tsx
+ui/src/components/context-setup/*-tab.test.tsx
+```
+
+The code was real — route parity, a11y smoke, UI contract tests, typecheck, lint,
+and backend unit tests passed. The structured result was the broken part.
+
+**Why it matters:**
+- `filesChanged` is used as the operator’s first-pass audit surface. If it omits
+  nearly all code changes, it is worse than absent.
+- A reviewer could wrongly assume the workflow only updated a plan and skip code
+  review entirely.
+- This forces manual reconciliation via git/disk/test commands after every
+  workflow, defeating the purpose of structured results.
+
+**Possible directions:**
+- Populate `filesChanged` from git truth (`git diff --name-status` plus
+  checkpoint commit file lists), not from agent self-report.
+- Include both working-tree changes and checkpoint-commit changes.
+- Add a status warning when agent-reported `filesChanged` disagrees with git
+  truth.
+
+---
+
+## Issue 6 — Ignored plan files create “ghost source of truth” behavior
+
+**Severity:** medium (operator confusion / reproducibility)
+
+**What happened:**
+The live rolling-wave plan for Matcher UI parity was written to:
+
+```
+docs/plans/2026-06-09-matcher-ui-parity-100.md
+```
+
+That path is ignored by the Matcher repo:
+
+```
+.gitignore:47:docs/plans/
+```
+
+The main session could read and patch the file, but subagents sometimes reported
+that the file or `docs/plans/` did not exist. Meanwhile, the workflow checkpoint
+and `filesChanged` surfaces referenced the ignored file as if it were the primary
+changed artifact.
+
+**Why it matters:**
+- The workflow can treat an ignored, untracked file as the living source of truth,
+  but the file will not travel with the branch and may not be visible to agents
+  depending on their checkout/sandbox behavior.
+- `git status` does not show it, so an operator can believe the plan was saved
+  when it is actually a local ghost file.
+- Subagents may fail plan review because the ignored plan is unavailable, causing
+  false blockers unrelated to the task.
+
+**Possible directions:**
+- Warn when a workflow script references a plan/spec file that is ignored by git.
+- Include ignored referenced files in `workflow_status` diagnostics: tracked,
+  ignored, untracked, or missing from agent sandbox.
+- If a workflow uses an ignored file as source-of-truth, require explicit opt-in
+  or suggest a tracked path.
+
+---
+
+## Issue 7 — Executability/mode changes are easy to miss in workflow evidence
+
+**Severity:** medium (release gate reliability)
+
+**What happened:**
+In the Phase 1 Matcher UI parity workflow (`wf_5549jqh5`), the release-bundle
+guard stopped on:
+
+```
+./scripts/check-ui-production-bundle.sh: permission denied
+```
+
+The actual fix was a file-mode change:
+
+```
+chmod +x scripts/check-ui-production-bundle.sh
+```
+
+After that, the guard passed. The final tracked status showed only:
+
+```
+M scripts/check-ui-production-bundle.sh
+```
+
+which is a mode-only change in practice, but the workflow result did not make the
+mode change prominent as the reason the gate was unblocked.
+
+**Why it matters:**
+- A script can be content-identical but still fail every CI/local release gate due
+  to mode bits.
+- Standard `filesChanged` output does not distinguish content edits from mode
+  changes, so reviewers can miss why a file changed.
+- The operator had to rerun the guard manually to prove the mode fix.
+
+**Possible directions:**
+- Surface mode-only changes explicitly in workflow status and file summaries
+  (`100644 -> 100755`).
+- When a command fails with `permission denied` for a repo script, suggest or
+  perform a mode-check diagnostic (`git diff --summary`, `ls -l`).
+- Include mode changes in checkpoint/file-change summaries, not just paths.
+
+---
+
 ## Meta note
 
 The tool *surface* (the `workflow` / `workflow_status` / `workflow_stop` schemas)
-is unchanged from before the plugin update — all three issues live in the engine
+is unchanged from before the plugin update — these issues live in the engine
 (checkpointing + verifyDiff timing), and were only discoverable by inspecting
 `git log` / `git status` / re-running the gate by hand. Consider surfacing more of
 this engine state in `workflow_status --full` so an operator doesn't have to drop
