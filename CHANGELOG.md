@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.2.0...v1.3.0) (2026-06-09)
+
+
+### Features
+
+* **workflows:** per-agent git worktree isolation with TUI-safe engine shell ([c8034a4](https://github.com/fredcamaral/opencode-drawers/commit/c8034a4fd2d8199a82db2bfeebc4ab7a6348345c))
+
 # [1.2.0](https://github.com/fredcamaral/opencode-drawers/compare/v1.1.0...v1.2.0) (2026-06-09)
 
 
