@@ -51,11 +51,22 @@ function makeShell(stubs: Stub[] = []) {
 			text: () => out.stdout,
 		});
 	};
+	const quietedCommands: string[] = [];
 	const shell = (strings: TemplateStringsArray, ...expressions: unknown[]) => {
 		const cmd = reconstruct(strings, expressions);
 		commands.push(cmd);
 		const stub = stubs.find((s) => s.match(cmd));
-		return makeResult(stub?.out ?? { stdout: "", stderr: "", exitCode: 0 });
+		const p = makeResult(stub?.out ?? { stdout: "", stderr: "", exitCode: 0 });
+		// The real Bun ShellPromise carries `.quiet()` (the NAMESPACE does not); the
+		// checkpointer appends it per-call to stop the echo to the host TTY. Model it on
+		// the returned promise so a test can assert a SPECIFIC command was suppressed.
+		Object.assign(p, {
+			quiet: () => {
+				quietedCommands.push(cmd);
+				return p;
+			},
+		});
+		return p;
 	};
 	const chain = Object.assign(shell, {
 		cwd: () => chain,
@@ -66,7 +77,7 @@ function makeShell(stubs: Stub[] = []) {
 		throws: () => chain,
 	});
 	// biome-ignore lint/suspicious/noExplicitAny: structural BunShell fake for tests.
-	return { shell: chain as any, commands };
+	return { shell: chain as any, commands, quietedCommands };
 }
 
 const ok = (stdout = ""): FakeOutput => ({ stdout, stderr: "", exitCode: 0 });
@@ -213,6 +224,28 @@ describe("createGitCheckpointer — ready() dead-latch", () => {
 		expect(
 			commands.filter((c) => c.includes("is-inside-work-tree")).length,
 		).toBe(1);
+	});
+});
+
+describe("createGitCheckpointer — output suppression (TTY safety)", () => {
+	test("every git invocation is fenced with .quiet() so output never echoes to the host TTY", async () => {
+		// The engine + plugin host run in the same OS process as the opencode opentui
+		// renderer, sharing fd 1/2. An un-quieted BunShell echoes git's stdout/stderr
+		// (e.g. the commit summary) onto the TUI alt-buffer, corrupting the screen. The
+		// fenced `git()` factory MUST engage `.quiet()` so every git command only buffers.
+		const { shell, commands, quietedCommands } = makeShell([
+			{
+				match: (c) => c.includes("rev-parse --is-inside-work-tree"),
+				out: ok("true"),
+			},
+		]);
+		const cp = createGitCheckpointer({ shell, directory: "/proj", clock });
+		expect(await cp.ready()).toBe(true);
+		// The probe ran AND was quieted: the engine + the opentui renderer share the
+		// host TTY, so an un-quieted git command would corrupt the screen.
+		const probe = "git rev-parse --is-inside-work-tree";
+		expect(commands).toContain(probe);
+		expect(quietedCommands).toContain(probe);
 	});
 });
 

@@ -23,7 +23,19 @@ import {
 	type IntentJournalEntry,
 	type JournalEntry,
 	type ProgressEvent,
+	type WorktreeManagerSeam,
 } from "./types";
+
+/** A no-op worktree manager satisfying the opaque seam (Epic H.1.6 plumbing test). */
+function noopWorktreeManager(): WorktreeManagerSeam {
+	return {
+		create: async () => null,
+		mergeBack: async () => ({ merged: true }),
+		isUnchanged: async () => true,
+		cleanup: async () => undefined,
+		sweep: async () => undefined,
+	};
+}
 
 /**
  * A deferred completion handle: lets a test control exactly when a launched
@@ -205,8 +217,11 @@ interface HarnessOverrides {
 	verifyResult?: (opts: {
 		verifyDiff: boolean | { check?: string };
 		sessionId?: string;
+		directory?: string;
 	}) => Promise<{ passed: boolean; available: boolean; reason?: string }>;
 	directory?: string;
+	worktreeManager?: WorktreeManagerSeam;
+	serializeOnCheckpoint?: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 function harness(overrides: HarnessOverrides = {}) {
@@ -246,6 +261,12 @@ function harness(overrides: HarnessOverrides = {}) {
 			: {}),
 		...(overrides.directory !== undefined
 			? { directory: overrides.directory }
+			: {}),
+		...(overrides.worktreeManager !== undefined
+			? { worktreeManager: overrides.worktreeManager }
+			: {}),
+		...(overrides.serializeOnCheckpoint !== undefined
+			? { serializeOnCheckpoint: overrides.serializeOnCheckpoint }
 			: {}),
 	});
 	return {
@@ -391,6 +412,20 @@ describe("createAgentPrimitive — structured output (schema)", () => {
 		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
 		const { agent } = harness({ runner });
 		await agent("do it");
+		expect(runner.launches[0]?.directory).toBeUndefined();
+	});
+
+	test("deps.worktreeManager is accepted and inert today (Epic H.1.6 plumbing)", async () => {
+		// H.1.6 threads the manager handle only; H.1.2 will consume it. A non-isolated
+		// agent runs identically whether or not a manager is injected — no launch is
+		// re-rooted and nothing degrades.
+		const runner = new FakeRunner({ status: "completed", summaryText: "ok" });
+		const { agent } = harness({
+			runner,
+			worktreeManager: noopWorktreeManager(),
+		});
+		expect(await agent("do it")).toBe("ok");
+		expect(runner.launches).toHaveLength(1);
 		expect(runner.launches[0]?.directory).toBeUndefined();
 	});
 
@@ -864,6 +899,534 @@ describe("createAgentPrimitive — launch wiring and live tasks", () => {
 		]);
 		expect(bad).toBeNull();
 		expect(good).toBe("SIBLING_OK");
+	});
+});
+
+// ---- Task H.1.2: mint a per-agent worktree (replace P0.4 degrade-to-null) -
+
+/** A worktree manager that records every call and mints a fixed handle. */
+function recordingWorktreeManager(
+	overrides: Partial<WorktreeManagerSeam> & {
+		createReturns?: { dir: string; branch: string } | null;
+	} = {},
+): WorktreeManagerSeam & {
+	creates: { runId: string; label: string }[];
+	cleanups: { dir: string; branch: string }[];
+	mergeBacks: { dir: string; branch: string }[];
+	unchangedChecks: string[];
+} {
+	const creates: { runId: string; label: string }[] = [];
+	const cleanups: { dir: string; branch: string }[] = [];
+	const mergeBacks: { dir: string; branch: string }[] = [];
+	const unchangedChecks: string[] = [];
+	const handle =
+		overrides.createReturns !== undefined
+			? overrides.createReturns
+			: { dir: "/tmp/wf/run-1/L", branch: "wf/run-1/L" };
+	return {
+		creates,
+		cleanups,
+		mergeBacks,
+		unchangedChecks,
+		create:
+			overrides.create ??
+			(async (key) => {
+				creates.push(key);
+				return handle;
+			}),
+		mergeBack:
+			overrides.mergeBack ??
+			(async (dir, branch) => {
+				mergeBacks.push({ dir, branch });
+				return { merged: true };
+			}),
+		isUnchanged:
+			overrides.isUnchanged ??
+			(async (dir) => {
+				unchangedChecks.push(dir);
+				return true;
+			}),
+		cleanup:
+			overrides.cleanup ??
+			(async (dir, branch) => {
+				cleanups.push({ dir, branch });
+			}),
+		sweep: overrides.sweep ?? (async () => undefined),
+	};
+}
+
+describe("createAgentPrimitive — worktree isolation mint (Task H.1.2)", () => {
+	test("an isolated agent launches with directory=<worktree>, overriding run-wide directory", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		});
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			// A run-wide directory the per-agent worktree must override.
+			directory: "/repo/main",
+		});
+
+		expect(await agent("mutate files", { isolation: "worktree" })).toBe("OK");
+
+		// One launch, re-rooted to the minted worktree (NOT the run-wide directory).
+		expect(runner.launches).toHaveLength(1);
+		expect(runner.launches[0]?.directory).toBe("/tmp/wf/run-1/iso");
+
+		// create() was called with the run key and a per-call-unique label segment:
+		// the display label folded with this call's deterministic index (collision-proof).
+		expect(manager.creates).toEqual([
+			{ runId: "run-1", label: "mutate files-0" },
+		]);
+
+		// Teardown registered in the finally: the minted worktree is cleaned up.
+		expect(manager.cleanups).toEqual([
+			{ dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		]);
+	});
+
+	test("create() runs AFTER gate.acquire (a created worktree holds a real resource)", async () => {
+		const runner = new FakeRunner({ deferred: true });
+		const order: string[] = [];
+		const gate = new ConcurrencyManager({ defaultConcurrency: 5 });
+		const realAcquire = gate.acquire.bind(gate);
+		gate.acquire = (k: string) => {
+			order.push("acquire");
+			return realAcquire(k);
+		};
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			create: async () => {
+				order.push("create");
+				return { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" };
+			},
+		});
+		const { agent } = harness({ runner, gate, worktreeManager: manager });
+
+		const call = agent("mutate", { isolation: "worktree" });
+		await flush();
+		// create must not run before the gate slot is held.
+		expect(order).toEqual(["acquire", "create"]);
+
+		runner.releaseOne("completed");
+		await call;
+	});
+
+	test("create() returning null (manager present) degrades with worktree_mint_failed, NOT isolation_unsupported", async () => {
+		const runner = new FakeRunner({ summaryText: "OK" });
+		const manager = recordingWorktreeManager({ create: async () => null });
+		const { agent, events, diags } = harness({
+			runner,
+			worktreeManager: manager,
+		});
+
+		expect(await agent("p", { isolation: "worktree" })).toBeNull();
+
+		// Loud: warn + agent:end error. Because a manager IS threaded, the mint failure
+		// must be reported as worktree_mint_failed (isolation IS supported, the mint
+		// failed) and MUST NOT masquerade as isolation_unsupported.
+		expect(events.some((e) => e.type === "warn")).toBe(true);
+		const end = events.find((e) => e.type === "agent:end");
+		expect((end as { status: string }).status).toBe("error");
+		expect((end as { note?: string }).note).toContain("worktree_mint_failed");
+		expect((end as { note?: string }).note).not.toContain(
+			"isolation_unsupported",
+		);
+		expect(diags).toHaveLength(1);
+		expect(diags[0]?.reason).toBe("worktree_mint_failed");
+
+		// The warn names the true cause (a mint failure), not "not supported".
+		const warn = events.find((e) => e.type === "warn") as { message: string };
+		expect(warn.message.toLowerCase()).toContain("mint failed");
+		expect(warn.message).not.toContain("not supported");
+
+		// It did NOT run unisolated: no child session launched.
+		expect(runner.launches).toHaveLength(0);
+		expect(events.some((e) => e.type === "agent:launched")).toBe(false);
+	});
+
+	test("NO manager threaded keeps the genuine isolation_unsupported degrade", async () => {
+		const runner = new FakeRunner({ summaryText: "OK" });
+		// No worktreeManager at all: the feature has no primitive here.
+		const { agent, events, diags } = harness({ runner });
+
+		expect(await agent("p", { isolation: "worktree" })).toBeNull();
+
+		const end = events.find((e) => e.type === "agent:end");
+		expect((end as { status: string }).status).toBe("error");
+		expect((end as { note?: string }).note).toContain("isolation_unsupported");
+		expect(diags).toHaveLength(1);
+		expect(diags[0]?.reason).toBe("isolation_unsupported");
+		expect(runner.launches).toHaveLength(0);
+	});
+
+	test("colliding labels mint DISTINCT branches/dirs — the per-call index disambiguates", async () => {
+		// Two parallel isolated agents with the SAME label. The manager (git-worktree.ts)
+		// does NOT de-dup: identical labels would derive an identical branch+dir and the
+		// second create would fail. Folding the per-call index into the mint key makes
+		// each call's path/branch identity unique, so both creates carry distinct labels.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			create: async (key) => {
+				manager.creates.push(key);
+				return {
+					dir: `/tmp/wf/run-1/${key.label}`,
+					branch: `wf/run-1/${key.label}`,
+				};
+			},
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		const [a, b] = await Promise.all([
+			agent("mutate", { isolation: "worktree", label: "refuter" }),
+			agent("mutate", { isolation: "worktree", label: "refuter" }),
+		]);
+		expect(a).toBe("OK");
+		expect(b).toBe("OK");
+
+		// Same display label, but the index-folded mint labels are distinct → no collision.
+		const labels = manager.creates.map((c) => c.label).sort();
+		expect(labels).toEqual(["refuter-0", "refuter-1"]);
+		expect(labels[0]).not.toBe(labels[1]);
+	});
+
+	test("a null-create worktree request does NOT detonate its parallel() batch", async () => {
+		const runner = new FakeRunner({ summaryText: "SIBLING_OK" });
+		const manager = recordingWorktreeManager({ create: async () => null });
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		const [bad, good] = await Promise.all([
+			agent("needs-isolation", { isolation: "worktree" }),
+			agent("plain-sibling"),
+		]);
+		expect(bad).toBeNull();
+		expect(good).toBe("SIBLING_OK");
+	});
+
+	test("a throwing cleanup is fenced — the agent still resolves its result", async () => {
+		// The finally wraps worktreeManager.cleanup() in try/catch (degrade-don't-
+		// detonate). A teardown failure must neither reject the agent nor change its
+		// non-null result. A regression that removed the catch would surface here.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			create: async () => ({
+				dir: "/tmp/wf/run-1/iso",
+				branch: "wf/run-1/iso",
+			}),
+			cleanup: async () => {
+				throw new Error("worktree remove failed");
+			},
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		expect(await agent("mutate", { isolation: "worktree" })).toBe("OK");
+		expect(runner.launches).toHaveLength(1);
+	});
+
+	test("create() is gated under back-pressure — no mint without a held slot (limit-1)", async () => {
+		// A defaultConcurrency:1 gate: a deferred first isolated agent holds the only
+		// slot. A second isolated agent's create() must NOT fire until the first
+		// releases — proving the mint sits strictly BEHIND gate.acquire under contention
+		// (not merely after acquire on an always-available gate).
+		const runner = new FakeRunner({ deferred: true });
+		const gate = new ConcurrencyManager({ defaultConcurrency: 1 });
+		const manager = recordingWorktreeManager({
+			create: async (key) => {
+				manager.creates.push(key);
+				return {
+					dir: `/tmp/wf/run-1/${key.label}`,
+					branch: `wf/run-1/${key.label}`,
+				};
+			},
+		});
+		const { agent } = harness({ runner, gate, worktreeManager: manager });
+
+		const first = agent("a", { isolation: "worktree", label: "one" });
+		const second = agent("b", { isolation: "worktree", label: "two" });
+		await flush();
+		// The first holds the only slot and has minted; the second is parked on
+		// gate.acquire and has NOT minted.
+		expect(manager.creates).toHaveLength(1);
+		expect(manager.creates[0]?.label).toBe("one-0");
+
+		// Release the first; its slot frees and the second can finally mint + launch.
+		runner.releaseOne("completed");
+		await first;
+		await flush();
+		expect(manager.creates).toHaveLength(2);
+
+		runner.releaseOne("completed");
+		await second;
+	});
+
+	test("a non-isolated agent never mints a worktree even with a manager present", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager();
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			directory: "/repo/main",
+		});
+
+		expect(await agent("plain")).toBe("OK");
+		expect(manager.creates).toHaveLength(0);
+		expect(manager.cleanups).toHaveLength(0);
+		// The run-wide directory still applies on the non-isolated path.
+		expect(runner.launches[0]?.directory).toBe("/repo/main");
+	});
+});
+
+// ---- Task H.1.3: verifyDiff + merge-back on agent:end --------------------
+
+describe("createAgentPrimitive — worktree merge-back on settle (Task H.1.3)", () => {
+	test("a CHANGED isolated agent merges back, THEN cleans up (merged path)", async () => {
+		// isUnchanged:false → the worktree carries real work. The settle path must
+		// mergeBack the scratch branch into the main tree, and on a clean merge tear the
+		// worktree down. The merge must run BEFORE cleanup (merge-then-reclaim).
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const order: string[] = [];
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async (dir, branch) => {
+				order.push(`merge:${dir}:${branch}`);
+				return { merged: true };
+			},
+			cleanup: async (dir, branch) => {
+				order.push(`cleanup:${dir}:${branch}`);
+			},
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		expect(await agent("mutate", { isolation: "worktree" })).toBe("OK");
+
+		// mergeBack ran against the minted worktree's dir+branch, THEN cleanup.
+		expect(order).toEqual([
+			"merge:/tmp/wf/run-1/iso:wf/run-1/iso",
+			"cleanup:/tmp/wf/run-1/iso:wf/run-1/iso",
+		]);
+	});
+
+	test("an UNCHANGED isolated agent cleans up WITHOUT merging (auto-cleanup-if-unchanged)", async () => {
+		// isUnchanged:true → CC's cleanup-if-unchanged: no merge commit pollutes the main
+		// tree for a worktree that did nothing; the worktree is simply reclaimed.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => true,
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		expect(await agent("noop", { isolation: "worktree" })).toBe("OK");
+
+		expect(manager.mergeBacks).toHaveLength(0);
+		expect(manager.cleanups).toEqual([
+			{ dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		]);
+	});
+
+	test("a merge CONFLICT preserves the worktree (SKIP cleanup) + emits merge_conflict", async () => {
+		// Locked design decision #2: a conflict is Tier 1 — loud, first-class, NOT
+		// auto-resolved. The worktree+branch are PRESERVED (not cleaned) so a Tier 2
+		// resolver script can act on them, and a merge_conflict diagnostic surfaces.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async () => ({
+				conflict: true,
+				branch: "wf/run-1/iso",
+				files: ["src/A.ts"],
+				baseRef: "base0000",
+			}),
+		});
+		const { agent, diags } = harness({ runner, worktreeManager: manager });
+
+		await agent("mutate", { isolation: "worktree" });
+
+		// The conflicted worktree is PRESERVED for inspection / Tier 2 resolution.
+		expect(manager.cleanups).toHaveLength(0);
+		// A merge_conflict diagnostic surfaces (loud), naming the conflicted files.
+		const conflict = diags.find((d) => d.reason === "merge_conflict");
+		expect(conflict).toBeDefined();
+	});
+
+	test("a merge CONFLICT makes the agent result a first-class {status:'conflict'} value (Task H.1.4)", async () => {
+		// Tier 1: the conflict is not a thrown error and not the agent's text — it is a
+		// STRUCTURED result the script can branch on (status/branch/files/baseRef), so a
+		// Tier 2 resolver step can act on the preserved worktree deterministically.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async () => ({
+				conflict: true,
+				branch: "wf/run-1/iso",
+				files: ["src/A.ts", "src/B.ts"],
+				baseRef: "base0000",
+			}),
+		});
+		const { agent, events } = harness({ runner, worktreeManager: manager });
+
+		const result = await agent("mutate", { isolation: "worktree" });
+
+		// The result is the first-class conflict value — NOT the agent's "OK" text.
+		expect(result).toEqual({
+			status: "conflict",
+			branch: "wf/run-1/iso",
+			files: ["src/A.ts", "src/B.ts"],
+			baseRef: "base0000",
+		});
+		// A loud warn surfaces the conflict (mirrors P0.4's non-detonating discipline).
+		const warn = events.find(
+			(e) => e.type === "warn" && /conflict/i.test(e.message),
+		);
+		expect(warn).toBeDefined();
+	});
+
+	test("a CONFLICT does not detonate the batch — a sibling still settles (Task H.1.4)", async () => {
+		// The conflicting agent returns its structured value; a sibling agent in the same
+		// logical batch resolves normally (degrade-don't-detonate, mirroring P0.4).
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async () => ({
+				conflict: true,
+				branch: "wf/run-1/iso",
+				files: ["src/A.ts"],
+				baseRef: "base0000",
+			}),
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		const [conflicted, sibling] = await Promise.all([
+			agent("mutate", { isolation: "worktree" }),
+			agent("plain sibling"),
+		]);
+
+		expect(conflicted).toMatchObject({ status: "conflict" });
+		// The non-isolated sibling completed normally — the conflict did not throw.
+		expect(sibling).toBe("OK");
+	});
+
+	test("a FAILED (non-conflict) merge PRESERVES the worktree and degrades the agent to null", async () => {
+		// {failed} is a NON-conflict merge failure (operator dirtied the main tree mid-run,
+		// a transient failure, a lock-loss). The agent's edits are committed on the scratch
+		// branch but did NOT reach the main tree. Silently cleaning up here would DROP that
+		// work — the #5 lost-work catastrophe re-entering through the isolation path. So the
+		// worktree+branch are PRESERVED (recoverable), a LOUD merge_failed diagnostic fires,
+		// and the agent degrades to null so a resumed run re-attempts (nothing journaled).
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async () => ({ failed: true }),
+		});
+		const { agent, diags } = harness({ runner, worktreeManager: manager });
+
+		const result = await agent("mutate", { isolation: "worktree" });
+
+		// Degraded to null (the work did not land) — NOT the agent's "OK" text.
+		expect(result).toBeNull();
+		// PRESERVED: no cleanup ran, so the scratch branch still holds the recoverable work.
+		expect(manager.cleanups).toEqual([]);
+		// Surfaced LOUD as merge_failed; it is NOT a Tier 1 merge_conflict.
+		expect(diags.some((d) => d.reason === "merge_failed")).toBe(true);
+		expect(diags.some((d) => d.reason === "merge_conflict")).toBe(false);
+	});
+
+	test("BOTH the create and the merge-back are serialized on serializeOnCheckpoint", async () => {
+		// H.1.2/H.1.3: the `git worktree add` (create, at mint) AND the merge-back (at
+		// settle) both run on the SAME checkpointTail that serializes commits. An
+		// UNSERIALIZED create races a sibling's merge/commit for the `.git` ref locks → the
+		// loser's merge exits non-zero with zero unmerged files → a phantom {failed} →
+		// dropped work (the #5 tail through a lock race). Each runs inside its own barrier.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const trace: string[] = [];
+		const manager = recordingWorktreeManager({
+			create: async () => {
+				trace.push("create");
+				return { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" };
+			},
+			isUnchanged: async () => false,
+			mergeBack: async () => {
+				trace.push("merge");
+				return { merged: true };
+			},
+		});
+		const serializeOnCheckpoint = async <T>(
+			task: () => Promise<T>,
+		): Promise<T> => {
+			trace.push("enter-serialize");
+			const out = await task();
+			trace.push("exit-serialize");
+			return out;
+		};
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			serializeOnCheckpoint,
+		});
+
+		expect(await agent("mutate", { isolation: "worktree" })).toBe("OK");
+
+		// Create AND merge each ran strictly inside a serialize barrier, in separate cycles
+		// (create at mint, merge at settle) — never racing each other or a sibling.
+		expect(trace).toEqual([
+			"enter-serialize",
+			"create",
+			"exit-serialize",
+			"enter-serialize",
+			"merge",
+			"exit-serialize",
+		]);
+	});
+
+	test("verifyDiff for a worktree agent is checked against the WORKTREE dir", async () => {
+		// H.1.3 re-roots the verify shell to the worktree: the engine's verifyResult must
+		// receive the worktree dir so a `{check}` command runs in the isolated checkout,
+		// not the main tree (where the agent's edits do not yet exist).
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+		});
+		const verifyCalls: Array<{ directory?: string }> = [];
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			directory: "/repo/main",
+			verifyResult: async (opts) => {
+				verifyCalls.push({ directory: opts.directory });
+				return { passed: true, available: true };
+			},
+		});
+
+		await agent("mutate", {
+			isolation: "worktree",
+			verifyDiff: { check: "bun test" },
+		});
+
+		expect(verifyCalls).toHaveLength(1);
+		expect(verifyCalls[0]?.directory).toBe("/tmp/wf/run-1/iso");
+	});
+
+	test("a throwing mergeBack is fenced — the agent still resolves its result", async () => {
+		// Merge-back is best-effort wrt the agent's resolution (degrade-don't-detonate): a
+		// thrown mergeBack must neither reject the agent nor change its non-null result.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+			mergeBack: async () => {
+				throw new Error("merge exploded");
+			},
+		});
+		const { agent } = harness({ runner, worktreeManager: manager });
+
+		expect(await agent("mutate", { isolation: "worktree" })).toBe("OK");
 	});
 });
 

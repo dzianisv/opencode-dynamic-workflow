@@ -214,12 +214,16 @@ function makeShell(
 		commands.push(cmd);
 		const r = reply(cmd);
 		const text = r.stdout ?? "";
-		return Promise.resolve({
+		const p = Promise.resolve({
 			stdout: { toString: () => text },
 			stderr: { toString: () => r.stderr ?? "" },
 			exitCode: r.exitCode ?? 0,
 			text: () => text,
 		});
+		// `.quiet()` lives on the ShellPromise (not the namespace); the engine appends it
+		// per-call to suppress the echo to the host TTY. Model it as a chainable no-op.
+		Object.assign(p, { quiet: () => p });
+		return p;
 	};
 	const chain = Object.assign(shell, {
 		cwd: () => chain,
@@ -256,6 +260,14 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 	// Exit code returned for a verifyDiff `{check}` command (Task 4.2.x) — any non-git
 	// command that isn't matched above. Default 0 (pass); a test sets non-zero to fail.
 	let checkExit = 0;
+	// Epic H.1.3: when set, `git merge --no-ff` exits non-zero and
+	// `git diff --diff-filter=U` reports these unmerged files — modeling a REAL conflict.
+	let conflictFiles: string[] = [];
+	// Epic H.1.3 (high finding): the `git diff` text returned ONLY when the diff is bound
+	// to a worktree cwd (not the main tree). Lets a test model an EMPTY main-tree diff
+	// with a NON-EMPTY worktree diff — the exact shape that falsely failed a correctly-
+	// working isolated agent before verifyResult re-rooted its git-diff branch.
+	let worktreeDiffText = "";
 
 	const recon = (strings: TemplateStringsArray, exprs: unknown[]): string => {
 		let out = strings[0] ?? "";
@@ -280,9 +292,16 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		});
 
 	const commands: string[] = [];
-	const shell = (strings: TemplateStringsArray, ...exprs: unknown[]) => {
+	const quietedCommands: string[] = [];
+	// Epic H.1.3 (medium finding): record the directory each command was BOUND to via
+	// `.cwd(dir)` so a test can prove the verify shell re-rooted to the worktree dir and
+	// not the main tree. `cwd()` stashes `lastCwd`; the template invocation stamps it.
+	const cwdByCommand: Array<{ cmd: string; cwd: string }> = [];
+	let lastCwd = "/proj";
+	const run = (strings: TemplateStringsArray, ...exprs: unknown[]) => {
 		const cmd = recon(strings, exprs);
 		commands.push(cmd);
+		cwdByCommand.push({ cmd, cwd: lastCwd });
 		if (cmd.includes("is-inside-work-tree")) {
 			return isRepo ? result("true") : result("", 128);
 		}
@@ -293,8 +312,27 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		if (cmd === "git rev-parse HEAD") {
 			return result(head);
 		}
+		// Epic H.1.3: `isUnchanged` counts commits ahead of the worktree base. This
+		// fake does not model per-worktree commits, so it reports 0 ahead — leaving
+		// the porcelain status (the shared dirty set) as the sole change signal.
+		if (cmd.includes("rev-list --count")) {
+			return result("0");
+		}
+		// Epic H.1.3: the unmerged-files probe MUST be matched before the generic
+		// `git diff` (both start with "git diff"). It reports the injected conflict set.
+		if (cmd.includes("--diff-filter=U")) {
+			return result(conflictFiles.join("\n"));
+		}
+		if (cmd.startsWith("git merge --no-ff")) {
+			// A real conflict exits non-zero (the manager then probes diff-filter=U); a
+			// clean merge exits 0. `git merge --abort` falls through to the catch-all (0).
+			return conflictFiles.length > 0 ? result("", 1) : result("");
+		}
 		if (cmd.startsWith("git diff")) {
-			return result(diffText);
+			// A diff bound to a non-main cwd is a WORKTREE diff (Epic H.1.3 re-rooting):
+			// report the worktree text so a test can prove an isolated agent's verifyDiff
+			// judges its OWN tree, not the (empty) main tree.
+			return result(lastCwd !== "/proj" ? worktreeDiffText : diffText);
 		}
 		if (cmd.startsWith("git add -- ")) {
 			staged.push(cmd.slice("git add -- ".length));
@@ -323,8 +361,25 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		}
 		return result("");
 	};
+	// `.quiet()` lives on the ShellPromise (not the namespace); the engine appends it
+	// per-call to stop the echo to the host TTY. The wrapper records the quieted command
+	// so a test can assert the verifyDiff check cannot corrupt the opencode TUI.
+	const shell = (strings: TemplateStringsArray, ...exprs: unknown[]) => {
+		const cmd = recon(strings, exprs);
+		const p = run(strings, ...exprs);
+		Object.assign(p, {
+			quiet: () => {
+				quietedCommands.push(cmd);
+				return p;
+			},
+		});
+		return p;
+	};
 	const chain = Object.assign(shell, {
-		cwd: () => chain,
+		cwd: (d: string) => {
+			lastCwd = d;
+			return chain;
+		},
 		nothrow: () => chain,
 		env: () => chain,
 		braces: (p: string) => [p],
@@ -336,6 +391,8 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		shell: chain as any,
 		commits,
 		commands,
+		quietedCommands,
+		cwdByCommand,
 		setDirty: (path: string) => dirty.add(path),
 		setClean: (path: string) => dirty.delete(path),
 		setCommitGate: (gate: (() => Promise<void>) | undefined) => {
@@ -344,8 +401,14 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		setDiff: (text: string) => {
 			diffText = text;
 		},
+		setWorktreeDiff: (text: string) => {
+			worktreeDiffText = text;
+		},
 		setCheckExit: (code: number) => {
 			checkExit = code;
+		},
+		setMergeConflict: (files: string[]) => {
+			conflictFiles = files;
 		},
 	};
 }
@@ -481,6 +544,352 @@ describe("createWorkflowEngine — host shell ($) threading (Epic 2.1)", () => {
 		});
 		await engine.statusOf(handle.runId)?.settled;
 		expect(engine.statusOf(handle.runId)?.record.status).toBe("completed");
+		await engine.dispose();
+	});
+
+	test("a shell-bearing engine wires a worktree manager into the run (Epic H.1.6)", async () => {
+		// H.1.6: the engine constructs createWorktreeManager once from `$` and threads
+		// it through WorkflowRunDeps → AgentPrimitiveDeps so the isolation mint-point
+		// (H.1.2) can reach it. This guards the wiring does not throw. The shell reports
+		// a NON-repo (`git rev-parse --is-inside-work-tree` ≠ "true"), so the manager's
+		// `create` returns null and an isolation:'worktree' agent takes the
+		// degrade-to-null FALLBACK rather than minting a worktree — keeping this test
+		// focused on wiring, with the mint path covered by agent-call.test.ts.
+		const { facade } = makeFs();
+		const { shell } = makeShell(() => ({ exitCode: 1, stdout: "" }));
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_wtmgr001"),
+			shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("isolated", { isolation: "worktree", label: "iso" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		const record = engine.statusOf(handle.runId)?.record;
+		expect(record?.status).toBe("completed");
+		// The isolation request degrades-to-null. A manager IS threaded (shell present)
+		// but create() returns null because the checkout is a non-repo → this is a MINT
+		// failure (worktree_mint_failed), NOT isolation_unsupported: the feature is wired,
+		// the mint failed. isolation_unsupported is reserved for "no manager threaded".
+		expect(record?.returnValue).toBeNull();
+		expect(
+			record?.diagnostics?.some((d) => d.reason === "worktree_mint_failed"),
+		).toBe(true);
+		expect(
+			record?.diagnostics?.some((d) => d.reason === "isolation_unsupported"),
+		).toBe(false);
+		await engine.dispose();
+	});
+
+	test("a git-backed engine threads a FUNCTIONING manager: an isolated agent mints + completes non-null (Epic H.1.2/H.1.6)", async () => {
+		// The H.1.6 test above only ever exercises the create→null branch (non-repo). This
+		// guards the SUCCESS path end-to-end: with a git-backed shell (is-inside-work-tree
+		// 'true' and `git worktree add` exit 0), the engine constructs and threads a
+		// FUNCTIONING manager whose create() returns a real handle, so an
+		// isolation:'worktree' agent runs isolated and completes with a NON-null result and
+		// NO isolation diagnostic — proving the wiring is correct on the mint path, not just
+		// the degrade path. (A mis-threaded manager on the success path would only surface
+		// at the unit layer otherwise.)
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		// makeGitRepo: is-inside-work-tree 'true' and any other `git ...` (incl. `worktree
+		// add`/`remove`, `branch -D`) returns exit 0 — a successful mint + teardown.
+		const repo = makeGitRepo();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_wtmgr002"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: `${META}const r = await agent("isolated", { isolation: "worktree", label: "iso" });\nreturn r;\n`,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const record = engine.statusOf(handle.runId)?.record;
+		expect(record?.status).toBe("completed");
+		// The mint succeeded → the agent ran isolated and returned its real result.
+		expect(record?.returnValue).toBe("DONE");
+		// No isolation/mint failure diagnostic on the success path (an absent
+		// diagnostics array is itself "no such diagnostic").
+		expect(
+			(record?.diagnostics ?? []).some(
+				(d) =>
+					d.reason === "isolation_unsupported" ||
+					d.reason === "worktree_mint_failed",
+			),
+		).toBe(false);
+		// A worktree WAS minted (the engine threaded a functioning manager).
+		expect(repo.commands.some((c) => c.startsWith("git worktree add"))).toBe(
+			true,
+		);
+		await engine.dispose();
+	});
+});
+
+// ---- Task H.1.3: verifyDiff + merge-back on agent:end (engine wiring) -----
+
+const ISO_VERIFY_CHECK = `${META}const r = await agent("isolated", { isolation: "worktree", label: "iso", verifyDiff: { check: "bun run lint" } });\nreturn r;\n`;
+const ISO_AGENT = `${META}const r = await agent("isolated", { isolation: "worktree", label: "iso" });\nreturn r;\n`;
+const ISO_VERIFY_DIFF = `${META}const r = await agent("isolated", { isolation: "worktree", label: "iso", verifyDiff: true });\nreturn r;\n`;
+
+describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", () => {
+	test("a CHANGED isolated agent merges its branch back into the main tree, then cleans up", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		// The worktree carries real work → isUnchanged is false → the engine merges back.
+		repo.setDirty("src/A.ts");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_h13_merge"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: ISO_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		expect(rec?.returnValue).toBe("DONE");
+		// The scratch branch was merged back into the main tree (--no-ff, an explicit
+		// merge unit), and the worktree was then reclaimed.
+		expect(repo.commands.some((c) => c.startsWith("git merge --no-ff"))).toBe(
+			true,
+		);
+		expect(
+			repo.commands.some((c) => c.startsWith("git worktree remove --force")),
+		).toBe(true);
+		// No conflict diagnostic on the clean-merge path.
+		expect(
+			(rec?.diagnostics ?? []).some((d) => d.reason === "merge_conflict"),
+		).toBe(false);
+		await engine.dispose();
+	});
+
+	test("a merge CONFLICT surfaces merge_conflict and PRESERVES the worktree (no remove)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setDirty("src/A.ts"); // changed → merge is attempted
+		repo.setMergeConflict(["src/A.ts"]); // and it conflicts
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_h13_conf"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: ISO_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		// The run itself still completes (degrade, don't detonate); the conflict is a
+		// first-class diagnostic, NOT a thrown run.
+		expect(rec?.status).toBe("completed");
+		expect(
+			(rec?.diagnostics ?? []).some((d) => d.reason === "merge_conflict"),
+		).toBe(true);
+		// merge --abort left the main tree clean; the conflicted worktree is PRESERVED
+		// (no `worktree remove`) for inspection / a Tier 2 resolver.
+		expect(repo.commands.some((c) => c.startsWith("git merge --abort"))).toBe(
+			true,
+		);
+		expect(repo.commands.some((c) => c.startsWith("git worktree remove"))).toBe(
+			false,
+		);
+		await engine.dispose();
+	});
+
+	test("verifyDiff:{check} for an isolated agent runs the check IN the worktree dir", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setDirty("src/A.ts");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_h13_verify"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: ISO_VERIFY_CHECK,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		// The check passed (exit 0) so the result survives, and the command was quieted
+		// (TTY safety) — the verify shell re-rooted to the worktree, not the main tree.
+		expect(rec?.returnValue).toBe("DONE");
+		expect(repo.quietedCommands).toContain("bun run lint");
+		// Medium finding: the check must run BOUND to the minted worktree dir, not the
+		// main tree. The worktree root is a sibling of the repo (`<repo>/../.wf-worktrees`)
+		// and the label is `<label>-<index>` → with directory '/proj' the minted dir is
+		// '/.wf-worktrees/<runId>/iso-0'. Assert the recorded cwd so a regression that
+		// ignores v.directory (binds to '/proj') is caught — the prior name-only assertion
+		// could not distinguish the two.
+		const lintBinding = repo.cwdByCommand.find((c) => c.cmd === "bun run lint");
+		expect(lintBinding).toBeDefined();
+		expect(lintBinding?.cwd).toBe("/.wf-worktrees/wf_h13_verify/iso-0");
+		expect(lintBinding?.cwd).not.toBe("/proj");
+		await engine.dispose();
+	});
+
+	test("verifyDiff:true for an isolated agent judges the WORKTREE diff, not the empty main tree (high finding)", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		// The agent's edits live in its WORKTREE: the worktree diff is NON-empty while the
+		// main-tree diff is EMPTY. Before the fix, verifyResult's git-diff branch diffed
+		// the (empty) MAIN tree → passed:false → the correctly-working agent was downgraded
+		// to null with verify_failed. After the fix the diff is re-rooted to the worktree.
+		repo.setDiff(""); // main tree: empty
+		repo.setWorktreeDiff("diff --git a/src/A.ts b/src/A.ts\n+work"); // worktree: real
+		repo.setDirty("src/A.ts"); // so the worktree is changed → merge-back fires
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_h13_vdiff"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: ISO_VERIFY_DIFF,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		// The agent PASSES verify (its worktree diff is non-empty) and is NOT downgraded.
+		expect(rec?.returnValue).toBe("DONE");
+		expect(
+			(rec?.diagnostics ?? []).some((d) => d.reason === "verify_failed"),
+		).toBe(false);
+		await engine.dispose();
+	});
+});
+
+describe("createWorkflowEngine — crash-safety sweep on ready (Task H.1.5)", () => {
+	test("ready() sweeps orphan wf/* worktrees + branches from a prior crash, quieted", async () => {
+		const { facade } = makeFs();
+		const repo = makeGitRepo();
+		const engine = createWorkflowEngine({
+			client: makeCompletingClient().client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: { now: () => NOW },
+			logger: noopLogger,
+			ids: fixedIds("wf_h15_sweep"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		// The manager's sweep prunes stale worktree admin entries, then enumerates ONLY
+		// our wf/* branch namespace (never operator/host branches) for deletion. Both
+		// commands MUST have been issued by ready() — a crashed prior run leaves orphans.
+		expect(repo.commands).toContain("git worktree prune");
+		expect(
+			repo.commands.some(
+				(c) => c.startsWith("git for-each-ref") && c.includes("refs/heads/wf/"),
+			),
+		).toBe(true);
+		// TTY invariant: every engine-owned git command appends `.quiet()` to the
+		// ShellPromise (the host shares fd 1/2 with the opentui renderer).
+		expect(repo.quietedCommands).toContain("git worktree prune");
+		await engine.dispose();
+	});
+
+	test("a non-repo engine's ready() does NOT issue sweep mutations (dead-latch)", async () => {
+		const { facade } = makeFs();
+		const repo = makeGitRepo({ isRepo: false });
+		const engine = createWorkflowEngine({
+			client: makeCompletingClient().client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: { now: () => NOW },
+			logger: noopLogger,
+			ids: fixedIds("wf_h15_norepo"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		// The manager latches dead on the non-repo probe → sweep is a no-op. No prune,
+		// no branch enumeration (the for-each-ref over wf/* never runs).
+		expect(repo.commands).not.toContain("git worktree prune");
+		expect(repo.commands.some((c) => c.startsWith("git for-each-ref"))).toBe(
+			false,
+		);
 		await engine.dispose();
 	});
 });
@@ -988,6 +1397,10 @@ describe("createWorkflowEngine — verifyDiff post-condition (Task 4.2.3)", () =
 		expect(rec?.diagnostics?.some((d) => d.reason === "verify_failed")).toBe(
 			true,
 		);
+		// TTY safety: the verifyDiff check command runs an arbitrary tool (tsc/eslint)
+		// whose stdout/stderr would otherwise echo onto the opencode TUI alt-buffer; it
+		// MUST be quieted at the source.
+		expect(repo.quietedCommands).toContain("bun test x");
 
 		await engine.dispose();
 	});

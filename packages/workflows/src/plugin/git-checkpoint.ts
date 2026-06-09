@@ -22,8 +22,11 @@
  * touched since the baseline. A collision (an agent edits a path the operator had
  * left dirty) is refused and surfaced, never swept into an engine commit.
  *
- * Fencing: EVERY git invocation runs through `shell.cwd(dir).nothrow()` and is
- * inspected by `exitCode` — a non-zero git never rejects into the run. A non-repo
+ * Fencing: EVERY git invocation runs through `shell.cwd(dir).nothrow()`, appends
+ * `.quiet()` to the ShellPromise (the plugin host shares fd 1/2 with the opencode
+ * opentui renderer — an un-quieted command's stdout/stderr would punch raw bytes
+ * through the TUI alt-buffer and corrupt the screen), and is inspected by
+ * `exitCode` — a non-zero git never rejects into the run. A non-repo
  * (bare/detached/zero-commit-safe) is detected ONCE by `ready()`, which latches the
  * checkpointer dead with a single warn; every later call is a silent no-op. When no
  * `shell` is injected the whole subsystem is a documented no-op. This mirrors the
@@ -209,7 +212,21 @@ export function createGitCheckpointer(
 	let preexistingDirty = new Set<string>();
 	let baselineHead: string | null = null;
 
-	/** The repo-bound, fenced shell. Only reachable when `shell` is defined. */
+	/**
+	 * The repo-bound, fenced shell. Only reachable when `shell` is defined.
+	 *
+	 * Returns the configured namespace; EVERY call site appends `.quiet()` to the
+	 * resulting ShellPromise — `.quiet()` lives on the promise, NOT the namespace, so it
+	 * cannot be baked into this factory. Quieting is load-bearing, not cosmetic: the
+	 * plugin host runs in the same OS process as the opencode opentui renderer and shares
+	 * fd 1/2. The default BunShell ECHOES each command's stdout/stderr to those
+	 * descriptors (only the lazy `ShellPromise.text()` auto-quiets — but this module
+	 * awaits first, then reads `.text()` off the resolved buffer, which does NOT). Without
+	 * `.quiet()`, git's commit summary ("[branch sha] workflow checkpoint: …") punches raw
+	 * bytes through the TUI alt-buffer and corrupts the screen. `.quiet()` still buffers,
+	 * so the `.exitCode`/`readText()` reads downstream are unchanged — it only suppresses
+	 * the echo. The {@link createGitCheckpointer} output-suppression test guards this.
+	 */
 	const git = () => (shell as BunShell).cwd(directory).nothrow();
 
 	async function ready(): Promise<boolean> {
@@ -220,7 +237,7 @@ export function createGitCheckpointer(
 			return alive;
 		}
 		probed = true;
-		const res = await git()`git rev-parse --is-inside-work-tree`;
+		const res = await git()`git rev-parse --is-inside-work-tree`.quiet();
 		if (res.exitCode !== 0 || readText(res).trim() !== "true") {
 			dead = true;
 			alive = false;
@@ -239,7 +256,8 @@ export function createGitCheckpointer(
 		if (dead) {
 			return [];
 		}
-		const res = await git()`git -c diff.renames=false status --porcelain`;
+		const res =
+			await git()`git -c diff.renames=false status --porcelain`.quiet();
 		if (res.exitCode !== 0) {
 			return [];
 		}
@@ -254,7 +272,7 @@ export function createGitCheckpointer(
 		preexistingDirty = new Set(await dirtyPaths());
 		// Baseline HEAD (forensics). A zero-commit repo has no HEAD → exitCode != 0
 		// and we record null without throwing (fenced).
-		const head = await git()`git rev-parse HEAD`;
+		const head = await git()`git rev-parse HEAD`.quiet();
 		baselineHead = head.exitCode === 0 ? readText(head).trim() || null : null;
 	}
 
@@ -274,7 +292,9 @@ export function createGitCheckpointer(
 		// documented). Fenced: a non-zero exit → empty text, never a rejection.
 		const base = baselineHead;
 		const res =
-			base !== null ? await git()`git diff ${base}` : await git()`git diff`;
+			base !== null
+				? await git()`git diff ${base}`.quiet()
+				: await git()`git diff`.quiet();
 		const text = res.exitCode === 0 ? readText(res) : "";
 		return { text, isEmpty: text.trim().length === 0, available: true };
 	}
@@ -321,7 +341,7 @@ export function createGitCheckpointer(
 		// path from the commit set rather than throwing.
 		const staged: string[] = [];
 		for (const path of toCommit) {
-			const add = await git()`git add -- ${path}`;
+			const add = await git()`git add -- ${path}`.quiet();
 			if (add.exitCode === 0) {
 				staged.push(path);
 			} else {
@@ -350,7 +370,7 @@ export function createGitCheckpointer(
 		// element-wise, so each pathspec is a single safely-quoted argument.
 		const message = commitMessageFor(meta);
 		const commit =
-			await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} -- ${staged}`;
+			await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} -- ${staged}`.quiet();
 		if (commit.exitCode !== 0) {
 			logger?.warn("git checkpoint commit failed", {
 				runId: meta.runId,
@@ -363,7 +383,7 @@ export function createGitCheckpointer(
 		}
 
 		// (6) Read back the new commit sha.
-		const rev = await git()`git rev-parse HEAD`;
+		const rev = await git()`git rev-parse HEAD`.quiet();
 		const sha = rev.exitCode === 0 ? readText(rev).trim() : undefined;
 
 		return {

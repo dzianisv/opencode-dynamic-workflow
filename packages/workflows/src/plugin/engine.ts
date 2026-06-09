@@ -70,6 +70,7 @@ import {
 	type Checkpointer,
 	createGitCheckpointer,
 } from "./git-checkpoint";
+import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
 import {
@@ -621,6 +622,20 @@ export function createWorkflowEngine(
 			presumedAlive: checkpointerAlive,
 		});
 
+	// Engine-owned per-agent worktree manager (Epic H.1.6). Constructed ONCE from the
+	// host `$` bound to the project root (sibling to the checkpointer's shared probe),
+	// then threaded through every run's WorkflowRunDeps → AgentPrimitiveDeps so the
+	// future isolation mint-point (Epic H.1.2) can reach it. ABSENT shell → a documented
+	// no-op (`create` returns null), so isolation requests degrade-to-null as today
+	// (Epic 0.4). The manager probes the work-tree lazily on first use (its own latch),
+	// so no extra startup probe is needed here. UNUSED today — this task wires the handle
+	// only (no behavior change until H.1.2 consumes it).
+	const worktreeManager: WorktreeManager = createWorktreeManager({
+		shell: opts.shell,
+		directory: opts.directory,
+		...(logger !== undefined ? { logger } : {}),
+	});
+
 	// (2) The run-record store + ONE shared registry.
 	const runStore = createRunStore({
 		baseDir: subdir(SUBDIR_RUNS),
@@ -1015,6 +1030,9 @@ export function createWorkflowEngine(
 			registry,
 			// Top-level run: its workflow() global can nest one level (spec §8).
 			resolveSubWorkflow,
+			// Epic H.1.6: the engine-owned worktree manager, threaded to every run so the
+			// future isolation mint-point (H.1.2) reaches it. Inert today (no-shell → no-op).
+			worktreeManager,
 			...(budget !== undefined ? { budget } : {}),
 			// Pre-launch checkpoint barrier (Task 2.1.5): the runtime awaits this opaque
 			// thunk after gate.acquire and before runner.launch, so the next agent's
@@ -1026,6 +1044,21 @@ export function createWorkflowEngine(
 					() => undefined,
 					() => undefined,
 				),
+			// Epic H.1.3: serialize an isolated agent's merge-back onto the SAME
+			// checkpoint tail that orders per-unit commits, so a merge never interleaves
+			// with a sibling's commit. Appends the task onto the live tail and resolves
+			// with its result once that link drains. The tail itself is kept un-poisoned
+			// (it only ever holds a resolved-or-swallowed link); the task's own result
+			// and rejection are surfaced to the caller via a separate promise, and the
+			// runtime fences that on its side (a thrown merge degrades, never detonates).
+			serializeOnCheckpoint: <T>(task: () => Promise<T>): Promise<T> => {
+				const run = checkpointTail.then(() => task());
+				checkpointTail = run.then(
+					() => undefined,
+					() => undefined,
+				);
+				return run;
+			},
 			// Epic 4.1: supply the engine-computed real git diff (since run start) for a
 			// `contextDiff:true` review from THIS run's OWN checkpointer (no cross-run
 			// bleed — each run closes over its own runCheckpointer; the baseline is
@@ -1054,9 +1087,20 @@ export function createWorkflowEngine(
 						return { passed: false, available: false };
 					}
 					try {
-						const res = await opts.shell.cwd(opts.directory).nothrow()`${{
-							raw: command,
-						}}`;
+						// Epic H.1.3: an isolation:'worktree' agent's edits live in its
+						// WORKTREE checkout, not the main tree — so re-root the verify shell
+						// to the worktree dir when one is supplied (the runtime passes it for
+						// an isolated agent). Absent → the engine-wide directory as today.
+						const verifyDir = v.directory ?? opts.directory;
+						// `.quiet()` is required: this runs an arbitrary user command
+						// (tsc/eslint/…) and the plugin host shares fd 1/2 with the opencode
+						// opentui renderer. Without it, the command's stdout/stderr echoes
+						// raw onto the TUI alt-buffer and corrupts the screen. `.quiet()`
+						// lives on the ShellPromise (not the namespace), so it is appended
+						// AFTER the template. We only read exitCode, so buffering loses nothing.
+						const res = await opts.shell
+							.cwd(verifyDir)
+							.nothrow()`${{ raw: command }}`.quiet();
 						return { passed: res.exitCode === 0, available: true };
 					} catch (err) {
 						logger?.debug(
@@ -1071,6 +1115,30 @@ export function createWorkflowEngine(
 					}
 				}
 				// `true` or `{}` → git-diff-nonempty mode (the {} collapse).
+				// Epic H.1.3: for an isolation:'worktree' agent the edits live in the
+				// WORKTREE checkout, not the main tree, so the main checkpointer's
+				// main-tree-bound diff is empty and would falsely fail the agent. When the
+				// runtime supplies the worktree dir, re-root the diff to it: run `git diff`
+				// (working tree vs HEAD — uncommitted edits, which is where a worktree
+				// agent's work lives pre-merge) bound to the worktree via cwd. Fenced +
+				// quieted (TTY safety, parity with the {check} branch). Absent v.directory
+				// → the main-tree checkpointer diff as today.
+				if (v.directory !== undefined && opts.shell !== undefined) {
+					try {
+						const res = await opts.shell
+							.cwd(v.directory)
+							.nothrow()`git diff`.quiet();
+						const text = res.exitCode === 0 ? res.text() : "";
+						return {
+							passed: text.trim().length > 0,
+							available: true,
+						};
+					} catch {
+						// A thrown shell → emptiness is unprovable → inert (available:false),
+						// never a fabricated failure (parity with the {check} branch).
+						return { passed: false, available: false };
+					}
+				}
 				const d = await runCheckpointer.diff();
 				return { passed: !d.isEmpty, available: d.available };
 			},
@@ -1417,6 +1485,21 @@ export function createWorkflowEngine(
 		// per-run checkpointer adopts it without re-probing or re-warning — per-run
 		// baseline/checkpoint stay silent no-ops on a non-repo. No-op when no shell.
 		checkpointerAlive = await probeCheckpointer.ready();
+		// Crash-safety sweep (Task H.1.5): prune orphan `wf/*` worktrees + branches a
+		// PRIOR run left behind on a crash (the agent `finally` cleans its own worktree
+		// on a clean exit, but a killed process leaks them). The manager's sweep is
+		// itself fenced (non-repo/no-shell → no-op; every git command nothrow + exitCode-
+		// inspected), but we wrap the call too so a thrown sweep can NEVER block engine
+		// startup — best-effort, never gating a run. A preserved CONFLICT worktree of a
+		// LIVE run is not a concern here: ready() runs once at engine construction,
+		// before any run mints a worktree.
+		try {
+			await worktreeManager.sweep();
+		} catch (err) {
+			logger?.warn("worktree sweep failed at engine ready (non-blocking)", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 		const recovered = await runStore.load();
 		const seed: RunRecord[] = [];
 		for (const record of recovered) {
