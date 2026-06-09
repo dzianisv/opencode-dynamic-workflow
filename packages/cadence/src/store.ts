@@ -100,8 +100,20 @@ function defaultBaseDir(): string {
 /**
  * Minimal validation of a parsed directive file. A file failing this is corrupt
  * and is skipped (not loaded). We require the discriminating fields the engine
- * needs to re-arm or evaluate: id, sessionID, a known kind, and a known status.
+ * needs to re-arm or evaluate: id, sessionID, a known kind, a known status, and
+ * the numeric invariants the engine's safety cap depends on.
+ *
+ * The iteration counters are validated as strictly as the discriminators: an
+ * undefined/NaN `iterations` or `maxIterations` silently DISABLES the cap (the
+ * engine's `iterations >= maxIterations` check evaluates false against `undefined`
+ * or `NaN`), so a file missing them is corrupt and must be skipped — not loaded as
+ * a directive that re-prompts forever. A loop also needs a finite positive
+ * `intervalMs`; for goals it is irrelevant (their trigger is idle, not a timer).
  */
+function isFinitePositive(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 function isValidDirective(value: unknown): value is Directive {
 	if (typeof value !== "object" || value === null) {
 		return false;
@@ -120,6 +132,18 @@ function isValidDirective(value: unknown): value is Directive {
 		return false;
 	}
 	if (typeof v.instruction !== "string") {
+		return false;
+	}
+	if (typeof v.iterations !== "number" || !Number.isFinite(v.iterations)) {
+		return false;
+	}
+	if (!isFinitePositive(v.maxIterations)) {
+		return false;
+	}
+	if (typeof v.createdAt !== "number" || !Number.isFinite(v.createdAt)) {
+		return false;
+	}
+	if (v.kind === "loop" && !isFinitePositive(v.intervalMs)) {
 		return false;
 	}
 	return true;
