@@ -255,6 +255,40 @@ describe("createBgOutputTool", () => {
 		expect(out).toContain("tool output");
 	});
 
+	test("full transcript with an undefined-text part renders without the literal 'undefined' and head-only when summary is empty", async () => {
+		// A part may arrive with no `text` (non-text kind / torn payload). The
+		// renderer must coalesce it to "", never leak the string "undefined" into
+		// the model-facing transcript. An empty summaryText must render head-only
+		// (no blank-line summary block).
+		const result: TaskOutput = {
+			status: "completed",
+			summaryText: "",
+			messages: [
+				{
+					role: "assistant",
+					parts: [
+						{ type: "text", text: "visible" },
+						// TaskOutputPart.text is typed required, but the live SDK path can
+						// yield a part with no text — the exact degradation under test.
+						{ type: "tool", text: undefined as unknown as string },
+					],
+				},
+			],
+		};
+		const runner = makeRunner({
+			readOutput: async () => result,
+		});
+		const tool = createBgOutputTool(runner);
+		const out = await run(tool, { task_id: "bg_x", full: true }, makeContext());
+		expect(out).toContain("visible");
+		expect(out).not.toContain("undefined");
+		// Head-only: with an empty summary the status line is followed directly by
+		// the transcript block — no summary text is interposed between them.
+		expect(out.startsWith("task bg_x — completed\n\nfull transcript:")).toBe(
+			true,
+		);
+	});
+
 	test("unknown task id (runner throws) returns an honest error string", async () => {
 		const runner = makeRunner({
 			readOutput: async () => {

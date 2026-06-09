@@ -82,7 +82,9 @@ function render(taskId: string, output: TaskOutput, full: boolean): string {
 	}
 	const transcript = output.messages
 		.map((m) => {
-			const text = m.parts.map((p) => p.text).join("\n");
+			// A part may carry no `text` (non-text kinds, or a torn payload); coalesce
+			// to "" so the transcript never leaks the literal string "undefined".
+			const text = m.parts.map((p) => p.text ?? "").join("\n");
 			return `[${m.role}]\n${text}`;
 		})
 		.join("\n\n");
