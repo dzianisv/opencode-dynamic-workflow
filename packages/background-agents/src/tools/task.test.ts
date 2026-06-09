@@ -376,6 +376,26 @@ describe("bg_task tool — fork", () => {
 		expect(runner.launched[0]?.contextParts).toBeUndefined();
 	});
 
+	test("fetchMessages throw (transient fetch failure) → honest error string, no launch", async () => {
+		const runner = makeRunner();
+		// A failed parent-transcript fetch (e.g. ECONNRESET surfaced by the engine)
+		// must NOT be treated as an empty session: refuse the fork, do not launch.
+		const fetchMessages = async () => {
+			throw new Error("fetchSessionMessages: ECONNRESET");
+		};
+		const tool = createBgTaskTool(runner, { fetchMessages });
+		const { context } = makeContext();
+
+		const result = await tool.execute(launchArgs({ fork: true }), context);
+		const text = typeof result === "string" ? result : result.output;
+
+		expect(text.toLowerCase()).toContain("fork");
+		expect(text).toContain("ECONNRESET");
+		expect(text.toLowerCase()).toContain("parent transcript");
+		// no launch happened — we refuse to send a blind context.
+		expect(runner.launched).toHaveLength(0);
+	});
+
 	test("transcript-builder throw (drift guard) → honest error string, no launch", async () => {
 		const runner = makeRunner();
 		// A non-empty input whose only part carries payload under an unknown type

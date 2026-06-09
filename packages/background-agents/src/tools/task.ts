@@ -169,15 +169,27 @@ export function createBgTaskTool(
 
 			// Fork: inject the parent session's transcript as a synthetic context
 			// part. An empty transcript ("") → launch WITHOUT contextParts (don't
-			// ship an empty header). A transcript-builder throw is the schema-drift
-			// guard — surface it as an honest error string; do NOT launch blind.
+			// ship an empty header). Two failure modes refuse the launch rather than
+			// ship a child a blind context, each with an honest, distinct message:
+			//   - fetchMessages throws → could not READ the parent transcript (a
+			//     transient SDK/network failure, NOT a genuinely empty session);
+			//   - buildForkTranscript throws → the SDK message schema drifted.
 			let contextParts:
 				| Array<{ type: "text"; text: string; synthetic: true }>
 				| undefined;
 			if (fork === true && fetchMessages) {
+				let messages: ForkMessage[];
+				try {
+					messages = await fetchMessages(context.sessionID);
+				} catch (err) {
+					return (
+						"Cannot fork: failed to read the parent transcript " +
+						`(${errorMessage(err)}). Not launching blind — retry, or launch ` +
+						"without fork if the parent context is not required."
+					);
+				}
 				let transcript: string;
 				try {
-					const messages = await fetchMessages(context.sessionID);
 					transcript = buildForkTranscript(messages);
 				} catch (err) {
 					return (

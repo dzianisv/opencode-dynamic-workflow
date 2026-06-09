@@ -71,7 +71,9 @@ export interface Engine {
 	 * the part/message fields the runner reads, but the live objects still carry
 	 * `info.summary` / `parts[].tool` / compaction parts at runtime — so the
 	 * result is widened to `ForkMessage[]` here (the single honest widening point,
-	 * matching where the adapter narrowed). Returns `[]` on an unreadable session.
+	 * matching where the adapter narrowed). A genuinely empty session resolves to
+	 * `[]`; a failed fetch (SDK/network error) THROWS so an explicitly requested
+	 * `fork` is never silently downgraded to a non-forked launch.
 	 */
 	fetchSessionMessages(sessionID: string): Promise<ForkMessage[]>;
 }
@@ -149,11 +151,16 @@ export async function createEngine(opts: CreateEngineOptions): Promise<Engine> {
 			// them. Widen through `unknown` — the one honest widening point.
 			return (res.data ?? []) as unknown as ForkMessage[];
 		} catch (err) {
+			// A failed fetch is NOT an empty session. Returning `[]` here would make
+			// a transient SDK/network failure indistinguishable from a genuinely
+			// empty parent, and an explicitly requested `fork` would launch blind
+			// with no context and no signal. Surface it so `bg_task` can refuse.
+			const message = err instanceof Error ? err.message : String(err);
 			logger?.warn("fetchSessionMessages failed", {
 				sessionID,
-				error: err instanceof Error ? err.message : String(err),
+				error: message,
 			});
-			return [];
+			throw new Error(`fetchSessionMessages: ${message}`);
 		}
 	};
 
