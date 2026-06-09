@@ -616,6 +616,20 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// 7. Launch the subagent. For structured output, register the compiled
 			// schema against the child sessionID the instant it exists (synchronous
 			// onSessionCreated hook), before the child's first turn can call the tool.
+			// toolsOverride is assembled from two independent sources that compose:
+			// the structured-output tool (when a schema is compiled) and any explicit
+			// opts.tools (Epic 2.1). Empty → omitted, so the no-schema/no-tools launch
+			// is byte-identical to before.
+			const toolsOverride: Record<string, boolean> = {};
+			if (compiled !== undefined) {
+				toolsOverride.structured_output = true;
+			}
+			for (const name of opts.tools ?? []) {
+				const trimmed = name.trim();
+				if (trimmed.length > 0) {
+					toolsOverride[trimmed] = true;
+				}
+			}
 			const task = await runner.launch({
 				parentSessionID,
 				description: label,
@@ -635,9 +649,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					? {
 							onSessionCreated: (sid: string) =>
 								registry.register(sid, compiled),
-							toolsOverride: { structured_output: true },
 						}
 					: {}),
+				...(Object.keys(toolsOverride).length > 0 ? { toolsOverride } : {}),
 			});
 			taskId = task.id;
 			sessionId = task.sessionID;

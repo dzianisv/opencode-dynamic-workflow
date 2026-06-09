@@ -21,11 +21,13 @@ This README is both the package landing page and the complete authoring manual. 
    - [Budget](#budget)
    - [Resume](#resume)
    - [Saved workflows](#saved-workflows)
+   - [Built-in workflows](#built-in-workflows)
    - [Sub-workflows](#sub-workflows)
-4. [Worked examples](#worked-examples)
-5. [Environment variables](#environment-variables)
-6. [The native TUI viewer](#the-native-tui-viewer)
-7. [Honest limitations](#honest-limitations)
+4. [Patterns](#patterns)
+5. [Worked examples](#worked-examples)
+6. [Environment variables](#environment-variables)
+7. [The native TUI viewer](#the-native-tui-viewer)
+8. [Honest limitations](#honest-limitations)
 
 ---
 
@@ -175,6 +177,7 @@ const summary = await agent("Summarize the architecture of this repo in 3 bullet
 | `schema` | object (JSON Schema) | supported | Request a validated structured result (see [Structured output](#structured-output-via-schema)). |
 | `model` | string | supported | Model override; default inherits the session model. |
 | `agentType` | string | supported | Custom subagent type from the same registry as the `Agent` tool. |
+| `tools` | string[] | supported | Tool names to **enable** for this agent (e.g. web search/fetch). Names are environment-dependent (the platform/MCP servers define them); composes with `schema`. This is the seam the built-in `deep-research` workflow uses. Omit to inherit the session's tools. |
 | `isolation` | `"worktree"` | **recognized but unsupported** | There is no worktree session primitive; the call emits a warn and runs **without** isolation. |
 
 The `isolation: "worktree"` option is honestly a no-op in this port: it is recognized, warns, and proceeds without isolation. Do not rely on it for parallel file mutation.
@@ -349,6 +352,18 @@ Place a script at `.opencode/workflows/<name>.js` (or `.mjs`) in your project di
 
 Name resolution tries `<name>.js` first, then `<name>.mjs`, rooted at `<project>/.opencode/workflows/`. An unknown name returns an error listing what is available in that directory.
 
+### Built-in workflows
+
+Some workflows ship **inside the plugin** and resolve by name with no file on disk. A built-in **wins** over a same-named user file in `.opencode/workflows/` — a shipped capability stays predictably available and cannot be silently shadowed.
+
+| Name | What it does |
+|---|---|
+| `deep-research` | Fans out web searches across independent angles, extracts checkable claims with source URLs, adversarially verifies each claim against its own source (dropping the unsupported ones), and synthesizes a cited report. Invoke with `{ "name": "deep-research", "args": "{\"question\": \"…\"}" }`. |
+
+`deep-research`'s research agents request the `tools` allowlist `["websearch", "webfetch", "exa", "firecrawl"]` — names are environment-dependent, so whichever your OpenCode/MCP setup provides activates and the rest are no-ops. If your deployment names web tools differently, the built-in source is the place to adjust.
+
+A `/deep-research <question>` slash-command wrapper ships at `.opencode/command/deep-research.md` in this package; copy it into your project's `.opencode/command/` to get the ergonomic invocation (OpenCode has no plugin-level command registration, so command files are project-scoped).
+
 ### Sub-workflows
 
 The `workflow(nameOrRef, args?)` global runs another workflow inline as a sub-step. `nameOrRef` is either a saved-name string or a `{ scriptPath }` ref (read relative to the project directory). `args` becomes the child's verbatim `args`.
@@ -366,6 +381,70 @@ Semantics:
 - **Resume.** The sub-workflow boundary is journaled as a single key over the *resolved child source* + args. Editing the child source (even a change the parent never sees) changes that key and re-runs the child; otherwise a matching boundary replays the cached child result without running the child at all. The child's internal agent calls get no individual journal entries — the one boundary key covers them.
 
 ---
+
+## Patterns
+
+Six composable shapes the Claude Code workflow guidance names; ours mirrors them. Each is the same move — "spawn isolated agents, then combine" — arranged differently. Naming the pattern when you ask for a workflow sharpens what Claude builds. Mix them freely; a research workflow is fan-out → adversarial-verification → generate-and-filter in one pipeline.
+
+- **classify-and-act** — one agent classifies the input, then you branch to a specialist agent per class (or classify the *output* at the end to shape it). Example 2 below is this shape: each file is classified into a severity bucket before anything acts on it. Mixed backlogs, triage.
+- **fan-out-and-synthesize** — one agent per independent step, each in its own clean context so the steps never cross-contaminate, then a **barrier** that merges their structured outputs into one result. Example 1 below fans out with no synthesis barrier; add a `parallel`-gated merge step to turn it into full fan-out-and-synthesize. Per-file audits, multi-angle research.
+- **adversarial-verification** — for each finding, spawn a *separate* agent whose only job is to refute it against a rubric. Producer and skeptic never share a context, which is what kills self-preference: a finding survives only if the skeptic cannot knock it down. Example 3 below is the flagship. Security findings, factual claims.
+- **generate-and-filter** — overgenerate a wide set of candidates, then a judge agent keeps only the rubric-passers. The generator and the judge **must be different agents** — a generator grading its own output is self-preference wearing a different hat. Naming, design exploration:
+
+```js
+// generate-and-filter: overgenerate in parallel, then a DIFFERENT agent judges.
+const candidates = await parallel(
+  Array.from({ length: 12 }, (_, i) =>
+    () => agent("Propose CLI tool name #" + i + " for: " + args.brief, { label: "gen:" + i }),
+  ),
+);
+const top3 = {
+  type: "object",
+  properties: { names: { type: "array", items: { type: "string" } } },
+  required: ["names"],
+};
+return await agent(
+  "Keep the 3 best names against the rubric (short, memorable, no clash):\n" +
+    candidates.filter(Boolean).join("\n"),
+  { label: "judge", schema: top3 },
+);
+```
+
+- **tournament** — N agents attempt the *same* task with different approaches; a judge compares them **pairwise** ("is A better than B?") until one wins. Comparative judgment is more reliable than absolute 1–10 scoring, which drifts. The deterministic JS loop holds the bracket; only the running order stays in context. There is **no `tournament()` primitive** — use `agent()` plus a plain loop, because keeping the bracket in JS is exactly what preserves resume. Taste-based ranking, sorting 1000+ items:
+
+```js
+// tournament: the bracket lives in the JS loop, not in an agent.
+const pick = {
+  type: "object",
+  properties: { winner: { type: "string", enum: ["A", "B"] } },
+  required: ["winner"],
+};
+let bracket = (
+  await parallel(
+    args.approaches.map((a, i) =>
+      () => agent("Draft a solution using approach: " + a, { label: "attempt:" + i }),
+    ),
+  )
+).filter(Boolean);
+while (bracket.length > 1) {
+  const next = [];
+  for (let i = 0; i < bracket.length; i += 2) {
+    if (i + 1 >= bracket.length) {
+      next.push(bracket[i]);
+      continue;
+    }
+    const v = await agent(
+      "Which is better, A or B? Reply 'A' or 'B'.\n\nA:\n" + bracket[i] + "\n\nB:\n" + bracket[i + 1],
+      { label: "judge:" + i, schema: pick },
+    );
+    next.push(v && v.winner === "B" ? bracket[i + 1] : bracket[i]);
+  }
+  bracket = next;
+}
+return { winner: bracket[0] };
+```
+
+- **loop-until-done** — for unknown-size work, loop spawning agents until a stop condition is met (no new findings for K rounds, no errors left in the logs) instead of a fixed pass count; pair the budget guard as a ceiling so an open-ended hunt cannot run away. Bug hunts, log-driven root-cause. Example 2 below shows the budget-guarded variant.
 
 ## Worked examples
 

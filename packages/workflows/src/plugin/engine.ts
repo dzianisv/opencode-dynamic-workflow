@@ -70,9 +70,14 @@ import {
 	type Checkpointer,
 	createGitCheckpointer,
 } from "./git-checkpoint";
+import { BUILTIN_WORKFLOWS } from "./builtins";
 import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
+import {
+	type RunLookup,
+	saveRunAsWorkflow,
+} from "./tools/workflow-save";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
@@ -541,6 +546,7 @@ export function createWorkflowEngine(
 	const resolveSubWorkflow = createSourceResolver({
 		directory: opts.directory,
 		fs,
+		builtins: BUILTIN_WORKFLOWS,
 	});
 
 	/** The journal file path for a runId (under the journals subdir). */
@@ -700,6 +706,28 @@ export function createWorkflowEngine(
 				});
 			}
 			stopRun(runId);
+		},
+		// Save the run's script as a named workflow (Epic 4.2). The TUI viewer drops
+		// a `<runId>.save` sentinel whose body is the name; we reuse the same shared,
+		// validated path as the `workflow_save_run` tool. The channel is one-way, so
+		// the outcome is logged here (the viewer toasts optimistically on keypress).
+		onSave: async (runId, name) => {
+			const lookup: RunLookup = { statusOf: (id) => runs.get(id), runs };
+			const result = await saveRunAsWorkflow(
+				{ engine: lookup, fs, directory: opts.directory },
+				{ runId, name },
+			);
+			if (result.ok) {
+				logger?.info?.(`saved run ${runId} as workflow "${name}"`, {
+					runId,
+					path: result.path,
+				});
+			} else {
+				logger?.warn?.(`save of run ${runId} as "${name}" refused`, {
+					runId,
+					reason: result.error,
+				});
+			}
 		},
 	});
 	control.start();
