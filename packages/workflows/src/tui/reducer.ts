@@ -80,6 +80,7 @@ type EnrichedAgentEnd = Extract<
 	tokens?: SessionTokenSnapshot;
 	toolCalls?: number;
 	durationMs?: number;
+	result?: string;
 };
 
 /**
@@ -103,6 +104,13 @@ export interface AgentView {
 	lastTools?: string[];
 	durationMs?: number;
 	note?: string;
+	/**
+	 * The conclusion the agent passed forward — a preview of its settled result
+	 * (structured JSON or final text), from the `agent:end` line. Absent while running
+	 * and on a degraded call (which carries {@link note} instead). The Detail pane
+	 * surfaces it as the step's conclusion once it settles.
+	 */
+	result?: string;
 	/** Engine `at` of this occurrence's `agent:start`. */
 	startedAt?: number;
 	/** Engine `at` of the last `agent:stats`/`agent:end` touching this occurrence. */
@@ -327,6 +335,9 @@ export function createRunStateReducer(): RunStateReducer {
 		}
 		if (e.note !== undefined) {
 			row.note = e.note;
+		}
+		if (e.result !== undefined) {
+			row.result = e.result;
 		}
 		if (e.model !== undefined) {
 			row.model = e.model;

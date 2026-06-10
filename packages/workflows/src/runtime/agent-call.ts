@@ -54,6 +54,39 @@ function promptPreviewOf(prompt: string): string {
 		? `${prompt.slice(0, PROMPT_PREVIEW_MAX)}…`
 		: prompt;
 }
+/** Max chars of the agent's result carried into `agent:end` for the viewer's Detail. */
+const RESULT_PREVIEW_MAX = 2000;
+
+/**
+ * A truncated, ellipsis-marked preview of the RESULT an agent passed forward — the
+ * "conclusion" the viewer's Detail pane surfaces once the agent settles. A string
+ * result passes through; a structured (object) result is rendered as compact JSON so
+ * a glance reads the shape it returned. `null`/`undefined`/`""` yield `undefined` (a
+ * degrade carries a `note`, not a conclusion), as does a non-serializable value.
+ * Capped like {@link promptPreviewOf} to keep feed lines bounded.
+ */
+function resultPreviewOf(result: unknown): string | undefined {
+	if (result === null || result === undefined) {
+		return undefined;
+	}
+	let text: string;
+	if (typeof result === "string") {
+		text = result;
+	} else {
+		try {
+			text = JSON.stringify(result);
+		} catch {
+			return undefined;
+		}
+	}
+	if (text.length === 0) {
+		return undefined;
+	}
+	return text.length > RESULT_PREVIEW_MAX
+		? `${text.slice(0, RESULT_PREVIEW_MAX)}…`
+		: text;
+}
+
 /** Cap on captured raw final text in a diagnostic (Task 7.2.1). */
 const RAW_TEXT_CAP = 20_000;
 /** Marker appended when raw-text capture is truncated. */
@@ -146,6 +179,19 @@ export interface AgentPrimitiveDeps {
 		isEmpty: boolean;
 		available: boolean;
 	}>;
+	/**
+	 * Resolve canonical skill names (Epic 2.2) to synthetic text contextParts — one
+	 * per skill — to inject onto the child launch, mirroring `resolveContextDiff`.
+	 * Plugin-backed and OPAQUE to the runtime: it never learns what a skill is, it
+	 * just merges the returned parts. UNLIKE `resolveContextDiff`, a rejection is NOT
+	 * fenced — an unknown skill name (a `SkillNotFoundError`) must propagate past the
+	 * degrade-to-null catch and reach the script as a real error (fail-loud is the
+	 * contract). ABSENT (standalone library / no-engine) → `skills` is inert (no
+	 * parts, no throw).
+	 */
+	resolveSkills?: (
+		names: string[],
+	) => Promise<Array<{ type: "text"; text: string; synthetic: true }>>;
 	/**
 	 * Verify an agent's git/command post-condition AFTER it settles non-null (Epic
 	 * 4.2). The engine wires it to the per-run checkpointer: `verifyDiff:true` asserts
@@ -244,6 +290,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		callIndex,
 		awaitCheckpointClear,
 		resolveContextDiff,
+		resolveSkills,
 		verifyResult,
 		directory,
 		// Epic H.1.3: serialize an isolated agent's merge-back onto the engine's
@@ -400,7 +447,15 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				phase,
 				promptPreview: promptPreviewOf(prompt),
 			});
-			emit({ type: "agent:end", label, status: "cached" });
+			// A cached hit still carries its frozen conclusion forward — surface it so a
+			// replayed agent's Detail reads the same result a live one would, not blank.
+			const cachedResult = resultPreviewOf(cached.result);
+			emit({
+				type: "agent:end",
+				label,
+				status: "cached",
+				...(cachedResult !== undefined ? { result: cachedResult } : {}),
+			});
 			// Re-record the cached hit into the NEW journal under the CURRENT call
 			// index so a resumed run's journal is fully self-contained and densely
 			// ordered — no engine-layer bookkeeping.
@@ -562,6 +617,11 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// Carried into the finally so the single `agent:end` emit can attach the
 		// diagnostic note (Task 7.2.1) — set on any null/empty collapse below.
 		let endNote: string | undefined;
+		// Carried into the finally so the single `agent:end` emit can attach the
+		// conclusion preview — set on any SETTLED non-null result below, so the viewer
+		// surfaces what the agent passed forward (a degrade leaves it unset, carrying
+		// `endNote` instead).
+		let endResult: string | undefined;
 		// Task H.1.4: the first-class merge-conflict result (locked design decision #2).
 		// The merge-back settle runs in the finally (so it also covers teardown on the
 		// throw path); when it hits a Tier 1 conflict it sets this, and the finally
@@ -594,6 +654,20 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				promptPreview: promptPreviewOf(prompt),
 			});
 
+			// 6a. skills (Epic 2.2): resolve canonical skill names to synthetic
+			// contextParts and merge them FIRST (so they precede any contextDiff part).
+			// Deliberately OUTSIDE a fence: an unknown skill name throws a SkillNotFoundError
+			// that must ABORT the launch (re-thrown past the degrade-to-null catch below),
+			// NOT be swallowed to a silent null — fail-loud is the contract (the deliberate
+			// contrast with contextDiff, where empty/error degrades quietly). ABSENT seam →
+			// skills is inert (no parts, no throw).
+			const contextParts: { type: "text"; text: string; synthetic: true }[] =
+				[];
+			if (opts.skills?.length && resolveSkills !== undefined) {
+				const parts = await resolveSkills(opts.skills);
+				contextParts.push(...parts);
+			}
+
 			// 6b. contextDiff (Epic 4.1): resolve the engine-computed real git diff
 			// (since run start) for a review. The diff rides a SYNTHETIC contextPart, not
 			// the prompt, so it never perturbs computeCallKey (resume replays the verdict).
@@ -604,7 +678,6 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// `available:false` (no shell / non-git) emptiness is unprovable → run the
 			// review with NO diff part; never refuse. A rejecting/absent thunk is fenced
 			// to launch-anyway with no diff part.
-			let contextParts: { type: "text"; text: string; synthetic: true }[] = [];
 			if (opts.contextDiff === true && resolveContextDiff !== undefined) {
 				let diff:
 					| { text: string; isEmpty: boolean; available: boolean }
@@ -626,7 +699,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 						status = "error";
 						return null;
 					}
-					contextParts = [{ type: "text", text: diff.text, synthetic: true }];
+					contextParts.push({ type: "text", text: diff.text, synthetic: true });
 				}
 			}
 
@@ -803,6 +876,12 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// Task H.1.4); deferring the record there keeps resume replaying the SAME
 			// value the script saw, never the now-superseded agent text.
 			if (result !== null && result !== undefined) {
+				// Capture the conclusion preview for `agent:end` on EVERY settled path
+				// (worktree or not) — the finally reads it to surface what was handed
+				// forward. A later Tier 1 conflict supersedes the script's value but not
+				// this preview: the note then names the conflict, and the preview still
+				// shows what the agent itself produced.
+				endResult = resultPreviewOf(result);
 				if (worktree !== undefined && worktreeManager !== undefined) {
 					settledResult = result;
 				} else {
@@ -811,6 +890,16 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			}
 			return result;
 		} catch (err) {
+			// Fail-loud exception (Epic 2.2): an unknown skill name (resolveSkills →
+			// SkillNotFoundError, resolved at 6a above the launch) is an authoring bug that
+			// must reach the script as a real error, NOT degrade to a silent null like a
+			// launch/await failure. Discriminated structurally by name so the runtime stays
+			// plugin-agnostic (the error class lives in the plugin layer). Re-thrown here,
+			// before the worktree-settle finally — no worktree did real work (the launch
+			// never happened), so the finally's conflict/mergeFailed overrides cannot fire.
+			if (err instanceof Error && err.name === "SkillNotFoundError") {
+				throw err;
+			}
 			// launch()/awaitCompletion() throwing is a degrade, not a detonation.
 			status = "error";
 			emit({
@@ -946,6 +1035,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				status,
 				...(sessionId !== undefined ? { sessionID: sessionId } : {}),
 				...(endNote !== undefined ? { note: endNote } : {}),
+				...(endResult !== undefined ? { result: endResult } : {}),
 			});
 			// Task H.1.4: a Tier 1 merge conflict supersedes the try's resolved value.
 			// A `return` in the finally overrides whatever the try returned (the agent's

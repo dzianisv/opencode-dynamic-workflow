@@ -33,6 +33,21 @@ export interface AgentOpts {
 	 */
 	tools?: string[];
 	/**
+	 * Canonical skill names (e.g. `ring:writing-trds`) to bind into this spawned
+	 * step (Epic 2.2), discoverable via the `workflow_skills` tool — use EXACT
+	 * names. Each name resolves through the plugin-side `resolveSkills` seam to a
+	 * synthetic contextPart carrying the framed `SKILL.md` body, injected onto the
+	 * child launch exactly like {@link AgentOpts.contextDiff}. An UNKNOWN name FAILS
+	 * the launch LOUDLY (it throws past the degrade-to-null fence) — the deliberate
+	 * contrast with `tools`/`agentType`, which silently no-op on an unknown value.
+	 * Like `contextDiff`, the part rides synthetically and is deliberately ABSENT
+	 * from {@link computeCallKey} (a resumed run replays its journaled result rather
+	 * than re-binding). Absent/empty → inert (today's launch). A skill-bound step
+	 * needs file-read tools (`Read`/`Bash`) enabled if the skill references bundled
+	 * `shared-patterns` resources.
+	 */
+	skills?: string[];
+	/**
 	 * Inject the engine-computed REAL git diff (since run start) as model-only
 	 * context, and refuse the review when that diff is genuinely empty (Epic 4.1).
 	 * Opt-in; absent → today's behavior. For REVIEW agents: a reviewer of narrative-
@@ -144,6 +159,16 @@ export type ProgressEvent =
 			 * chars preserved`, or the empty-output warning.
 			 */
 			note?: string;
+			/**
+			 * A truncated preview of the RESULT the agent passed forward — its
+			 * structured-output object (rendered as compact JSON) or its final text.
+			 * Present only when the call SETTLED non-null (a degrade carries `note`
+			 * instead); the viewer's Detail pane surfaces it as the step's "conclusion"
+			 * once the agent settles, so a glance reads what the agent handed downstream
+			 * rather than only its tool ring. Capped like {@link promptPreview} to keep
+			 * feed lines bounded; the runtime stays clock-free.
+			 */
+			result?: string;
 	  }
 	| { type: "log"; message: string }
 	| { type: "warn"; message: string };

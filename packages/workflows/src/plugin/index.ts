@@ -54,6 +54,7 @@ import { createWorkflowEngine, type EngineLogger } from "./engine";
 import { createGitDenyHook } from "./git-deny-hook";
 import { createWorkflowTool } from "./tools/workflow";
 import { createWorkflowSaveRunTool } from "./tools/workflow-save";
+import { createWorkflowSkillsTool } from "./tools/workflow-skills";
 import { createWorkflowStatusTool } from "./tools/workflow-status";
 import { createWorkflowStopTool } from "./tools/workflow-stop";
 
@@ -140,6 +141,7 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory, $ }) => {
 			workflow_status: createWorkflowStatusTool(engine),
 			workflow_stop: createWorkflowStopTool(engine),
 			workflow_save_run: createWorkflowSaveRunTool(engine, { directory }),
+			workflow_skills: createWorkflowSkillsTool({ directory }),
 		},
 	};
 };

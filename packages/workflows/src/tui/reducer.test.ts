@@ -148,6 +148,87 @@ describe("createRunStateReducer — prompt preview", () => {
 	});
 });
 
+describe("createRunStateReducer — conclusion (agent:end result)", () => {
+	test("agent:end result lands on the agent as the step conclusion", () => {
+		const state = reduce([
+			{
+				type: "run:start",
+				runId: "wf_r",
+				parentSessionID: "ses_parent",
+				at: 1,
+			},
+			{ type: "agent:start", label: "review", phase: "Review", at: 2 },
+			{
+				type: "agent:launched",
+				label: "review",
+				phase: "Review",
+				sessionID: "ses_a",
+				at: 3,
+			},
+			{
+				type: "agent:end",
+				label: "review",
+				status: "completed",
+				sessionID: "ses_a",
+				result: '{"status":"completed","summary":"phase 4 is safe to start"}',
+				at: 4,
+			} as FeedEvent,
+		]);
+		expect(state.phases[0]?.agents[0]?.result).toBe(
+			'{"status":"completed","summary":"phase 4 is safe to start"}',
+		);
+	});
+
+	test("a cached end carries its frozen conclusion forward", () => {
+		const state = reduce([
+			{
+				type: "run:start",
+				runId: "wf_r",
+				parentSessionID: "ses_parent",
+				at: 1,
+			},
+			{ type: "agent:start", label: "cached", phase: "P", at: 2 },
+			{
+				type: "agent:end",
+				label: "cached",
+				status: "cached",
+				result: "replayed conclusion",
+				at: 3,
+			} as FeedEvent,
+		]);
+		const agent = state.phases[0]?.agents[0];
+		expect(agent?.status).toBe("cached");
+		expect(agent?.result).toBe("replayed conclusion");
+	});
+
+	test("an agent:end without result leaves the conclusion undefined", () => {
+		const state = reduce([
+			{
+				type: "run:start",
+				runId: "wf_r",
+				parentSessionID: "ses_parent",
+				at: 1,
+			},
+			{ type: "agent:start", label: "x", phase: "P", at: 2 },
+			{
+				type: "agent:launched",
+				label: "x",
+				phase: "P",
+				sessionID: "ses_x",
+				at: 3,
+			},
+			{
+				type: "agent:end",
+				label: "x",
+				status: "completed",
+				sessionID: "ses_x",
+				at: 4,
+			} as FeedEvent,
+		]);
+		expect(state.phases[0]?.agents[0]?.result).toBeUndefined();
+	});
+});
+
 describe("createRunStateReducer — full multi-phase feed", () => {
 	const tokens = (over: Partial<Record<string, number>> = {}) => ({
 		input: 0,

@@ -1939,6 +1939,166 @@ describe("createWorkflowEngine — contextDiff review injection (Task 4.1.4)", (
 	});
 });
 
+// ---- Task 2.2.2: engine wires resolveSkills from the on-disk skill catalog -----
+
+/**
+ * A skill-catalog-aware fs facade (Epic 2.2 engine integration). The default
+ * {@link makeFs} `readdir` only lists FILE basenames and never throws on a file
+ * path, so {@link loadSkillCatalog}'s "readdir succeeds → it's a dir" detection
+ * cannot traverse it. This facade adds real directory semantics over the same
+ * path→content map: `readdir(dir)` returns the immediate child segment names
+ * (files AND intermediate dirs) under `dir/`, and THROWS `ENOTDIR` on a leaf file
+ * path — exactly what the catalog walk needs to find a seeded `SKILL.md`.
+ */
+function makeSkillAwareFs(initial: Record<string, string> = {}) {
+	const files = new Map<string, string>(Object.entries(initial));
+	const facade: FsFacade = {
+		mkdir: async () => undefined,
+		readdir: async (dir: string) => {
+			const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+			const children = new Set<string>();
+			for (const key of files.keys()) {
+				if (key.startsWith(prefix)) {
+					const rest = key.slice(prefix.length);
+					const seg = rest.split("/")[0];
+					if (seg) {
+						children.add(seg);
+					}
+				}
+			}
+			if (children.size === 0) {
+				// No children: a leaf file → ENOTDIR; an absent path → ENOENT.
+				const code = files.has(dir) ? "ENOTDIR" : "ENOENT";
+				const err = new Error(code) as Error & { code: string };
+				err.code = code;
+				throw err;
+			}
+			return [...children];
+		},
+		readFile: async (path: string) => {
+			const f = files.get(path);
+			if (f === undefined) {
+				const err = new Error("ENOENT") as Error & { code: string };
+				err.code = "ENOENT";
+				throw err;
+			}
+			return f;
+		},
+		writeFile: async (path: string, data: string) => {
+			files.set(path, data);
+		},
+		rename: async (from: string, to: string) => {
+			const v = files.get(from);
+			if (v !== undefined) {
+				files.set(to, v);
+				files.delete(from);
+			}
+		},
+		rm: async (path: string) => {
+			files.delete(path);
+		},
+	};
+	return { facade, files };
+}
+
+const SKILL_AGENT = `${META}const r = await agent("use the skill", { label: "s", skills: ["ring:demo"] });\nreturn r;\n`;
+const BAD_SKILL_AGENT = `${META}const r = await agent("use the skill", { label: "s", skills: ["ring:nope"] });\nreturn r;\n`;
+
+const DEMO_SKILL_MD = [
+	"---",
+	"name: ring:demo",
+	'description: "A demo skill."',
+	"---",
+	"Do the demo thing.",
+].join("\n");
+
+describe("createWorkflowEngine — skills injection (Task 2.2.2)", () => {
+	test("a skills step launches with the framed SKILL.md body as a synthetic contextPart", async () => {
+		const { facade } = makeSkillAwareFs({
+			"/proj/.opencode/skill/cat/demo/SKILL.md": DEMO_SKILL_MD,
+		});
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions, promptParts } = makeClockedCapturingClient(
+			mclock.now,
+			"DONE",
+		);
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_skill01"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: SKILL_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const parts = promptParts.get(sessions[0] as string) as Array<{
+			type: string;
+			text: string;
+			synthetic?: boolean;
+		}>;
+		expect(parts).toBeDefined();
+		// The synthetic skill part comes FIRST, framed with the canonical name, the
+		// description, the absolute skill dir, and the frontmatter-stripped body.
+		expect(parts[0]?.synthetic).toBe(true);
+		expect(parts[0]?.text).toContain('<skill name="ring:demo">');
+		expect(parts[0]?.text).toContain(
+			"<description>A demo skill.</description>",
+		);
+		expect(parts[0]?.text).toContain(
+			"<skill-dir>/proj/.opencode/skill/cat/demo</skill-dir>",
+		);
+		expect(parts[0]?.text).toContain("Do the demo thing.");
+		expect(parts[0]?.text).not.toContain("name: ring:demo");
+		// The task prompt still rides last.
+		expect(parts.some((p) => p.text === "use the skill")).toBe(true);
+
+		await engine.dispose();
+	});
+
+	test("an unknown skill name fails the run loudly (the SkillNotFoundError surfaces, not a silent null)", async () => {
+		const { facade } = makeSkillAwareFs({
+			"/proj/.opencode/skill/cat/demo/SKILL.md": DEMO_SKILL_MD,
+		});
+		const { clock: mclock } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCapturingClient(mclock.now, "DONE");
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_skill02"),
+		});
+		await engine.ready();
+
+		const handle = await engine.startRun({
+			source: BAD_SKILL_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+
+		// The unknown name aborted the launch — no child session was ever created.
+		expect(sessions.length).toBe(0);
+		// The run failed loudly with the named error (NOT a completed/null run).
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("error");
+		expect(rec?.error).toContain('Unknown skill: "ring:nope"');
+
+		await engine.dispose();
+	});
+});
+
 // ---- Task 4.2.3: engine wires verifyResult from the per-run checkpointer + shell --
 
 const VERIFY_DIFF_AGENT = `${META}const r = await agent("fix the bug", { label: "fix", verifyDiff: true });\nreturn r;\n`;
@@ -4364,13 +4524,15 @@ describe("createWorkflowEngine — enriched agent:end + RunRecord.agents (Task 8
 		expect(feedEnd?.tokens).toBeUndefined();
 		expect(feedEnd?.toolCalls).toBeUndefined();
 
-		// The rolled-up summary carries only label/phase/status (no stats).
+		// The rolled-up summary carries no stats (cached → no enrichment), but DOES
+		// carry the replayed conclusion so the settle-time digest shows it.
 		const agents = engine.statusOf(handle.runId)?.record.agents ?? [];
 		expect(agents).toHaveLength(1);
 		expect(agents[0]).toEqual({
 			label: "cachee",
 			phase: "Review",
 			status: "cached",
+			result: "CACHED",
 		});
 
 		await engine.dispose();

@@ -101,25 +101,14 @@ export interface WorkflowsRouteProps {
 	params?: Record<string, unknown>;
 }
 
-/** Build one CC-style agent row string (marker + label + model + stats). */
+/**
+ * Build one tree agent row string — the marker glyph + the step name, nothing else.
+ * Tokens/tools/duration/model are deliberately NOT shown here: the tree is the
+ * navigation rail (one clean name per row), and every stat lives in the Detail pane
+ * for the selected row. The marker still carries status (✓/✗/…) at a glance.
+ */
 function agentRowText(agent: AgentView): string {
-	const marker = statusMarker(agent.status);
-	const model = agent.model !== undefined ? shortModel(agent.model) : "";
-	if (agent.status === "cached") {
-		return `${marker} ${agent.label}${model ? `  ${model}` : ""}  cached`;
-	}
-	const stats: string[] = [];
-	if (agent.tokens !== undefined) {
-		stats.push(`${formatTokens(agent.tokens)} tok`);
-	}
-	if (agent.toolCalls !== undefined) {
-		stats.push(`${agent.toolCalls} tools`);
-	}
-	if (agent.durationMs !== undefined) {
-		stats.push(formatDuration(agent.durationMs));
-	}
-	const tail = stats.length > 0 ? `  ${stats.join(" · ")}` : "";
-	return `${marker} ${agent.label}${model ? `  ${model}` : ""}${tail}`;
+	return `${statusMarker(agent.status)} ${agent.label}`;
 }
 
 /** The phase header row text (marker + name + done/total; count dropped while pending). */
@@ -490,7 +479,11 @@ export default function WorkflowsRoute(props: WorkflowsRouteProps) {
 		// report a rejection back, so we must not hand it a name it will refuse.
 		const name = slugifyWorkflowName(view().name ?? id);
 		try {
-			await writeSaveSentinel({ controlDir: props.controlDir, runId: id, name });
+			await writeSaveSentinel({
+				controlDir: props.controlDir,
+				runId: id,
+				name,
+			});
 			props.api.ui.toast({
 				variant: "info",
 				title: "Saving run",
@@ -671,18 +664,20 @@ function isFailure(status: string | undefined): boolean {
 }
 
 /**
- * The Detail pane body for one agent. Every field is LABELLED (`session …`, `note: …`)
- * so it identifies by name, not bare id, and the field ORDER is status-aware:
+ * The Detail pane body for one agent — the full per-step view the clean tree rail no
+ * longer carries. The identity (label/model/session) leads, then the body is grouped
+ * into labelled `──` sections (`stats`, `conclusion`, `note`/`error`, `tools`,
+ * `prompt`) so a glance scans the step instead of reading a flat key/value dump. The
+ * field ORDER is status-aware:
  *
  * - RUNNING (`status === undefined`): lead with the live signal — the running marker,
- *   live tokens, and the tool activity ring — since that is what a glance wants while
- *   the agent works.
- * - SETTLED: lead with the terminal stats (status, tokens, tool calls, duration) and
- *   surface the note prominently — in {@link theme.error} for a failure, where the note
- *   IS the failure reason — before the long prompt.
+ *   the live stats line, and the tool activity ring — what a glance wants mid-flight.
+ * - SETTLED: status, then the compact stats line, then the CONCLUSION (the headline —
+ *   what the agent passed forward, in {@link theme.text}), then the note (error-
+ *   prominent on a failure), the tool ring, and the prompt as supporting detail.
  *
- * The whole body is wrapped in a `<scrollbox>` so a long prompt or tool ring stays
- * readable without pushing the labelled stats off-screen; it is display-only (the route
+ * The whole body is wrapped in a `<scrollbox>` so a long conclusion/prompt/tool ring
+ * stays readable without pushing the stats off-screen; it is display-only (the route
  * keymap owns ↑/↓ for the tree, so this scrollbox takes no focus) and `viewportCulling`
  * is off with `flexShrink={0}` rows, matching the tree pane's clipping discipline.
  */
@@ -703,30 +698,50 @@ function AgentDetail(props: {
 			)}
 		</Show>
 	);
-	const Tokens = () => (
-		<Show when={props.agent.tokens !== undefined}>
-			<text fg={t.textMuted}>
-				{`tokens: ${formatTokens(props.agent.tokens ?? 0)}`}
-			</text>
-		</Show>
-	);
-	const ToolCalls = () => (
-		<Show when={props.agent.toolCalls !== undefined}>
-			<text fg={t.textMuted}>{`tool calls: ${props.agent.toolCalls}`}</text>
-		</Show>
-	);
-	const Duration = () => (
-		<Show when={props.agent.durationMs !== undefined}>
-			<text fg={t.textMuted}>
-				{`duration: ${formatDuration(props.agent.durationMs ?? 0)}`}
-			</text>
+	// One compact `── stats` section: tokens · tools · duration on a single line (the
+	// form the tree used to crowd into each row), instead of three stacked `key: value`
+	// lines. Each part is included only when its field is present, so a still-running
+	// agent shows just its live tokens/tools and a cached one shows nothing.
+	const Stats = () => {
+		const parts: string[] = [];
+		if (props.agent.tokens !== undefined) {
+			parts.push(`${formatTokens(props.agent.tokens)} tok`);
+		}
+		if (props.agent.toolCalls !== undefined) {
+			parts.push(`${props.agent.toolCalls} tools`);
+		}
+		if (props.agent.durationMs !== undefined) {
+			parts.push(formatDuration(props.agent.durationMs));
+		}
+		return (
+			<Show when={parts.length > 0}>
+				<box flexShrink={0} flexDirection="column" paddingTop={1}>
+					<text fg={t.border}>── stats</text>
+					<text fg={t.textMuted}>{parts.join(" · ")}</text>
+				</box>
+			</Show>
+		);
+	};
+	// The headline of a settled step: the conclusion the agent passed forward (its
+	// structured result or final text). Rendered in `t.text` (brighter than the muted
+	// prompt/tools) because this — not the tool ring — is what a glance wants after the
+	// step turns over. Absent while running and on a degrade (the Note carries that).
+	const Conclusion = () => (
+		<Show when={props.agent.result}>
+			{(result) => (
+				<box flexShrink={0} flexDirection="column" paddingTop={1}>
+					<text fg={t.border}>── conclusion</text>
+					<text fg={t.text}>{result()}</text>
+				</box>
+			)}
 		</Show>
 	);
 	const Note = () => (
 		<Show when={props.agent.note}>
 			{(note) => (
 				<box flexShrink={0} flexDirection="column" paddingTop={1}>
-					<text fg={failed() ? t.error : t.textMuted}>{`note: ${note()}`}</text>
+					<text fg={t.border}>{failed() ? "── error" : "── note"}</text>
+					<text fg={failed() ? t.error : t.textMuted}>{note()}</text>
 				</box>
 			)}
 		</Show>
@@ -773,15 +788,15 @@ function AgentDetail(props: {
 					)}
 				</Show>
 				{/* Status-aware ordering: a running agent leads with its live signal; a
-				    settled one leads with terminal stats + the (error-prominent) note. */}
+				    settled one leads with status + stats, then the CONCLUSION (the
+				    headline), then note/tools/prompt as supporting detail. */}
 				<Show
 					when={running()}
 					fallback={
 						<>
 							<StatusLine />
-							<Tokens />
-							<ToolCalls />
-							<Duration />
+							<Stats />
+							<Conclusion />
 							<Note />
 							<Tools />
 							<Prompt />
@@ -791,9 +806,8 @@ function AgentDetail(props: {
 					<text
 						fg={t.primary}
 					>{`status: ${statusMarker(undefined)} running`}</text>
-					<Tokens />
+					<Stats />
 					<Tools />
-					<ToolCalls />
 					<Prompt />
 				</Show>
 			</box>

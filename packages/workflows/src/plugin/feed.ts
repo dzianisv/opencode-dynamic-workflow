@@ -279,6 +279,8 @@ export interface FeedAgentSummary {
 	toolCalls?: number;
 	durationMs?: number;
 	note?: string;
+	/** The conclusion preview the agent passed forward (`agent:end.result`). */
+	result?: string;
 }
 
 /**
@@ -451,6 +453,7 @@ export async function readFeedCounts(
 						? { durationMs: end.durationMs }
 						: {}),
 					...(e.note !== undefined ? { note: e.note } : {}),
+					...(e.result !== undefined ? { result: e.result } : {}),
 				});
 				live += 1;
 			} else {
@@ -461,6 +464,7 @@ export async function readFeedCounts(
 					...(phase !== undefined ? { phase } : {}),
 					status: e.status,
 					...(e.note !== undefined ? { note: e.note } : {}),
+					...(e.result !== undefined ? { result: e.result } : {}),
 				});
 				if (e.status === "cached") {
 					cached += 1;

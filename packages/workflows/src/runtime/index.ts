@@ -151,6 +151,18 @@ export interface WorkflowRunDeps {
 		available: boolean;
 	}>;
 	/**
+	 * Resolve canonical skill names to synthetic contextParts for an
+	 * `agent({ skills })` step (Epic 2.2), threaded straight to the `agent()`
+	 * primitive. The engine wires it to the plugin-side `resolveSkillParts` (disk
+	 * reads under `.opencode/skill`); ABSENT (the standalone library) → `skills` is
+	 * inert. OPAQUE to the runtime — it never learns what a skill is. UNLIKE
+	 * `resolveContextDiff`, a rejection is NOT fenced: an unknown name fails the
+	 * launch loudly.
+	 */
+	resolveSkills?: (
+		names: string[],
+	) => Promise<Array<{ type: "text"; text: string; synthetic: true }>>;
+	/**
 	 * Verify an `agent({ verifyDiff })` post-condition after it settles (Epic 4.2),
 	 * threaded straight to the `agent()` primitive. The engine wires it to its per-run
 	 * checkpointer + repo-bound shell; ABSENT (the standalone library) → no
@@ -342,6 +354,11 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		...(deps.resolveContextDiff !== undefined
 			? { resolveContextDiff: deps.resolveContextDiff }
 			: {}),
+		// Epic 2.2: thread the skill-resolution seam so an `agent({ skills })` step
+		// binds the resolved parts; absent → skills is inert.
+		...(deps.resolveSkills !== undefined
+			? { resolveSkills: deps.resolveSkills }
+			: {}),
 		...(deps.verifyResult !== undefined
 			? { verifyResult: deps.verifyResult }
 			: {}),
@@ -404,6 +421,11 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				// checkpointer diff as the parent's (they share the run/git tree).
 				...(deps.resolveContextDiff !== undefined
 					? { resolveContextDiff: deps.resolveContextDiff }
+					: {}),
+				// Epic 2.2: a child's skills steps ride the SAME skill resolver as the
+				// parent's (they share the project's .opencode/skill roots).
+				...(deps.resolveSkills !== undefined
+					? { resolveSkills: deps.resolveSkills }
 					: {}),
 				// Epic 4.2: a child's verifyDiff post-conditions ride the SAME per-run
 				// checkpointer + shell as the parent's.

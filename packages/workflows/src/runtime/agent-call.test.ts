@@ -214,6 +214,9 @@ interface HarnessOverrides {
 		isEmpty: boolean;
 		available: boolean;
 	}>;
+	resolveSkills?: (
+		names: string[],
+	) => Promise<Array<{ type: "text"; text: string; synthetic: true }>>;
 	verifyResult?: (opts: {
 		verifyDiff: boolean | { check?: string };
 		sessionId?: string;
@@ -255,6 +258,9 @@ function harness(overrides: HarnessOverrides = {}) {
 			: {}),
 		...(overrides.resolveContextDiff !== undefined
 			? { resolveContextDiff: overrides.resolveContextDiff }
+			: {}),
+		...(overrides.resolveSkills !== undefined
+			? { resolveSkills: overrides.resolveSkills }
 			: {}),
 		...(overrides.verifyResult !== undefined
 			? { verifyResult: overrides.verifyResult }
@@ -399,6 +405,25 @@ describe("createAgentPrimitive — structured output (schema)", () => {
 		// Prompt carries the schema-instruction suffix.
 		expect(launch?.prompt).toContain("structured_output");
 		expect(launch?.prompt).toContain(JSON.stringify(SCHEMA));
+	});
+
+	test("a structured result is previewed as compact JSON on agent:end", async () => {
+		const registry = createSchemaRegistry();
+		const runner = new FakeRunner({
+			status: "completed",
+			sessionID: "ses_j",
+			onLaunched: () => registry.store("ses_j", { verdict: "pass", score: 9 }),
+		});
+		const { agent, events } = harness({ runner, registry });
+		await agent("judge it", { schema: SCHEMA });
+		const end = events.find((e) => e.type === "agent:end");
+		// The conclusion preview is the structured value rendered as compact JSON, so
+		// the viewer's Detail shows the shape the agent returned.
+		expect(end).toMatchObject({
+			type: "agent:end",
+			status: "completed",
+			result: '{"verdict":"pass","score":9}',
+		});
 	});
 
 	test("deps.directory forwards onto runner.launch (Epic H.1 inert seam)", async () => {
@@ -715,6 +740,9 @@ describe("createAgentPrimitive — progress events", () => {
 			// sessionID is now carried on the live path (Task 8.1.1); the default fake
 			// runner assigns "ses_1" to the first launch.
 			sessionID: "ses_1",
+			// The settled non-null result rides as the conclusion preview for the
+			// viewer's Detail — here the fake runner's plain final text.
+			result: "the final text",
 		});
 	});
 
@@ -1704,6 +1732,102 @@ describe("createAgentPrimitive — contextDiff injection (Task 4.1.2)", () => {
 		});
 		expect(await agent("review", { contextDiff: true })).toBe("R");
 		expect(runner.launches[0]?.contextParts).toBeUndefined();
+	});
+});
+
+// ---- Epic 2.2: skills injection via the resolveSkills seam (Task 2.2.2) ----
+
+describe("createAgentPrimitive — skills injection (Task 2.2.2)", () => {
+	const fakeParts = (...names: string[]) =>
+		names.map((n) => ({
+			type: "text" as const,
+			text: `<skill name="${n}">body</skill>`,
+			synthetic: true as const,
+		}));
+
+	/** A SkillNotFoundError-shaped throw (structurally, no plugin import). */
+	class FakeSkillNotFoundError extends Error {
+		constructor(name: string) {
+			super(`Unknown skill: "${name}".`);
+			this.name = "SkillNotFoundError";
+		}
+	}
+
+	test("resolveSkills returning N parts → launch carries those N parts", async () => {
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent } = harness({
+			runner,
+			resolveSkills: async (names) => fakeParts(...names),
+		});
+		expect(await agent("do it", { skills: ["ring:a", "ring:b"] })).toBe("DONE");
+		expect(runner.launches[0]?.contextParts).toEqual([
+			{
+				type: "text",
+				text: '<skill name="ring:a">body</skill>',
+				synthetic: true,
+			},
+			{
+				type: "text",
+				text: '<skill name="ring:b">body</skill>',
+				synthetic: true,
+			},
+		]);
+	});
+
+	test("skills + contextDiff → skill parts come BEFORE the diff part", async () => {
+		const runner = new FakeRunner({ summaryText: "REVIEWED" });
+		const { agent } = harness({
+			runner,
+			resolveSkills: async (names) => fakeParts(...names),
+			resolveContextDiff: async () => ({
+				text: "diff --git a/x b/x\n+line",
+				isEmpty: false,
+				available: true,
+			}),
+		});
+		await agent("review", { skills: ["ring:a"], contextDiff: true });
+		expect(runner.launches[0]?.contextParts).toEqual([
+			{
+				type: "text",
+				text: '<skill name="ring:a">body</skill>',
+				synthetic: true,
+			},
+			{ type: "text", text: "diff --git a/x b/x\n+line", synthetic: true },
+		]);
+	});
+
+	test("resolveSkills throwing SkillNotFoundError propagates (NOT a silent null)", async () => {
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent } = harness({
+			runner,
+			resolveSkills: async () => {
+				throw new FakeSkillNotFoundError("ring:typo");
+			},
+		});
+		await expect(agent("do it", { skills: ["ring:typo"] })).rejects.toThrow(
+			/Unknown skill: "ring:typo"/,
+		);
+		expect(runner.launches).toHaveLength(0);
+	});
+
+	test("no resolveSkills threaded → skills:['x'] is inert (no parts, no throw)", async () => {
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent } = harness({ runner });
+		expect(await agent("do it", { skills: ["ring:a"] })).toBe("DONE");
+		expect(runner.launches[0]?.contextParts).toBeUndefined();
+	});
+
+	test("computeCallKey is identical with and without skills (resume-safe)", async () => {
+		const base = computeCallKey({ prompt: "do it" });
+		const recorded: JournalEntry[] = [];
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent } = harness({
+			runner,
+			resolveSkills: async (names) => fakeParts(...names),
+			replay: { entries: [], onRecord: (e) => recorded.push(e) },
+		});
+		await agent("do it", { skills: ["ring:a", "ring:b"] });
+		expect(recorded[0]?.key).toBe(base);
 	});
 });
 

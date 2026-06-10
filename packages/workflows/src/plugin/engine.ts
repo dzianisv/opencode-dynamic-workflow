@@ -75,12 +75,14 @@ import {
 import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
 import { createSourceResolver } from "./resolve-source";
+import { renderRunDigest } from "./run-digest";
 import {
 	createSessionStatsCollector,
 	type SessionStatsCollector,
 	type SessionStatsSnapshot,
 	type SessionTokenSnapshot,
 } from "./session-stats";
+import { resolveSkillParts } from "./skill-resolver";
 import { type RunLookup, saveRunAsWorkflow } from "./tools/workflow-save";
 
 /** Structured logger surface — `client.app.log`-backed in the plugin entry. */
@@ -120,6 +122,13 @@ export interface AgentSummary {
 	durationMs?: number;
 	/** The degrade note (Task 7.2.1), when the call collapsed to null/empty. */
 	note?: string;
+	/**
+	 * The conclusion preview the agent passed forward — its structured result (as
+	 * compact JSON) or final text, from `agent:end.result`. Absent on a degraded call
+	 * (which carries {@link note} instead). The settle-time per-agent digest renders
+	 * it so the parent reads what each agent concluded without pulling the feed.
+	 */
+	result?: string;
 }
 
 /**
@@ -527,11 +536,6 @@ function extractDeclaredPhases(source: string): string[] | undefined {
 	}
 }
 
-/** The retrieval hint naming the workflow_status tool for a run. */
-function runHint(runId: string): string {
-	return `workflow_status run_id=${runId} for the result`;
-}
-
 /** Wrap a core TaskStore as a typed RunStore (the one documented widening). */
 function createRunStore(opts: {
 	baseDir?: string;
@@ -825,8 +829,11 @@ export function createWorkflowEngine(
 			}
 		},
 		logger: storeLogger,
-		// A run notice points at workflow_status, not bg_output.
-		renderHint: (task) => runHint(task.id),
+		// The synthetic notice part carries a per-agent digest (status, stats, and each
+		// agent's conclusion), not a bare pointer — the `task` shim IS the settled
+		// RunRecord, whose `agents[]` is fully rolled up by push time. The digest appends
+		// the workflow_status pointer, so the retrieval affordance survives.
+		renderHint: (task) => renderRunDigest(task as unknown as RunRecord),
 	});
 
 	function liveRunIds(): ReadonlySet<string> {
@@ -1249,6 +1256,13 @@ export function createWorkflowEngine(
 			// diff rides a SYNTHETIC contextPart, never the prompt, so computeCallKey is
 			// unchanged and the reviewer replays its verdict on resume.
 			resolveContextDiff: () => runCheckpointer.diff(),
+			// Epic 2.2: resolve an `agent({ skills })` step's canonical names to synthetic
+			// contextParts off disk (`.opencode/skill` under the project + user roots). Pure
+			// disk reads (no checkpointer/shell), so always available within the engine. An
+			// unknown name throws SkillNotFoundError, which the runtime re-throws past its
+			// degrade-to-null fence so the authoring bug fails loud.
+			resolveSkills: (names) =>
+				resolveSkillParts(names, { directory: opts.directory, fs }),
 			// Epic 4.2: verify a settled agent's git/command post-condition against GIT
 			// TRUTH (this run's checkpointer + the host shell), NEVER the opencode session
 			// diff (a snapshot that survives an out-of-band git restore — see the Phase 4
@@ -1394,6 +1408,7 @@ export function createWorkflowEngine(
 							: {}),
 						...(durationMs !== undefined ? { durationMs } : {}),
 						...(e.note !== undefined ? { note: e.note } : {}),
+						...(e.result !== undefined ? { result: e.result } : {}),
 					});
 					// Task 2.1.5: a LIVE completed agent gets a per-unit checkpoint, queued
 					// onto the serialized per-run chain (commit-and-continue). Cached and
@@ -1419,6 +1434,7 @@ export function createWorkflowEngine(
 						...(phase !== undefined ? { phase } : {}),
 						status: e.status,
 						...(e.note !== undefined ? { note: e.note } : {}),
+						...(e.result !== undefined ? { result: e.result } : {}),
 					});
 				}
 				handle.progress.push(out);
