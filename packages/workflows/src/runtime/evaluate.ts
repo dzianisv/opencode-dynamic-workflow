@@ -6,7 +6,7 @@ import type { RuntimeApi } from "./types";
  *
  * The body is plain JavaScript that runs inside an `AsyncFunction`, so top-level
  * `await` works and the body's `return` value becomes the workflow result. The
- * eight runtime API members are injected as named parameters, and a set of shadow
+ * nine runtime API members are injected as named parameters, and a set of shadow
  * parameters hide nondeterministic or out-of-scope globals.
  *
  * The threat model is resume-cache poisoning, not containment: the script author
@@ -27,7 +27,7 @@ export class DeterminismError extends Error {
 	}
 }
 
-/** The eight RuntimeApi members, in the order they are passed to the body. */
+/** The nine RuntimeApi members, in the order they are passed to the body. */
 const API_NAMES = [
 	"agent",
 	"pipeline",
@@ -37,6 +37,7 @@ const API_NAMES = [
 	"args",
 	"budget",
 	"workflow",
+	"shell",
 ] as const;
 
 /** `Object.getPrototypeOf(async function () {}).constructor` — not a JS global. */

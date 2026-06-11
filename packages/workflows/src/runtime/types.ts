@@ -107,6 +107,64 @@ export type WorkflowFn = (
 	args?: unknown,
 ) => Promise<unknown>;
 
+/** A single `shell()` call's options — the cheap deterministic-command primitive. */
+export interface ShellOpts {
+	/** Display label for the progress feed; defaults to the command string. */
+	label?: string;
+	/**
+	 * Working directory, RELATIVE to the run's project root (or absolute). Absent →
+	 * the project root. PART of the replay key: the same command in a different cwd
+	 * is a different call (a `make test` in two packages must not share a result).
+	 */
+	cwd?: string;
+	/**
+	 * The exit code that counts as `passed`. Default 0. PART of the replay key —
+	 * changing it changes the pass/fail verdict the journaled result carries, so a
+	 * resume must re-derive it rather than replay a stale verdict.
+	 */
+	expectExitCode?: number;
+}
+
+/**
+ * The settled result of a `shell()` call (spec §3.3, the deterministic-command
+ * primitive). NEVER thrown: a non-zero exit is a `passed:false` VALUE the script
+ * branches on, not an error — mirroring `agent()`'s degrade-don't-detonate.
+ */
+export interface ShellResult {
+	/** The command that ran, verbatim. */
+	command: string;
+	/** `exitCode === (opts.expectExitCode ?? 0)` — the branch the script reads. */
+	passed: boolean;
+	/** The process exit code; `-1` when the command could not run (`available:false`). */
+	exitCode: number;
+	/** Captured stdout, capped to bound the journal; `""` on an unavailable shell. */
+	stdout: string;
+	/** Captured stderr, capped to bound the journal; `""` on an unavailable shell. */
+	stderr: string;
+	/**
+	 * `false` on a no-shell engine / the standalone library (no shell capability is
+	 * threaded). An unavailable result is NEVER journaled — a resume in a
+	 * shell-capable engine RE-RUNS it rather than replaying a hollow "unavailable"
+	 * (mirrors the agent contract: failures are never cached). On an available shell
+	 * this is always `true`, even for a non-zero exit (the command genuinely ran).
+	 */
+	available: boolean;
+}
+
+/**
+ * Run a deterministic shell command from a workflow script — the CHEAP counterpart
+ * to spending an `agent()` just to discover a command's exit code (spec §3.3). The
+ * OS decides facts (`make test` passed?), the agent decides judgment (why did it
+ * fail?). Resolves to a {@link ShellResult}; NEVER throws on a non-zero exit. Runs
+ * via an engine-supplied seam over the repo-bound host shell; INERT (`available:
+ * false`) when no shell capability is threaded — it returns an honest unavailable
+ * result, never a fabricated pass (the anti-`dryRun` contract).
+ */
+export type ShellFn = (
+	command: string,
+	opts?: ShellOpts,
+) => Promise<ShellResult>;
+
 /** The token budget as the script sees it (spec §6). */
 export interface BudgetView {
 	/** The hard ceiling for the turn, or `null` if none was set. */
@@ -385,6 +443,8 @@ export interface RuntimeApi {
 	budget: BudgetView;
 	/** Run another workflow inline as a sub-step (spec §8); see {@link WorkflowFn}. */
 	workflow: WorkflowFn;
+	/** Run a deterministic shell command (spec §3.3); see {@link ShellFn}. */
+	shell: ShellFn;
 }
 
 /** The lifetime agent-count cap (1,000) was hit — a runaway-loop backstop (§5). */

@@ -28,6 +28,9 @@ function makeApi(opts: {
 		workflow: (() => {
 			throw new Error("workflow() not used");
 		}) as RuntimeApi["workflow"],
+		shell: (() => {
+			throw new Error("shell() not used");
+		}) as RuntimeApi["shell"],
 		parallel: async (thunks: Array<() => Promise<unknown>>) =>
 			Promise.all(thunks.map((t) => t())),
 		pipeline: async (

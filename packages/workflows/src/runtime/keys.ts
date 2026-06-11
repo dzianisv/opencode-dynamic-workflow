@@ -84,3 +84,26 @@ export function computeWorkflowKey(source: string, args: unknown): string {
 	const canonical = stableStringify({ source, args });
 	return `workflow:${createHash("sha256").update(canonical).digest("hex")}`;
 }
+
+/**
+ * The replay identity of a `shell()` call: a sha256 hex over the command plus its
+ * cwd and expected exit code, prefixed `shell:` so it occupies a distinct namespace
+ * from `agent()` and `workflow()` keys in the same journal stream.
+ *
+ * `label` and `timeoutMs`-style display/operational options are DELIBERATELY
+ * excluded — they do not change the command's identity (mirrors the `agent()` key's
+ * label/phase exclusion). `cwd` and `expectExitCode` ARE included: the same command
+ * in a different directory is a different call, and a changed pass threshold must
+ * re-derive its verdict rather than replay a stale one.
+ */
+export function computeShellKey(
+	command: string,
+	opts: { cwd?: string; expectExitCode?: number },
+): string {
+	const canonical = stableStringify({
+		command,
+		cwd: opts.cwd,
+		expectExitCode: opts.expectExitCode,
+	});
+	return `shell:${createHash("sha256").update(canonical).digest("hex")}`;
+}

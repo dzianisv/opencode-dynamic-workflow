@@ -144,13 +144,14 @@ describe("createWorkflowTool — description is the authoring contract", () => {
 		// Meta block contract.
 		expect(d).toContain("export const meta");
 		expect(d).toContain("pure literal");
-		// The eight globals and their core semantics.
+		// The nine globals and their core semantics.
 		expect(d).toContain("agent(");
 		expect(d).toContain("pipeline(");
 		expect(d).toContain("parallel(");
 		expect(d).toContain("phase(");
 		expect(d).toContain("budget");
 		expect(d).toContain("workflow(");
+		expect(d).toContain("shell(");
 		expect(d).toContain("filter(Boolean)");
 		// Determinism bans.
 		expect(d).toContain("Math.random()");

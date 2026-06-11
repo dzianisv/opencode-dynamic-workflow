@@ -18,6 +18,7 @@ import { createAgentPrimitive } from "./agent-call";
 import { parallel, pipeline } from "./compose";
 import { evaluateScript } from "./evaluate";
 import { parseScript, type WorkflowMeta } from "./meta";
+import { createShellPrimitive, type RunShell } from "./shell-call";
 import {
 	createSchemaRegistry,
 	type SchemaRegistry,
@@ -37,6 +38,7 @@ import type {
 	ProgressEvent,
 	RuntimeApi,
 	SettledJournalEntry,
+	ShellFn,
 	WorktreeManagerSeam,
 } from "./types";
 
@@ -213,6 +215,15 @@ export interface WorkflowRunDeps {
 	 * today (Epic 0.4). UNUSED until H.1.2; this task threads the handle only.
 	 */
 	worktreeManager?: WorktreeManagerSeam;
+	/**
+	 * Run a deterministic shell command for the `shell()` global, threaded straight to
+	 * the shell primitive. The engine wires it to the repo-bound host shell (`$`);
+	 * ABSENT (the standalone library / a no-shell engine) → `shell()` is inert
+	 * (`available:false`, never a fabricated pass). OPAQUE to the runtime — it never
+	 * learns what a shell is, preserving the zero-plugin-knowledge layering. A child
+	 * sub-workflow inherits the parent's shell (same project tree).
+	 */
+	runShell?: RunShell;
 }
 
 /** The terminal outcome of a workflow run (spec §2.3, §3.3). */
@@ -447,6 +458,10 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 				...(deps.worktreeManager !== undefined
 					? { worktreeManager: deps.worktreeManager }
 					: {}),
+				// A child sub-workflow inherits the parent's shell seam (same project
+				// tree), so a `shell()` inside a sub-workflow runs exactly as it would
+				// in the parent.
+				...(deps.runShell !== undefined ? { runShell: deps.runShell } : {}),
 				// No resolver → child workflow() throws NestingError (depth 1).
 				// No replay → the boundary entry in the PARENT journal covers the child.
 			});
@@ -462,6 +477,33 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		replay: deps.replay,
 	});
 
+	// The `shell()` global (spec §3.3): a journaled deterministic-command primitive
+	// over the opaque runShell seam. Shares the run's counters + callIndex + replay so
+	// a shell call is one journaled unit in the same dense ordinal stream as agents.
+	const innerShell = createShellPrimitive({
+		...(deps.runShell !== undefined ? { runShell: deps.runShell } : {}),
+		counters,
+		callIndex,
+		emit,
+		...(deps.replay !== undefined ? { replay: deps.replay } : {}),
+	});
+	// After abort(), a NEW shell() resolves an inert result immediately (mirrors the
+	// agent wrapper) rather than spawning a fresh command. The latch is the SHARED box,
+	// so a parent abort short-circuits a child's shell() too.
+	const shell: ShellFn = (command, opts) => {
+		if (abortBox.aborted) {
+			return Promise.resolve({
+				command,
+				passed: false,
+				exitCode: -1,
+				stdout: "",
+				stderr: "",
+				available: false,
+			});
+		}
+		return innerShell(command, opts);
+	};
+
 	const api: RuntimeApi = {
 		agent,
 		pipeline: pipeline as RuntimeApi["pipeline"],
@@ -475,6 +517,7 @@ export function createWorkflowRun(deps: WorkflowRunDeps): WorkflowRun {
 		args: deps.args,
 		budget,
 		workflow,
+		shell,
 	};
 
 	function abort(): void {

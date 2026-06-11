@@ -1377,6 +1377,50 @@ export function createWorkflowEngine(
 			// successful merge-back lands on THIS run's checkpoint ledger (see
 			// runWorktreeManager above). Inert on a no-shell engine (create → null).
 			worktreeManager: runWorktreeManager,
+			// The shell() primitive's seam: run a deterministic command via the repo-
+			// bound host shell so a gate like `make test` costs no agent (the doc's
+			// "an agent should not be paid to discover if go test passed"). `.quiet()`
+			// is REQUIRED for TTY safety — the plugin host shares fd 1/2 with the
+			// opentui renderer, so unquieted command output corrupts the alt-buffer
+			// (same reason as verifyResult's {check}). A script-supplied `cwd` resolves
+			// against the project root (absolute passes through); ABSENT → the project
+			// root. No shell threaded (no-shell engine / tests) or a thrown spawn →
+			// available:false, so the primitive returns an honest unavailable result,
+			// NEVER a fabricated pass.
+			runShell: async (command, shellOpts) => {
+				if (opts.shell === undefined) {
+					return { exitCode: -1, stdout: "", stderr: "", available: false };
+				}
+				const dir =
+					shellOpts.cwd === undefined
+						? opts.directory
+						: isAbsolute(shellOpts.cwd)
+							? shellOpts.cwd
+							: join(opts.directory, shellOpts.cwd);
+				try {
+					const res = await opts.shell
+						.cwd(dir)
+						.nothrow()`${{ raw: command }}`.quiet();
+					// Bun's quieted ShellOutput carries `.stdout`/`.stderr` Buffers and a
+					// synchronous `.text()` (stdout). Read the Buffers when present (the
+					// production path); fall back to `.text()` for a leaner test fake.
+					const stdout =
+						res.stdout != null
+							? res.stdout.toString()
+							: typeof res.text === "function"
+								? res.text()
+								: "";
+					const stderr = res.stderr != null ? res.stderr.toString() : "";
+					return { exitCode: res.exitCode, stdout, stderr, available: true };
+				} catch (err) {
+					logger?.debug("workflow shell() threw; returning available:false", {
+						runId,
+						command,
+						err: err instanceof Error ? err.message : String(err),
+					});
+					return { exitCode: -1, stdout: "", stderr: "", available: false };
+				}
+			},
 			...(budget !== undefined ? { budget } : {}),
 			// Pre-launch checkpoint barrier (Task 2.1.5): the runtime awaits this opaque
 			// thunk after gate.acquire and before runner.launch, so the next agent's

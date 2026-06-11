@@ -80,6 +80,45 @@ describe("createWorkflowRun — run() never rejects", () => {
 	});
 });
 
+describe("createWorkflowRun — shell() global wiring", () => {
+	test("a script's shell() reaches the runShell seam and returns a ShellResult", async () => {
+		let seenCommand: string | undefined;
+		const run = createWorkflowRun({
+			runner: makeRunner(),
+			parentSessionID: "ses_p",
+			runId: "run_shell",
+			runShell: async (command) => {
+				seenCommand = command;
+				return {
+					exitCode: 0,
+					stdout: "all green",
+					stderr: "",
+					available: true,
+				};
+			},
+		});
+		const result = await run.run(
+			`${META}const t = await shell("make test");\nreturn { passed: t.passed, out: t.stdout };\n`,
+		);
+		expect(result.status).toBe("completed");
+		expect(seenCommand).toBe("make test");
+		expect(result.returnValue).toEqual({ passed: true, out: "all green" });
+	});
+
+	test("with NO runShell seam, shell() is inert (available:false), never a fake pass", async () => {
+		const run = createWorkflowRun({
+			runner: makeRunner(),
+			parentSessionID: "ses_p",
+			runId: "run_noshell",
+		});
+		const result = await run.run(
+			`${META}const t = await shell("make test");\nreturn { passed: t.passed, available: t.available };\n`,
+		);
+		expect(result.status).toBe("completed");
+		expect(result.returnValue).toEqual({ passed: false, available: false });
+	});
+});
+
 describe("createWorkflowRun — currentPhase box wiring", () => {
 	test("phase() sets the box read by agent:start at call time", async () => {
 		const events: ProgressEvent[] = [];

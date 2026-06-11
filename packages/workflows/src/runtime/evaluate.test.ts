@@ -17,6 +17,7 @@ function makeApi(overrides: Partial<RuntimeApi> = {}): RuntimeApi {
 		args: {},
 		budget: { total: null, spent: () => 0, remaining: () => Infinity },
 		workflow: reject as RuntimeApi["workflow"],
+		shell: reject as RuntimeApi["shell"],
 		...overrides,
 	};
 }

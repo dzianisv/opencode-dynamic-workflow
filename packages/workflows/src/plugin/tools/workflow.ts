@@ -154,12 +154,13 @@ function architectureEcho(source: string | undefined): string[] {
 	const pipelines = count(/\bpipeline\(/g);
 	const parallels = count(/\bparallel\(/g);
 	const workflows = count(/\bworkflow\(/g);
+	const shells = count(/\bshell\(/g);
 	const hasSchema = /\bschema\b/.test(source);
 
 	lines.push(
 		`Detected call-sites (static approximation, not a DAG): ${agents} agent, ` +
-			`${pipelines} pipeline, ${parallels} parallel, ${workflows} workflow` +
-			`${hasSchema ? "; schema present" : ""}.`,
+			`${pipelines} pipeline, ${parallels} parallel, ${workflows} workflow, ` +
+			`${shells} shell${hasSchema ? "; schema present" : ""}.`,
 	);
 
 	// Advisory nudges (heuristic, best-effort, never blocking) — at most two,
@@ -260,6 +261,7 @@ The body below the meta runs in an async context: use top-level await freely; a 
 - args — the tool-call args value, verbatim.
 - budget — { total: number|null, spent(): number, remaining(): number }. Hard ceiling: once spent() reaches total, further agent() calls throw. Guard loops: while (budget.total && budget.remaining() > 50_000) { ... }.
 - workflow(nameOrRef, args?) — run another workflow inline (a saved name or { scriptPath }) and return its result. One level deep only; a child workflow error THROWS (unlike agent()'s null) — catch to handle.
+- shell(command, opts?) → Promise<{command, passed, exitCode, stdout, stderr, available}> — run a deterministic command via the repo-bound host shell. This is the CHEAP counterpart to agent(): the OS decides FACTS (did the gate pass?), so do NOT spend an agent to discover a command's exit code — run shell() and hand a FAILED result's stderr to an agent for JUDGMENT (why it failed, how to fix). NEVER throws on a non-zero exit; that is a passed:false VALUE you branch on. passed is exitCode === (opts.expectExitCode ?? 0). opts: label (display), cwd (relative to project root, or absolute), expectExitCode (default 0). available:false means no shell capability here (a no-shell checkout) — an honest unavailable result, NEVER a fabricated pass, so it is never cached and re-runs on resume. An available result IS journaled and replays on resume like agent() (a gate that passed once replays passed, never re-runs). stdout/stderr are capped (~100k chars each). Counts against the 1000-unit lifetime cap. Example: const t = await shell('make test'); if (!t.passed) await agent('Investigate this failing gate:\\n' + t.stderr).
 
 ## Determinism (violations throw)
 
