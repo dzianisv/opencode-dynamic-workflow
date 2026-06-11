@@ -137,13 +137,25 @@ export interface AgentStatsLine {
 export interface AgentCheckpointLine {
 	type: "agent:checkpoint";
 	label: string;
-	sessionID: string;
+	/**
+	 * The committing agent's child sessionID. Absent on a MERGE-BACK ledger line
+	 * (an isolated agent's merge is recorded by the engine's per-run worktree
+	 * wrapper, which knows the scratch branch but not the session).
+	 */
+	sessionID?: string;
 	/** The new commit sha the checkpoint created. */
 	sha?: string;
 	/** The exact pathspecs committed (workflow-touched, baseline-excluded). */
 	paths: string[];
+	/** The active progress phase, when one was known at the emit site. */
+	phase?: string;
 	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
 	modeFlips?: Record<string, string>;
+	/**
+	 * Committed while other unisolated agents were live (parallel() on one shared
+	 * tree) — attribution is approximate; see `CheckpointRecord.shared`.
+	 */
+	shared?: boolean;
 	at: number;
 }
 
@@ -285,17 +297,21 @@ export interface FeedAgentSummary {
 
 /**
  * The per-checkpoint git truth rehydrated from an `agent:checkpoint` feed line
- * (Epic 2.2 recovery parity). Structurally a `CheckpointRecord` (engine.ts) MINUS
- * `phase` — the feed line never carried `phase` (engine.ts:1028-1036), so a
- * recovered run's ledger omits it honestly. `phase` stays optional on the engine
- * `CheckpointRecord`, so a `FeedCheckpoint` is directly assignable to it.
+ * (Epic 2.2 recovery parity). Structurally a `CheckpointRecord` (engine.ts) —
+ * including `phase` and `shared`, which the feed line now carries from the emit
+ * site (older feeds simply lack them and rehydrate without). Defined HERE (not
+ * imported from engine) to keep the dependency one-way (engine → feed).
  */
 export interface FeedCheckpoint {
 	sha?: string;
 	paths: string[];
 	label: string;
+	/** The active progress phase at commit time, when the feed line carried one. */
+	phase?: string;
 	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
 	modeFlips?: Record<string, string>;
+	/** Shared-tree parallel commit (approximate attribution); see the engine type. */
+	shared?: boolean;
 }
 
 /** The outcome counts a recovered run rehydrates from its feed (Phase 3.2.1). */
@@ -412,14 +428,18 @@ export async function readFeedCounts(
 	for (const e of events) {
 		if (e.type === "agent:checkpoint") {
 			// Epic 2.2 recovery parity: harvest the per-checkpoint git truth a real
-			// crash dropped from the record (the record persists only at settle). The
-			// feed line carries label/sha?/paths/modeFlips? but NOT phase (it was never
-			// widened with it), so the rehydrated ledger omits phase — honest.
+			// crash dropped from the record (the record persists only at settle).
+			// Every field is defensively guarded — the parse above only proves valid
+			// JSON, not a well-formed line, and `label` feeds render paths that assume
+			// a string (a malformed line must degrade to "(unknown)", not poison the
+			// rehydrated ledger).
 			checkpoints.push({
-				...(e.sha !== undefined ? { sha: e.sha } : {}),
-				paths: e.paths ?? [],
-				label: e.label,
+				...(typeof e.sha === "string" ? { sha: e.sha } : {}),
+				paths: Array.isArray(e.paths) ? e.paths : [],
+				label: typeof e.label === "string" ? e.label : "(unknown)",
+				...(typeof e.phase === "string" ? { phase: e.phase } : {}),
 				...(e.modeFlips !== undefined ? { modeFlips: e.modeFlips } : {}),
+				...(e.shared === true ? { shared: true } : {}),
 			});
 		} else if (e.type === "agent:start") {
 			startQueue.push({ label: e.label, phase: e.phase });

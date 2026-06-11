@@ -25,7 +25,8 @@ function makeFs(names: string[] = [], contents: Record<string, string> = {}) {
 			calls.rm.push(path);
 			present.delete(path.slice(`${DIR}/`.length));
 		},
-		readFile: async (path: string) => contents[path.slice(`${DIR}/`.length)] ?? "",
+		readFile: async (path: string) =>
+			contents[path.slice(`${DIR}/`.length)] ?? "",
 	};
 	return { fs, present, calls };
 }

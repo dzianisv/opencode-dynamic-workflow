@@ -943,9 +943,12 @@ describe("createGitCheckpointer — per-run ref marker / promote / discard", () 
 		expect(rewindIdx).toBeLessThan(delIdx);
 	});
 
-	test("discard() with a diverged branch tip SKIPS the rewind, deletes the marker, warns with the residue sha", async () => {
-		// Branch tip moved to operator_sha (operator layered a commit) while the marker
-		// still points at sha_x → the guard fails → no rewind.
+	test("discard() with a FOREIGN commit in baseline..tip SKIPS the rewind, deletes the marker, warns with the residue sha", async () => {
+		// The operator layered a commit on top of the run's checkpoint: the range walk
+		// (`git log --format=%s baseline..HEAD`) finds a subject WITHOUT this run's
+		// `run=<runId>` marker → the foreign-commit guard fails → no rewind. (The old
+		// tip-equality guard is gone — a tip-equal interleaving from a CONCURRENT run
+		// would have passed it and orphaned the sibling's commits.)
 		let revParseHeadCalls = 0;
 		let porcelainCalls = 0;
 		const aliveStub: Stub = {
@@ -977,6 +980,14 @@ describe("createGitCheckpointer — per-run ref marker / promote / discard", () 
 			{
 				match: (c) => c === "git rev-parse refs/wf-checkpoints/wf_1",
 				out: ok("sha_x"),
+			},
+			{
+				// The range walk: the run's own checkpoint subject PLUS the operator's
+				// foreign commit — one marker-less subject is enough to block the rewind.
+				match: (c) => c.startsWith("git log --format=%s base000.."),
+				out: ok(
+					"operator: layered work\nworkflow checkpoint: run=wf_1 agent=worker session=ses_1",
+				),
 			},
 		]);
 		const { logger, warns } = captureLogger();
@@ -1169,5 +1180,274 @@ describe("createGitCheckpointer — checkpoint() modeFlips", () => {
 		});
 		expect(result.committed).toBe(true);
 		expect(result.modeFlips).toBeUndefined();
+	});
+});
+
+// ---- #1: diff() emptiness must count UNTRACKED files ------------------------
+
+describe("createGitCheckpointer — diff() emptiness counts untracked files (#1)", () => {
+	test("empty diff TEXT + an untracked file → isEmpty:false (a new module IS work)", async () => {
+		// `git diff <base>` never lists untracked files, so an agent whose only
+		// output is a NEW file used to read as "empty" → false verify_failed / false
+		// empty-diff refusal. The porcelain probe alongside the diff fixes the verdict.
+		let porcelainCalls = 0;
+		const { cp } = await liveCheckpointer([
+			{
+				match: (c) => c.includes("status --porcelain"),
+				get out() {
+					porcelainCalls += 1;
+					// Clean at baseline; the untracked new module appears at diff() time.
+					return porcelainCalls === 1 ? ok("") : ok("?? src/new-module.ts");
+				},
+			},
+			{ match: (c) => c === "git rev-parse HEAD", out: ok("base000") },
+			{ match: (c) => c === "git diff base000", out: ok("") },
+		]);
+		await cp.baseline();
+		const res = await cp.diff();
+		expect(res.available).toBe(true);
+		// The TEXT stays the raw (empty) git diff for contextDiff consumers…
+		expect(res.text.trim()).toBe("");
+		// …but the emptiness VERDICT sees the created file.
+		expect(res.isEmpty).toBe(false);
+	});
+
+	test("an untracked file that was ALREADY dirty at baseline does NOT flip emptiness", async () => {
+		// Operator-owned pre-run dirt is not run work: subtracting the baseline set
+		// keeps verifyDiff from vacuously passing on a tree the operator left dirty.
+		const { cp } = await liveCheckpointer([
+			{
+				match: (c) => c.includes("status --porcelain"),
+				out: ok("?? operator-notes.md"),
+			},
+			{ match: (c) => c === "git rev-parse HEAD", out: ok("base000") },
+			{ match: (c) => c === "git diff base000", out: ok("") },
+		]);
+		await cp.baseline(); // snapshots operator-notes.md as pre-existing
+		const res = await cp.diff();
+		expect(res.available).toBe(true);
+		expect(res.isEmpty).toBe(true);
+	});
+});
+
+// ---- #9: sweepMarkers() — stale refs/wf-checkpoints/* GC at startup ---------
+
+describe("createGitCheckpointer — sweepMarkers (#9)", () => {
+	test("deletes every refs/wf-checkpoints/* marker found, quieted", async () => {
+		const aliveStub: Stub = {
+			match: (c) => c.includes("is-inside-work-tree"),
+			out: ok("true"),
+		};
+		const made = makeShell([
+			aliveStub,
+			{
+				match: (c) => c.includes("for-each-ref"),
+				out: ok("refs/wf-checkpoints/wf_dead1\nrefs/wf-checkpoints/wf_dead2\n"),
+			},
+			{ match: (c) => c.startsWith("git update-ref -d"), out: ok() },
+		]);
+		const cp = createGitCheckpointer({
+			shell: made.shell,
+			directory: "/proj",
+			clock,
+		});
+		await cp.sweepMarkers();
+		// Enumerated ONLY our namespace, then deleted each stale marker.
+		const enumCmd = made.commands.find((c) => c.includes("for-each-ref"));
+		expect(enumCmd).toContain("refs/wf-checkpoints/");
+		expect(made.commands).toContain(
+			"git update-ref -d refs/wf-checkpoints/wf_dead1",
+		);
+		expect(made.commands).toContain(
+			"git update-ref -d refs/wf-checkpoints/wf_dead2",
+		);
+		for (const c of made.commands) {
+			expect(made.quietedCommands).toContain(c);
+		}
+	});
+
+	test("no markers → no deletes; a failing for-each-ref is fenced", async () => {
+		const aliveStub: Stub = {
+			match: (c) => c.includes("is-inside-work-tree"),
+			out: ok("true"),
+		};
+		const made = makeShell([
+			aliveStub,
+			{ match: (c) => c.includes("for-each-ref"), out: fail() },
+		]);
+		const cp = createGitCheckpointer({
+			shell: made.shell,
+			directory: "/proj",
+			clock,
+		});
+		await expect(cp.sweepMarkers()).resolves.toBeUndefined();
+		expect(made.commands.some((c) => c.startsWith("git update-ref"))).toBe(
+			false,
+		);
+	});
+
+	test("dead / no-shell → silent no-op", async () => {
+		const cp = createGitCheckpointer({ shell: undefined, directory: "/proj" });
+		await expect(cp.sweepMarkers()).resolves.toBeUndefined();
+	});
+});
+
+// ---- #15: real-git integration — the catastrophic flows against a real repo --
+
+import { afterEach } from "bun:test";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { $ } from "bun";
+
+describe("createGitCheckpointer — real-git integration (#15)", () => {
+	const tmps: string[] = [];
+
+	afterEach(async () => {
+		for (const dir of tmps.splice(0)) {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	/** Init a real repo (nested under the mkdtemp root — see git-worktree.test.ts #0). */
+	async function makeRepo(): Promise<string> {
+		const root = await mkdtemp(join(tmpdir(), "wf-cp-int-"));
+		tmps.push(root);
+		const dir = join(root, "repo");
+		await mkdir(dir, { recursive: true });
+		const git = $.cwd(dir).nothrow();
+		await git`git init -q -b main`.quiet();
+		await git`git config user.email t@t.local`.quiet();
+		await git`git config user.name tester`.quiet();
+		await writeFile(join(dir, "README.md"), "# tracked\n");
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m init`.quiet();
+		return dir;
+	}
+
+	function liveOn(dir: string) {
+		return createGitCheckpointer({ shell: $, directory: dir, clock });
+	}
+
+	test("checkpoint then discard → branch rewound to baseline, abandoned edits still on disk (#15.1)", async () => {
+		const repo = await makeRepo();
+		const git = $.cwd(repo).nothrow();
+		const cp = liveOn(repo);
+		await cp.ready();
+		await cp.baseline();
+		const baseline = cp.baselineRef() as string;
+
+		await writeFile(join(repo, "work.ts"), "export const w = 1;\n");
+		const res = await cp.checkpoint({
+			runId: "wf_int1",
+			label: "worker",
+			sessionID: "ses_1",
+		});
+		expect(res.committed).toBe(true);
+		expect(res.paths).toEqual(["work.ts"]);
+		// HEAD advanced past baseline; the marker tracks it.
+		const tip = (await git`git rev-parse HEAD`.quiet()).text().trim();
+		expect(tip).not.toBe(baseline);
+
+		await cp.discard();
+		// The branch pointer is back at baseline (the range walk saw only this run's
+		// forensic run= marker), the marker is gone, and the abandoned edit SURVIVES
+		// on disk as an uncommitted change (update-ref moves the pointer only).
+		expect((await git`git rev-parse HEAD`.quiet()).text().trim()).toBe(
+			baseline,
+		);
+		const marker = await git`git rev-parse refs/wf-checkpoints/wf_int1`.quiet();
+		expect(marker.exitCode).not.toBe(0);
+		expect(await readFile(join(repo, "work.ts"), "utf-8")).toBe(
+			"export const w = 1;\n",
+		);
+	});
+
+	test("a staged deletion (git rm) is committed by the checkpoint (#15.2)", async () => {
+		const repo = await makeRepo();
+		const git = $.cwd(repo).nothrow();
+		const cp = liveOn(repo);
+		await cp.ready();
+		await cp.baseline();
+
+		await git`git rm -q README.md`.quiet();
+		const res = await cp.checkpoint({
+			runId: "wf_int2",
+			label: "worker",
+			sessionID: "ses_1",
+		});
+		expect(res.committed).toBe(true);
+		expect(res.paths).toEqual(["README.md"]);
+		// The DELETION landed in the commit: README.md is gone from HEAD's tree.
+		const inHead = await git`git cat-file -e HEAD:README.md`.quiet();
+		expect(inHead.exitCode).not.toBe(0);
+		// And the working tree is clean (nothing left half-staged).
+		expect((await git`git status --porcelain`.quiet()).text().trim()).toBe("");
+	});
+
+	test("an operator PRE-STAGED file is never swept into a checkpoint (#15.4)", async () => {
+		const repo = await makeRepo();
+		const git = $.cwd(repo).nothrow();
+		// The operator stages a file BEFORE the run starts…
+		await writeFile(join(repo, "operator.txt"), "operator work\n");
+		await git`git add operator.txt`.quiet();
+
+		const cp = liveOn(repo);
+		await cp.ready();
+		await cp.baseline(); // snapshots operator.txt as off-limits
+
+		// …then an agent writes its own file mid-run.
+		await writeFile(join(repo, "agent.ts"), "export const a = 1;\n");
+		const res = await cp.checkpoint({
+			runId: "wf_int4",
+			label: "worker",
+			sessionID: "ses_1",
+		});
+		expect(res.committed).toBe(true);
+		expect(res.paths).toEqual(["agent.ts"]);
+		expect(res.refused).toEqual(["operator.txt"]);
+		// The pathspec-scoped commit held: operator.txt is NOT in the commit and is
+		// STILL staged, exactly as the operator left it.
+		const show = await git`git show --name-only --format= HEAD`.quiet();
+		expect(show.text()).toContain("agent.ts");
+		expect(show.text()).not.toContain("operator.txt");
+		expect((await git`git status --porcelain`.quiet()).text()).toContain(
+			"A  operator.txt",
+		);
+	});
+
+	test("a unicode filename survives the checkpoint pipeline (#7)", async () => {
+		const repo = await makeRepo();
+		const git = $.cwd(repo).nothrow();
+		const cp = liveOn(repo);
+		await cp.ready();
+		await cp.baseline();
+
+		await writeFile(join(repo, "café.txt"), "unicode work\n");
+		const res = await cp.checkpoint({
+			runId: "wf_int7",
+			label: "worker",
+			sessionID: "ses_1",
+		});
+		expect(res.committed).toBe(true);
+		expect(res.paths).toEqual(["café.txt"]);
+		// Committed byte-exact: HEAD's tree carries the file, the tree is clean, and
+		// the file is untouched on disk.
+		const show =
+			await git`git -c core.quotePath=false show --name-only --format= HEAD`.quiet();
+		expect(show.text()).toContain("café.txt");
+		expect((await git`git status --porcelain`.quiet()).text().trim()).toBe("");
+		expect(await readFile(join(repo, "café.txt"), "utf-8")).toBe(
+			"unicode work\n",
+		);
+		// Sanity for the suite's own hygiene: stat resolves on the exact name.
+		await stat(join(repo, "café.txt"));
 	});
 });

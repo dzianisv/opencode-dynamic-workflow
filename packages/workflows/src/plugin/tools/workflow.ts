@@ -19,6 +19,7 @@
  * string, an empty string, or absent — each handled explicitly here.
  */
 
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { FsFacade } from "@drawers/core";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { parseScript } from "../../runtime/meta";
@@ -81,6 +82,12 @@ export function nodeFs(): FsFacade {
 		writeFile: FsFacade["writeFile"];
 		rename: FsFacade["rename"];
 		rm: FsFacade["rm"];
+		// node:fs/promises carries these natively; widening the cast formalizes
+		// them so the catalog walk's cycle guard (realpath visited-set) and the
+		// engine's stat probe see them on the production facade.
+		stat: NonNullable<FsFacade["stat"]>;
+		lstat: NonNullable<FsFacade["lstat"]>;
+		realpath: NonNullable<FsFacade["realpath"]>;
 	};
 	return fs;
 }
@@ -257,7 +264,7 @@ The body below the meta runs in an async context: use top-level await freely; a 
 
 ## Script API (the only globals available)
 
-- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. If later control flow branches on a result (a count, a pass/fail, a list to fan out over), that agent MUST have a schema — free text cannot be gated. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, tools (string[] — enable named platform/MCP tools for this agent, e.g. web search/fetch for research; names are environment-dependent and a no-op if the platform lacks them; omit to inherit the session's tools), skills (string[] — canonical skill names from the workflow_skills tool, e.g. \`ring:writing-trds\`; use EXACT names, each binds that skill's instructions into the spawned step. UNLIKE agentType/tools, an UNKNOWN name FAILS the step loudly, so verify names via workflow_skills first; a skill-bound step needs file-read tools (Read/Bash) enabled if the skill references bundled resources), contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. verifyDiff:true (or {}) asserts the unit's git diff is non-empty (the agent actually wrote to disk); verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) and asserts exit 0. On failure the result is downgraded to null (so it re-runs on resume); it does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
+- agent(prompt, opts?) → Promise — spawn a subagent. Resolves to its final text, or a validated object when opts.schema (a JSON Schema) is set, or null when the agent fails. If later control flow branches on a result (a count, a pass/fail, a list to fan out over), that agent MUST have a schema — free text cannot be gated. Filter nulls: results.filter(Boolean). opts: label (display), phase (progress group — use inside pipeline/parallel stages instead of the global phase()), schema, model ('provider/model' override; omit to inherit), agentType, tools (string[] — enable named platform/MCP tools for this agent, e.g. web search/fetch for research; names are environment-dependent and a no-op if the platform lacks them; omit to inherit the session's tools), skills (string[] — canonical skill names from the workflow_skills tool, e.g. \`ring:writing-trds\`; use EXACT names, each binds that skill's instructions into the spawned step. UNLIKE agentType/tools, an UNKNOWN name FAILS the step loudly, so verify names via workflow_skills first; a skill-bound step needs file-read tools (Read/Bash) enabled if the skill references bundled resources), contextDiff. isolation:'worktree' runs the agent in its OWN git worktree (a scratch branch checked out in a sibling dir) when the run is git-backed, so parallel mutating agents never overwrite each other on one tree; it degrades to null with a loud diagnostic ONLY on a non-git / no-shell checkout (where there is no worktree primitive) rather than silently running unisolated. WORKTREE ENVIRONMENT: the checkout is HEAD + the agent's own edits + a node_modules symlinked from the main tree when one exists (so test/lint checks can run); OTHER untracked artifacts (.env, build output, generated files) are ABSENT — a verifyDiff {check} that needs them will fail environmentally. MERGE-BACK + CONFLICT RESULT: when an isolated agent settles with real work, the engine merges its scratch branch back into the main tree; on a REAL merge conflict the agent() call resolves to a structured {status:'conflict', branch, files, baseRef} value (NOT the agent's text, NOT a throw — the batch survives) and the worktree+branch are PRESERVED so a follow-up resolver step can act on them — a conflict means two agents got overlapping scope, which is a decomposition error to fix in the script. contextDiff:true (FOR REVIEW AGENTS) injects the engine-computed REAL git diff (since run start) as model-only context, and refuses the review (degrades to null) when that diff is empty — so a reviewer reviews what is actually ON DISK, never narrative-only claims. The diff does not change the resume cache key, so a reviewer still replays its verdict on resume. On a non-git checkout it is inert (the review runs with no diff). verifyDiff (FOR FIX/IMPLEMENT AGENTS) is a post-condition the engine checks AFTER the agent settles, against GIT/DISK truth — NOT the agent's self-report. Setting verifyDiff IMPLIES worktree isolation on a git-backed engine (the check must observe only THIS agent's edits, not a sibling's). verifyDiff:true (or {}) asserts the agent actually wrote work — modified files, NEW files, and commits the agent made inside its worktree all count; verifyDiff:{check:'<cmd>'} runs <cmd> (e.g. a test) in the agent's worktree and asserts exit 0. VERIFY GATES THE MERGE: when verify fails for an isolated agent, its work is NOT merged to the main branch — the result is downgraded to null (so it re-runs on resume, never on top of its own failed work) and the worktree+scratch branch (named wf/<run_id>/<label> in the warn) are preserved for inspection/recovery. verifyDiff:false is identical to omitting it. It does NOT change the resume cache key. Best-effort: it proves something is on disk or a command passed, not that the work is correct. Inert on a non-git checkout.
 - pipeline(items, stage1, stage2, ...) → Promise<any[]> — run each item through all stages with NO barrier between stages: item A can be in stage 3 while item B is in stage 1. DEFAULT to this for multi-stage work. Each stage receives (prevResult, originalItem, index). A throwing stage drops that item to null.
 - parallel(thunks) → Promise<any[]> — run thunks (() => Promise) concurrently with a BARRIER: awaits all before returning; a failed thunk yields null, the call never rejects. Use ONLY when a later step genuinely needs ALL results together (dedup, cross-item comparison, early-exit on count).
 - phase(title) — start a progress group for subsequent agent() calls.
@@ -276,7 +283,7 @@ Lifetime cap of 1000 agent() calls per run (cached replays count); 4096 items ma
 
 ## Acting on failures
 
-agent() failures and failed verifyDiff/contextDiff post-conditions degrade to null — the script keeps running unless you decide otherwise. When a stage gates downstream work, DECIDE explicitly: stop the run (throw), escalate (spawn a fix/repair agent), or record-and-continue. For SEQUENTIAL phases where phase N+1 builds on phase N's code, the default is to STOP on a red gate rather than compound onto broken work; for independent fan-out, record-and-continue and report the failures in the result.
+agent() failures and failed verifyDiff/contextDiff post-conditions degrade to null — the script keeps running unless you decide otherwise. An isolated agent can also resolve to {status:'conflict', branch, files, baseRef} (merge-back conflict; its worktree is preserved) — branch on result && result.status === 'conflict' to dispatch a resolver or stop. When a stage gates downstream work, DECIDE explicitly: stop the run (throw), escalate (spawn a fix/repair agent), or record-and-continue. For SEQUENTIAL phases where phase N+1 builds on phase N's code, the default is to STOP on a red gate rather than compound onto broken work; for independent fan-out, record-and-continue and report the failures in the result.
 
 ## Resume and saved workflows
 
@@ -385,10 +392,13 @@ export function createWorkflowTool(
 				.string()
 				.optional()
 				.describe(
-					"Path to the run's source-of-truth file (e.g. a rolling-wave plan " +
-						"doc), resolved relative to the project directory. Classified for a " +
+					"Path to the run's source-of-truth FILE (e.g. a rolling-wave plan " +
+						"doc): repo-relative, or absolute under the project directory — a " +
+						"path resolving outside the project is rejected. Classified for a " +
 						"git diagnostic; if untracked/ignored it is copied into " +
-						"worktree-isolated agents so they can see it. Omit if none.",
+						"worktree-isolated agents so they can see it. The copy is READ-ONLY " +
+						"input: an agent edit to it is never merged (a loud warning names " +
+						"where the edited bytes survive). Omit if none.",
 				),
 		},
 		async execute(args, context: ToolContext) {
@@ -399,7 +409,29 @@ export function createWorkflowTool(
 			const script = trimmedOrAbsent(args.script);
 			const scriptPath = trimmedOrAbsent(args.script_path);
 			const name = trimmedOrAbsent(args.name);
-			const specPath = trimmedOrAbsent(args.spec_path);
+
+			// spec_path containment (model-supplied input): support repo-relative AND
+			// absolute (the documented contract), resolve absolute-aware (a naive
+			// join() both mangles absolute paths and lets `../..` escape the repo),
+			// then REQUIRE the result inside the project directory — an escaping path
+			// is rejected loudly here, at the tool boundary. The engine receives the
+			// normalized REPO-RELATIVE path so classification and the worktree copy
+			// share one canonical shape.
+			let specPath = trimmedOrAbsent(args.spec_path);
+			if (specPath !== undefined) {
+				const root = resolve(directory);
+				const abs = isAbsolute(specPath)
+					? resolve(specPath)
+					: resolve(root, specPath);
+				if (abs !== root && !abs.startsWith(root + sep)) {
+					return (
+						`spec_path must resolve inside the project directory (${directory}); ` +
+						`"${specPath}" resolves to ${abs}. Pass a repo-relative path or an ` +
+						"absolute path under the project."
+					);
+				}
+				specPath = relative(root, abs);
+			}
 
 			const present = [script, scriptPath, name].filter((v) => v !== undefined);
 			// The source xor only applies when NOT resuming: a resume may carry zero

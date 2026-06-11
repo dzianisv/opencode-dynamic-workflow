@@ -25,10 +25,12 @@ import type { BunShell } from "./git-checkpoint";
  * `rule` is the matching `.gitignore` line (`<file>:<line>:<pattern>`) when the
  * path is `ignored`; absent otherwise. Defined HERE as the single home for the
  * type — `engine.ts` imports it for {@link RunRecord.sourceDiagnostics}.
+ * `directory` is an ENGINE-side verdict (the fs probe found a directory, not a
+ * file — a spec must be a file); {@link classifyPath} itself never emits it.
  */
 export interface SourceDiagnostic {
 	path: string;
-	classification: "tracked" | "untracked" | "ignored" | "missing";
+	classification: "tracked" | "untracked" | "ignored" | "missing" | "directory";
 	rule?: string;
 }
 

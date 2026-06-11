@@ -37,3 +37,26 @@ describe("WORKFLOW_DESCRIPTION pattern catalogue", () => {
 		expect(missing).toEqual([]);
 	});
 });
+
+describe("WORKFLOW_DESCRIPTION isolation/verify contracts (#13)", () => {
+	test("documents the first-class {status:'conflict'} merge-back result", () => {
+		expect(WORKFLOW_DESCRIPTION).toContain(
+			"{status:'conflict', branch, files, baseRef}",
+		);
+	});
+
+	test("documents that verifyDiff IMPLIES worktree isolation", () => {
+		expect(WORKFLOW_DESCRIPTION).toContain("IMPLIES worktree isolation");
+	});
+
+	test("documents that verify GATES the merge and the preserved-branch recovery affordance", () => {
+		expect(WORKFLOW_DESCRIPTION).toContain("VERIFY GATES THE MERGE");
+		expect(WORKFLOW_DESCRIPTION).toContain("wf/<run_id>/<label>");
+	});
+
+	test("documents the worktree environment caveat (HEAD + edits + linked node_modules)", () => {
+		expect(WORKFLOW_DESCRIPTION).toContain("WORKTREE ENVIRONMENT");
+		expect(WORKFLOW_DESCRIPTION).toContain("node_modules");
+		expect(WORKFLOW_DESCRIPTION).toContain(".env");
+	});
+});

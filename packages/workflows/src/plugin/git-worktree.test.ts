@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+	lstat,
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
@@ -218,6 +226,25 @@ describe("createWorktreeManager — create()", () => {
 		expect(commands.some((c) => c.includes("worktree add"))).toBe(false);
 	});
 
+	test("baseOf exposes the create-time base for a minted dir; undefined for orphans / after cleanup", async () => {
+		// The engine's verifyDiff worktree arm reads this to count commits ahead, so
+		// agent-COMMITTED work (clean porcelain) still counts as landed.
+		const { shell } = makeShell([
+			{ match: (c) => c.includes("is-inside-work-tree"), out: ok("true") },
+			{ match: (c) => c.includes("worktree add"), out: ok() },
+			{ match: (c) => c.includes("rev-parse HEAD"), out: ok("base000") },
+		]);
+		const mgr = createWorktreeManager({ shell, directory: "/proj" });
+		const created = (await mgr.create({ runId: "wf_1", label: "w" })) as {
+			dir: string;
+			branch: string;
+		};
+		expect(mgr.baseOf(created.dir)).toBe("base000");
+		expect(mgr.baseOf("/some/orphan")).toBeUndefined();
+		await mgr.cleanup(created.dir, created.branch);
+		expect(mgr.baseOf(created.dir)).toBeUndefined();
+	});
+
 	test("a failed `worktree add` returns null (fenced, non-throwing)", async () => {
 		const { shell } = makeShell([
 			{ match: (c) => c.includes("is-inside-work-tree"), out: ok("true") },
@@ -337,9 +364,17 @@ describe("createWorktreeManager — mergeBack()", () => {
 		]);
 		const mgr = createWorktreeManager({ shell, directory: "/proj" });
 		const res = await mgr.mergeBack("/wt", "wf/wf_1/worker");
-		expect(res).toEqual({ merged: true });
+		// The merged arm now carries the ledger truth: paths from the post-merge
+		// name-only diff (empty here — the fake answers ""), sha omitted (the fake's
+		// default rev-parse answer is empty).
+		expect(res).toEqual({ merged: true, paths: [] });
 		const merge = commands.find((c) => c.includes("merge --no-ff")) as string;
 		expect(merge).toContain("wf/wf_1/worker");
+		// The merge commit needs an author even in a user-less repo → the identity
+		// fallback precedes the subcommand, and the message carries the forensic
+		// run marker parsed from the branch (discard()'s range guard contract).
+		expect(merge).toContain("user.name=opencode-drawers");
+		expect(merge).toContain("run=wf_1");
 		expect(quietedCommands).toContain(merge);
 		// A clean merge never aborts.
 		expect(commands.some((c) => c.includes("merge --abort"))).toBe(false);
@@ -453,7 +488,7 @@ describe("createWorktreeManager — mergeBack()", () => {
 			shell,
 			directory: "/proj",
 		}).mergeBack("/wt", "wf/wf_1/worker");
-		expect(res).toEqual({ merged: true });
+		expect(res).toEqual({ merged: true, paths: [] });
 
 		// It staged BOTH dirty paths as explicit pathspecs (NEVER `git add -A`).
 		expect(commands.some((c) => c === "git add -- src/a.ts")).toBe(true);
@@ -497,7 +532,7 @@ describe("createWorktreeManager — mergeBack()", () => {
 			shell,
 			directory: "/proj",
 		}).mergeBack("/wt", "wf/wf_1/worker");
-		expect(res).toEqual({ merged: true });
+		expect(res).toEqual({ merged: true, paths: [] });
 		expect(commands.some((c) => c.includes("git add"))).toBe(false);
 		expect(commands.some((c) => c.includes("commit --no-verify"))).toBe(false);
 	});
@@ -740,11 +775,17 @@ describe("createWorktreeManager — registerSpec copies an untracked spec into t
 
 	/** Init a real git repo with one tracked commit so `HEAD` exists for `worktree add`. */
 	async function makeRepo(): Promise<string> {
-		const dir = await mkdtemp(join(tmpdir(), "wf-wt-"));
-		tmps.push(dir);
-		// The managed worktree root is a SIBLING of the repo (`<repo>/../.wf-worktrees`),
-		// so register the parent for cleanup too.
-		tmps.push(join(dir, "..", ".wf-worktrees"));
+		// Nest the repo ONE level under the mkdtemp root: the module's worktree root is
+		// a SIBLING of the repo (`<repo>/../.wf-worktrees`), so a repo created directly
+		// in mkdtemp(tmpdir()) would resolve its sibling to the machine-global
+		// `${tmpdir()}/.wf-worktrees` — shared across concurrent test runs/CI jobs, and
+		// rm -rf'd by afterEach (clobbering a parallel job's live worktrees). With the
+		// repo at `<tmp>/repo`, the sibling root is `<tmp>/.wf-worktrees`, fully inside
+		// the per-test temp dir; ONE tmps entry (the mkdtemp root) cleans everything.
+		const root = await mkdtemp(join(tmpdir(), "wf-wt-"));
+		tmps.push(root);
+		const dir = join(root, "repo");
+		await mkdir(dir, { recursive: true });
 		const git = $.cwd(dir).nothrow();
 		await git`git init -q -b main`.quiet();
 		await git`git config user.email t@t.local`.quiet();
@@ -837,5 +878,419 @@ describe("createWorktreeManager — registerSpec copies an untracked spec into t
 		const dir = (handle as { dir: string }).dir;
 		await expect(stat(join(dir, "notes.md"))).rejects.toThrow();
 		await mgr.cleanup(dir, (handle as { branch: string }).branch);
+	});
+
+	test("the copied spec is INVISIBLE to the settle path: isUnchanged stays true, nothing merges (#6)", async () => {
+		// Before the fix, the copied spec landed as an untracked file in EVERY minted
+		// worktree → isUnchanged was always false → commitWorktreeEdits committed and
+		// MERGED the operator's never-committed file onto the main branch (bypassing
+		// refuse-don't-stomp), or the merge refused on "untracked working tree file
+		// would be overwritten" and a SUCCESSFUL agent's real work was dropped.
+		const repo = await makeRepo();
+		await writeFile(join(repo, "notes.md"), "# the operator's spec\n");
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec("wf_spec_inv", "notes.md");
+		const handle = (await mgr.create({
+			runId: "wf_spec_inv",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		// The spec IS in the worktree (the agent can read it)…
+		expect(await readFile(join(handle.dir, "notes.md"), "utf-8")).toBe(
+			"# the operator's spec\n",
+		);
+		// …but the worktree still reads UNCHANGED (manager-placed ≠ agent work).
+		expect(await mgr.isUnchanged(handle.dir)).toBe(true);
+		// And a forced merge-back commits NOTHING of it to the main branch: the main
+		// tree's notes.md stays the operator's UNTRACKED file, not a committed one.
+		await mgr.mergeBack(handle.dir, handle.branch);
+		const tracked = await $.cwd(
+			repo,
+		).nothrow()`git ls-files --error-unmatch -- notes.md`.quiet();
+		expect(tracked.exitCode).not.toBe(0);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("AGENT work merges back even when a spec rides along; the spec itself never lands (#6)", async () => {
+		const repo = await makeRepo();
+		await writeFile(join(repo, "notes.md"), "# spec\n");
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec("wf_spec_work", "notes.md");
+		const handle = (await mgr.create({
+			runId: "wf_spec_work",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		// The agent writes a REAL new module in the worktree.
+		await writeFile(join(handle.dir, "feature.ts"), "export const x = 1;\n");
+		expect(await mgr.isUnchanged(handle.dir)).toBe(false);
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		// The agent's file landed in the main tree (committed); the spec did not.
+		expect(await readFile(join(repo, "feature.ts"), "utf-8")).toBe(
+			"export const x = 1;\n",
+		);
+		const merged = res as { merged: true; sha?: string; paths?: string[] };
+		expect(merged.paths).toEqual(["feature.ts"]);
+		expect(typeof merged.sha).toBe("string");
+		const specTracked = await $.cwd(
+			repo,
+		).nothrow()`git ls-files --error-unmatch -- notes.md`.quiet();
+		expect(specTracked.exitCode).not.toBe(0);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+});
+
+/**
+ * Real-git integration tests (#15): the catastrophic flows — merge-back content,
+ * conflicts, unicode paths, node_modules linking, forensic markers — exercised
+ * against a real on-disk repo, not the fake shell.
+ */
+describe("createWorktreeManager — real-git integration (#15)", () => {
+	const tmps: string[] = [];
+
+	afterEach(async () => {
+		for (const dir of tmps.splice(0)) {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	async function makeRepo(): Promise<string> {
+		// Nested one level under the mkdtemp root — see the harness note above (#0).
+		const root = await mkdtemp(join(tmpdir(), "wf-wt-int-"));
+		tmps.push(root);
+		const dir = join(root, "repo");
+		await mkdir(dir, { recursive: true });
+		const git = $.cwd(dir).nothrow();
+		await git`git init -q -b main`.quiet();
+		await git`git config user.email t@t.local`.quiet();
+		await git`git config user.name tester`.quiet();
+		await writeFile(join(dir, "README.md"), "# tracked\n");
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m init`.quiet();
+		return dir;
+	}
+
+	test("a unicode filename round-trips: committed in the worktree, merged to the main tree (#7)", async () => {
+		// With core.quotePath ON (git's default), porcelain C-quotes "café.txt" →
+		// the parsed pathspec fails `git add` → the path is silently dropped → the
+		// later `worktree remove --force` DELETES the file (work loss). quotePath=off
+		// on the status invocations keeps the path byte-exact end-to-end.
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_uni",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		await writeFile(join(handle.dir, "café.txt"), "unicode work\n");
+		expect(await mgr.isUnchanged(handle.dir)).toBe(false);
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		expect(await readFile(join(repo, "café.txt"), "utf-8")).toBe(
+			"unicode work\n",
+		);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("a REAL merge conflict yields the Tier 1 {conflict} result and leaves the main tree clean (#15.3)", async () => {
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_conf",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		// Diverge: the worktree edits README one way…
+		await writeFile(join(handle.dir, "README.md"), "# worktree version\n");
+		// …while the MAIN branch commits a competing edit on top of the base.
+		await writeFile(join(repo, "README.md"), "# main version\n");
+		const git = $.cwd(repo).nothrow();
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m "main edit"`.quiet();
+
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("conflict" in res).toBe(true);
+		const conflict = res as {
+			conflict: true;
+			branch: string;
+			files: string[];
+			baseRef: string | undefined;
+		};
+		expect(conflict.branch).toBe(handle.branch);
+		expect(conflict.files).toEqual(["README.md"]);
+		expect(typeof conflict.baseRef).toBe("string");
+		// merge --abort left the MAIN tree clean: porcelain empty, content = main's.
+		const status = await git`git status --porcelain`.quiet();
+		expect(status.text().trim()).toBe("");
+		expect(await readFile(join(repo, "README.md"), "utf-8")).toBe(
+			"# main version\n",
+		);
+		// The conflicted worktree+branch are still alive for Tier 2 (cleanup now).
+		expect(await readFile(join(handle.dir, "README.md"), "utf-8")).toBe(
+			"# worktree version\n",
+		);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("scratch + merge commits carry the forensic run=<runId> marker (#4)", async () => {
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_marked",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		await writeFile(join(handle.dir, "work.ts"), "export const w = 1;\n");
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		// Every commit the settle created (scratch commit + merge commit) must carry
+		// `run=wf_marked` so discard()'s range guard recognizes them as the run's own.
+		// Walk the whole log and exclude the base commit — `git log -N` is
+		// DATE-ordered, and same-second commits make a -2 slice nondeterministic.
+		const log = await $.cwd(repo).nothrow()`git log --format=%s`.quiet();
+		const subjects = log
+			.text()
+			.split("\n")
+			.filter((s) => s.trim().length > 0 && s.trim() !== "init");
+		expect(subjects).toHaveLength(2);
+		for (const subject of subjects) {
+			expect(subject).toContain("run=wf_marked");
+		}
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("node_modules from the main tree is symlinked into the worktree and stays settle-invisible (#3)", async () => {
+		const repo = await makeRepo();
+		// A real (untracked, conventionally-ignored-but-here-unignored) node_modules.
+		await mkdir(join(repo, "node_modules", "dep"), { recursive: true });
+		await writeFile(
+			join(repo, "node_modules", "dep", "index.js"),
+			"module.exports = 1;\n",
+		);
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_mods",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		// The worktree's node_modules is a SYMLINK to the main tree's.
+		const link = await lstat(join(handle.dir, "node_modules"));
+		expect(link.isSymbolicLink()).toBe(true);
+		expect(
+			await readFile(
+				join(handle.dir, "node_modules", "dep", "index.js"),
+				"utf-8",
+			),
+		).toBe("module.exports = 1;\n");
+		// Manager-placed → settle-invisible: the worktree reads UNCHANGED, so the
+		// link is never committed/merged (here node_modules is not even gitignored —
+		// the exclusion, not .gitignore, is what keeps it out).
+		expect(await mgr.isUnchanged(handle.dir)).toBe(true);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("checkpoint-style staged DELETION in the worktree merges back (git rm shape)", async () => {
+		// #15.2 analogue on the worktree path: a deletion staged via `git rm` (file
+		// gone from disk, deletion in the index) must survive commitWorktreeEdits'
+		// pathspec staging and land in the main tree as a deletion.
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_del",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		await $.cwd(handle.dir).nothrow()`git rm -q README.md`.quiet();
+		expect(await mgr.isUnchanged(handle.dir)).toBe(false);
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		// The deletion landed: README.md is gone from the main tree and untracked.
+		await expect(stat(join(repo, "README.md"))).rejects.toThrow();
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("agent-COMMITTED work (clean porcelain) is landed work: isUnchanged false, merge carries it, ledger covers it", async () => {
+		// The declared blind spot, closed: an agent that `git commit`s inside its
+		// worktree leaves porcelain clean — the settle must still treat it as real
+		// work (commits ahead of the mint base), the merge must carry the commits,
+		// and the merged paths (HEAD^1..HEAD) must cover files changed ONLY via
+		// agent commits.
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_committed",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		const wt = $.cwd(handle.dir).nothrow();
+		await writeFile(join(handle.dir, "feature.ts"), "export const f = 1;\n");
+		await wt`git add feature.ts`.quiet();
+		await wt`git -c user.name=agent -c user.email=a@a commit -q -m "agent commit run=wf_committed"`.quiet();
+		// Porcelain is CLEAN — the work lives in a commit.
+		const st = await wt`git status --porcelain`.quiet();
+		expect(st.text().trim()).toBe("");
+		// baseOf + commits-ahead: the exact probe the engine's verify arm runs.
+		const base = mgr.baseOf(handle.dir) as string;
+		expect(typeof base).toBe("string");
+		const ahead = await wt`git rev-list --count ${base}..HEAD`.quiet();
+		expect(Number.parseInt(ahead.text().trim(), 10)).toBeGreaterThan(0);
+		// The settle treats it as changed and the merge lands the commit.
+		expect(await mgr.isUnchanged(handle.dir)).toBe(false);
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		const merged = res as { merged: true; sha?: string; paths?: string[] };
+		expect(merged.paths).toEqual(["feature.ts"]);
+		expect(await readFile(join(repo, "feature.ts"), "utf-8")).toBe(
+			"export const f = 1;\n",
+		);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+
+	test("MIXED committed + dirty work: both land, the ledger paths cover both", async () => {
+		const repo = await makeRepo();
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		const handle = (await mgr.create({
+			runId: "wf_mixed",
+			label: "worker",
+		})) as { dir: string; branch: string };
+		const wt = $.cwd(handle.dir).nothrow();
+		// One file committed by the agent…
+		await writeFile(join(handle.dir, "committed.ts"), "export const c = 1;\n");
+		await wt`git add committed.ts`.quiet();
+		await wt`git -c user.name=agent -c user.email=a@a commit -q -m "agent commit run=wf_mixed"`.quiet();
+		// …one left dirty for the settle to stage.
+		await writeFile(join(handle.dir, "dirty.ts"), "export const d = 2;\n");
+		expect(await mgr.isUnchanged(handle.dir)).toBe(false);
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		const merged = res as { merged: true; sha?: string; paths?: string[] };
+		expect([...(merged.paths ?? [])].sort()).toEqual([
+			"committed.ts",
+			"dirty.ts",
+		]);
+		expect(await readFile(join(repo, "committed.ts"), "utf-8")).toBe(
+			"export const c = 1;\n",
+		);
+		expect(await readFile(join(repo, "dirty.ts"), "utf-8")).toBe(
+			"export const d = 2;\n",
+		);
+		await mgr.cleanup(handle.dir, handle.branch);
+	});
+});
+
+/**
+ * Task 2 — loud-loss for agent edits to the copied spec. The copy is the run's
+ * INPUT and stays settle-invisible (merging it would stomp the operator's
+ * untracked file); these tests pin that an edit is REPORTED (via the registerSpec
+ * onEdit sink) and that the edited bytes are preserved/named per settle path.
+ */
+describe("createWorktreeManager — spec-edit loud loss (real git)", () => {
+	const tmps: string[] = [];
+
+	afterEach(async () => {
+		for (const dir of tmps.splice(0)) {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	async function makeRepo(): Promise<string> {
+		const root = await mkdtemp(join(tmpdir(), "wf-wt-spec-"));
+		tmps.push(root);
+		const dir = join(root, "repo");
+		await mkdir(dir, { recursive: true });
+		const git = $.cwd(dir).nothrow();
+		await git`git init -q -b main`.quiet();
+		await git`git config user.email t@t.local`.quiet();
+		await git`git config user.name tester`.quiet();
+		await writeFile(join(dir, "README.md"), "# tracked\n");
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m init`.quiet();
+		return dir;
+	}
+
+	/** Mint a worktree with a registered untracked spec + a captured onEdit sink. */
+	async function mintWithSpec(runId: string) {
+		const repo = await makeRepo();
+		await writeFile(join(repo, "notes.md"), "# operator spec\n");
+		const notes: string[] = [];
+		const mgr = createWorktreeManager({ shell: $, directory: repo });
+		mgr.registerSpec(runId, "notes.md", (m) => notes.push(m));
+		const handle = (await mgr.create({ runId, label: "worker" })) as {
+			dir: string;
+			branch: string;
+		};
+		return { repo, mgr, handle, notes };
+	}
+
+	test("UNCHANGED spec → no note, no preserved file (clean settle)", async () => {
+		const { mgr, handle, notes } = await mintWithSpec("wf_spec_ok");
+		await mgr.cleanup(handle.dir, handle.branch);
+		expect(notes).toEqual([]);
+		await expect(stat(`${handle.dir}.spec-edited`)).rejects.toThrow();
+	});
+
+	test("EDITED spec on the clean-settle path → loud note naming the preserved copy; operator file untouched", async () => {
+		const { repo, mgr, handle, notes } = await mintWithSpec("wf_spec_edit");
+		await writeFile(join(handle.dir, "notes.md"), "# AGENT EDIT\n");
+		// Only the (excluded) spec changed → unchanged → the clean-settle path runs
+		// cleanup, which is where the bytes would silently die.
+		expect(await mgr.isUnchanged(handle.dir)).toBe(true);
+		await mgr.cleanup(handle.dir, handle.branch);
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain("NEVER merged");
+		const aside = `${handle.dir}.spec-edited`;
+		expect(notes[0]).toContain(aside);
+		// The edited bytes survive aside; the operator's file is untouched.
+		expect(await readFile(aside, "utf-8")).toBe("# AGENT EDIT\n");
+		expect(await readFile(join(repo, "notes.md"), "utf-8")).toBe(
+			"# operator spec\n",
+		);
+	});
+
+	test("EDITED spec + real agent work → the merge is UNAFFECTED, the spec edit is noted, the spec never lands", async () => {
+		const { repo, mgr, handle, notes } = await mintWithSpec("wf_spec_work");
+		await writeFile(join(handle.dir, "notes.md"), "# AGENT EDIT\n");
+		await writeFile(join(handle.dir, "feature.ts"), "export const x = 1;\n");
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("merged" in res && res.merged).toBe(true);
+		// The agent's real work landed; the spec did not (still untracked, operator's
+		// content), and the loud note fired at cleanup with the preserved-aside path.
+		expect((res as { paths?: string[] }).paths).toEqual(["feature.ts"]);
+		await mgr.cleanup(handle.dir, handle.branch);
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain(`${handle.dir}.spec-edited`);
+		expect(await readFile(join(repo, "notes.md"), "utf-8")).toBe(
+			"# operator spec\n",
+		);
+		const tracked = await $.cwd(
+			repo,
+		).nothrow()`git ls-files --error-unmatch -- notes.md`.quiet();
+		expect(tracked.exitCode).not.toBe(0);
+	});
+
+	test("AGENT-DELETED spec → reported as deleted, nothing preserved, operator file untouched", async () => {
+		const { repo, mgr, handle, notes } = await mintWithSpec("wf_spec_del");
+		await rm(join(handle.dir, "notes.md"));
+		await mgr.cleanup(handle.dir, handle.branch);
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain("deleted the copied spec");
+		expect(notes[0]).toContain("nothing to preserve");
+		expect(await readFile(join(repo, "notes.md"), "utf-8")).toBe(
+			"# operator spec\n",
+		);
+	});
+
+	test("CONFLICT path (worktree preserved) → the note names the spec copy INSIDE the live worktree", async () => {
+		const { repo, mgr, handle, notes } = await mintWithSpec("wf_spec_conf");
+		await writeFile(join(handle.dir, "notes.md"), "# AGENT EDIT\n");
+		// Force a real conflict so the worktree is preserved (no cleanup).
+		await writeFile(join(handle.dir, "README.md"), "# worktree version\n");
+		await writeFile(join(repo, "README.md"), "# main version\n");
+		const git = $.cwd(repo).nothrow();
+		await git`git add README.md`.quiet();
+		await git`git commit -q -m "main edit"`.quiet();
+		const res = await mgr.mergeBack(handle.dir, handle.branch);
+		expect("conflict" in res).toBe(true);
+		expect(notes).toHaveLength(1);
+		// Worktree alive → the bytes survive in place; the note names that location.
+		expect(notes[0]).toContain("preserved worktree");
+		expect(notes[0]).toContain(join(handle.dir, "notes.md"));
+		expect(await readFile(join(handle.dir, "notes.md"), "utf-8")).toBe(
+			"# AGENT EDIT\n",
+		);
+		await mgr.cleanup(handle.dir, handle.branch);
 	});
 });

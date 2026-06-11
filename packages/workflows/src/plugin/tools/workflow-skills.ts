@@ -17,6 +17,7 @@
 import type { FsFacade } from "@drawers/core";
 import { tool } from "@opencode-ai/plugin";
 import { loadSkillCatalog } from "../skill-catalog";
+import { oneLine } from "../text";
 
 export interface WorkflowSkillsToolDeps {
 	/** Project directory — the project `.opencode/skill` root resolution base. */
@@ -27,12 +28,6 @@ export interface WorkflowSkillsToolDeps {
 
 /** Per-skill description cap: keep a many-skill catalog scannable on one line each. */
 const DESCRIPTION_CAP = 200;
-
-/** Truncate to `max` chars with a trailing ellipsis; collapses inner whitespace to spaces. */
-function oneLine(text: string, max: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
-}
 
 /**
  * The model-facing description: what the tool is and exactly when to reach for it.

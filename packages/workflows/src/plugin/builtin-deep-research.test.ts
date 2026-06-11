@@ -51,7 +51,9 @@ function happyAgent(verdictSupported: (claimText: string) => boolean) {
 		if (label === "plan") return { angles: ["angle-A", "angle-B"] };
 		if (label.startsWith("search:")) {
 			return {
-				claims: [{ text: "claim from " + label, source: "https://src/" + label }],
+				claims: [
+					{ text: "claim from " + label, source: "https://src/" + label },
+				],
 			};
 		}
 		if (label === "verify") {

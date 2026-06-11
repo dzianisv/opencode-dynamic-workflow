@@ -271,6 +271,14 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 	// with a NON-EMPTY worktree diff — the exact shape that falsely failed a correctly-
 	// working isolated agent before verifyResult re-rooted its git-diff branch.
 	let worktreeDiffText = "";
+	// #1 fix: the verify arm now probes `status --porcelain` IN the worktree (untracked-
+	// aware). When set, a status bound to a non-main cwd returns THIS text instead of
+	// the shared dirty set — letting a test model "this agent's worktree wrote nothing"
+	// while a sibling dirties the main tree. Undefined → fall through to the shared set.
+	let worktreeStatusText: string | undefined;
+	// Committed-work probe: the count `git rev-list --count <base>..HEAD` reports —
+	// models an agent that committed inside its worktree (porcelain clean, N ahead).
+	let worktreeAhead = 0;
 
 	const recon = (strings: TemplateStringsArray, exprs: unknown[]): string => {
 		let out = strings[0] ?? "";
@@ -309,11 +317,19 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 			return isRepo ? result("true") : result("", 128);
 		}
 		if (cmd.includes("status --porcelain")) {
+			if (lastCwd !== "/proj" && worktreeStatusText !== undefined) {
+				return result(worktreeStatusText);
+			}
 			const lines = [...dirty].map((p) => ` M ${p}`).join("\n");
 			return result(lines);
 		}
 		if (cmd === "git rev-parse HEAD") {
 			return result(head);
+		}
+		// #9: the startup marker sweep enumerates refs/wf-checkpoints/* — answer from
+		// the markers map so a test can seed a stale marker and assert its deletion.
+		if (cmd.includes("for-each-ref") && cmd.includes("refs/wf-checkpoints/")) {
+			return result([...markers.keys()].join("\n"));
 		}
 		// Epic 4.1: marker ref read — `git rev-parse refs/wf-checkpoints/<runId>`.
 		if (cmd.startsWith("git rev-parse refs/wf-checkpoints/")) {
@@ -337,20 +353,23 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 			}
 			return result("");
 		}
-		// Epic H.1.3: `isUnchanged` counts commits ahead of the worktree base. This
-		// fake does not model per-worktree commits, so it reports 0 ahead — leaving
-		// the porcelain status (the shared dirty set) as the sole change signal.
+		// Epic H.1.3: `isUnchanged` (and the verify arm's committed-work probe)
+		// count commits ahead of the worktree base. Default 0 (no per-worktree
+		// commits modeled) — `setWorktreeAhead` lets a test model an agent that
+		// COMMITTED inside its worktree (clean porcelain, commits ahead).
 		if (cmd.includes("rev-list --count")) {
-			return result("0");
+			return result(String(worktreeAhead));
 		}
 		// Epic H.1.3: the unmerged-files probe MUST be matched before the generic
 		// `git diff` (both start with "git diff"). It reports the injected conflict set.
 		if (cmd.includes("--diff-filter=U")) {
 			return result(conflictFiles.join("\n"));
 		}
-		if (cmd.startsWith("git merge --no-ff")) {
-			// A real conflict exits non-zero (the manager then probes diff-filter=U); a
-			// clean merge exits 0. `git merge --abort` falls through to the catch-all (0).
+		if (cmd.includes("merge --no-ff")) {
+			// The real command now leads with the `-c user.*` identity fallback (a merge
+			// CREATES a commit), so match by inclusion, not prefix. A real conflict
+			// exits non-zero (the manager then probes diff-filter=U); a clean merge
+			// exits 0. `git merge --abort` falls through to the catch-all (0).
 			return conflictFiles.length > 0 ? result("", 1) : result("");
 		}
 		if (cmd.startsWith("git diff")) {
@@ -429,12 +448,22 @@ function makeGitRepo(opts: { isRepo?: boolean } = {}) {
 		setWorktreeDiff: (text: string) => {
 			worktreeDiffText = text;
 		},
+		setWorktreeStatus: (text: string | undefined) => {
+			worktreeStatusText = text;
+		},
+		setWorktreeAhead: (count: number) => {
+			worktreeAhead = count;
+		},
 		setCheckExit: (code: number) => {
 			checkExit = code;
 		},
 		setMergeConflict: (files: string[]) => {
 			conflictFiles = files;
 		},
+		setMarker: (ref: string, sha: string) => {
+			markers.set(ref, sha);
+		},
+		markers,
 	};
 }
 
@@ -716,10 +745,9 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 		expect(rec?.status).toBe("completed");
 		expect(rec?.returnValue).toBe("DONE");
 		// The scratch branch was merged back into the main tree (--no-ff, an explicit
-		// merge unit), and the worktree was then reclaimed.
-		expect(repo.commands.some((c) => c.startsWith("git merge --no-ff"))).toBe(
-			true,
-		);
+		// merge unit, with the identity fallback ahead of the subcommand), and the
+		// worktree was then reclaimed.
+		expect(repo.commands.some((c) => c.includes("merge --no-ff"))).toBe(true);
 		expect(
 			repo.commands.some((c) => c.startsWith("git worktree remove --force")),
 		).toBe(true);
@@ -878,13 +906,14 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 			"DONE",
 		);
 		const repo = makeGitRepo();
-		// The agent's OWN worktree diff is EMPTY (it changed nothing), while the MAIN
+		// The agent's OWN worktree delta is EMPTY (it changed nothing), while the MAIN
 		// tree is dirty — modeling a concurrent sibling's mid-flight mutation. Before
 		// the fix the {} mode diffed the whole tree (non-empty → false pass); now the
-		// verdict comes from THIS agent's worktree (empty → a TRUE verify_failed).
+		// verdict comes from THIS agent's worktree porcelain (empty → a TRUE
+		// verify_failed — and untracked-aware, unlike the old `git diff` probe).
 		repo.setDirty("src/SIBLING.ts"); // sibling's edit in the shared/main tree
 		repo.setDiff("diff --git a/src/SIBLING.ts b/src/SIBLING.ts\n+sibling"); // main: non-empty
-		repo.setWorktreeDiff(""); // THIS agent's worktree: empty (it wrote nothing)
+		repo.setWorktreeStatus(""); // THIS agent's worktree: clean (it wrote nothing)
 		const engine = createWorkflowEngine({
 			client,
 			directory: "/proj",
@@ -914,7 +943,7 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 		await engine.dispose();
 	});
 
-	test("the {} worktree git diff is bound to the worktree cwd and quieted", async () => {
+	test("the {} worktree porcelain probe is bound to the worktree cwd and quieted", async () => {
 		const { facade } = makeFs();
 		const { clock: mclock, bump } = bumpClock(NOW);
 		const { client, sessions } = makeClockedCompletingClient(
@@ -923,7 +952,7 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 		);
 		const repo = makeGitRepo();
 		repo.setDirty("src/A.ts");
-		repo.setWorktreeDiff("diff --git a/src/A.ts b/src/A.ts\n+work");
+		repo.setWorktreeStatus("?? src/NEW.ts"); // an UNTRACKED new module counts as work
 		const engine = createWorkflowEngine({
 			client,
 			directory: "/proj",
@@ -943,15 +972,16 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 		await driveIdle(engine, sessions[0] as string, bump);
 		await engine.statusOf(handle.runId)?.settled;
 
-		// The verdict's `git diff` ran BOUND to the minted worktree dir, not /proj,
-		// and was quieted (TTY safety) — pinning the per-agent arm against a refactor
-		// that re-introduces the whole-tree diff for an isolated agent.
-		const verifyDiffBinding = repo.cwdByCommand.find(
-			(c) =>
-				c.cmd === "git diff" && c.cwd === "/.wf-worktrees/wf_p3_bind/iso-0",
+		// The verdict's porcelain probe ran BOUND to the minted worktree dir, not
+		// /proj, and was quieted (TTY safety) — pinning the per-agent arm against a
+		// refactor that re-introduces the whole-tree probe for an isolated agent. The
+		// probe is `status --porcelain` (untracked-aware, #1 fix), not `git diff`.
+		const probeCmd = "git -c core.quotePath=false status --porcelain";
+		const verifyBinding = repo.cwdByCommand.find(
+			(c) => c.cmd === probeCmd && c.cwd === "/.wf-worktrees/wf_p3_bind/iso-0",
 		);
-		expect(verifyDiffBinding).toBeDefined();
-		expect(repo.quietedCommands).toContain("git diff");
+		expect(verifyBinding).toBeDefined();
+		expect(repo.quietedCommands).toContain(probeCmd);
 		await engine.dispose();
 	});
 
@@ -988,6 +1018,50 @@ describe("createWorkflowEngine — worktree merge-back on settle (Task H.1.3)", 
 		expect(
 			(rec?.diagnostics ?? []).some((d) => d.reason === "verify_failed"),
 		).toBe(false);
+		await engine.dispose();
+	});
+
+	test("verifyDiff:true PASSES for an agent that COMMITTED in its worktree (clean porcelain, commits ahead)", async () => {
+		// The closed blind spot: an agent that `git commit`s its own work leaves the
+		// worktree porcelain CLEAN — the old porcelain-only verdict red-gated real
+		// work. The verdict is now porcelain-non-empty OR commits-ahead-of-base.
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setWorktreeStatus(""); // porcelain clean (work lives in a commit)
+		repo.setWorktreeAhead(2); // …two agent commits ahead of the mint base
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_committed"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: VERIFY_DIFF_IMPLIED,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		// Verify PASSED (committed work counts as landed) — not downgraded.
+		expect(rec?.returnValue).toBe("DONE");
+		expect(
+			(rec?.diagnostics ?? []).some((d) => d.reason === "verify_failed"),
+		).toBe(false);
+		// And the settle treated the worktree as CHANGED (commits ahead) → merged.
+		expect(repo.commands.some((c) => c.includes("merge --no-ff"))).toBe(true);
 		await engine.dispose();
 	});
 });
@@ -4844,6 +4918,295 @@ describe("createWorkflowEngine — isWorkerSession (Epic 0.1)", () => {
 		// AFTER settle: the worker window has closed.
 		expect(engine.isWorkerSession(child)).toBe(false);
 
+		await engine.dispose();
+	});
+});
+
+// ---- #4/#8: merge-back ledger + persisted checkpoints --------------------
+
+describe("createWorkflowEngine — merge-back lands on the checkpoint ledger (#4) and persists (#8)", () => {
+	test("a merged isolated agent records a CheckpointRecord + agent:checkpoint feed line, and the persisted record carries it", async () => {
+		const { facade, files } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		repo.setDirty("src/A.ts"); // the worktree carries real work → merge-back fires
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_ledger"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: ISO_AGENT,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		await driveIdle(engine, sessions[0] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const rec = engine.statusOf(handle.runId)?.record;
+		expect(rec?.status).toBe("completed");
+		// #4: before the fix, the merged agent's work was INVISIBLE to the ledger —
+		// the main tree is clean post-merge, so the per-unit checkpointer committed
+		// nothing and `record.checkpoints` stayed empty despite a real merge commit.
+		// The per-run worktree wrapper now records the merge (sha + label parsed from
+		// the scratch branch `wf/<runId>/<label>-<index>`).
+		const cps = rec?.checkpoints ?? [];
+		expect(cps.length).toBeGreaterThanOrEqual(1);
+		const mergeCp = cps.find((c) => c.label === "iso-0");
+		expect(mergeCp).toBeDefined();
+		expect(typeof mergeCp?.sha).toBe("string");
+		// The feed carries the matching agent:checkpoint line (viewer parity).
+		const feedRaw = files.get(`${BASE}/workflow-feed/${handle.runId}.jsonl`);
+		expect(feedRaw).toBeDefined();
+		const feedCp = (feedRaw as string)
+			.split("\n")
+			.filter((l) => l.length > 0)
+			.map((l) => JSON.parse(l) as { type: string; label?: string })
+			.find((e) => e.type === "agent:checkpoint" && e.label === "iso-0");
+		expect(feedCp).toBeDefined();
+		// #8: the PERSISTED record (not just the in-memory handle) carries the
+		// ledger. Before the fix, settleRecord persisted BEFORE drainCheckpoints
+		// appended — a one-agent run routinely persisted an empty ledger.
+		const persistedRaw = files.get(
+			`${BASE}/workflow-runs/${handle.runId}.json`,
+		);
+		expect(persistedRaw).toBeDefined();
+		const persisted = JSON.parse(persistedRaw as string) as {
+			checkpoints?: Array<{ label: string }>;
+		};
+		expect((persisted.checkpoints ?? []).some((c) => c.label === "iso-0")).toBe(
+			true,
+		);
+		await engine.dispose();
+	});
+});
+
+// ---- #9: stale refs/wf-checkpoints/* markers swept at engine ready ---------
+
+describe("createWorkflowEngine — stale checkpoint-marker sweep on ready (#9)", () => {
+	test("ready() deletes refs/wf-checkpoints/* leftovers from a crashed prior run", async () => {
+		const { facade } = makeFs();
+		const repo = makeGitRepo();
+		// A prior process crashed mid-run: its marker still GC-pins its commits.
+		repo.setMarker("refs/wf-checkpoints/wf_dead_run", "deadsha");
+		const engine = createWorkflowEngine({
+			client: makeCompletingClient().client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: { now: () => NOW },
+			logger: noopLogger,
+			ids: fixedIds("wf_marker_sweep"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		expect(repo.commands).toContain(
+			"git update-ref -d refs/wf-checkpoints/wf_dead_run",
+		);
+		expect(repo.markers.size).toBe(0);
+		await engine.dispose();
+	});
+
+	test("a non-repo engine's ready() issues no marker deletes (dead latch)", async () => {
+		const { facade } = makeFs();
+		const repo = makeGitRepo({ isRepo: false });
+		const engine = createWorkflowEngine({
+			client: makeCompletingClient().client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: { now: () => NOW },
+			logger: noopLogger,
+			ids: fixedIds("wf_marker_dead"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		expect(repo.commands.some((c) => c.startsWith("git update-ref -d"))).toBe(
+			false,
+		);
+		await engine.dispose();
+	});
+});
+
+// ---- #6: spec_path containment at the engine boundary ----------------------
+
+describe("createWorkflowEngine — spec_path containment (#6)", () => {
+	test("a spec_path escaping the project directory is ignored: no classify, no registerSpec, a warn", async () => {
+		const { facade } = makeFs({ "/outside.md": "# escape" });
+		const { shell, commands } = makeShell(() => ({
+			stdout: "true",
+			exitCode: 0,
+		}));
+		const warns: string[] = [];
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: { ...noopLogger, warn: (msg: string) => warns.push(msg) },
+			ids: fixedIds("wf_spec_esc"),
+			shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: INSTANT,
+			specPath: "../outside.md",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		const rec = engine.statusOf(handle.runId)?.record;
+		// No diagnostic fabricated, no git classification ran for the escapee.
+		expect(rec?.sourceDiagnostics).toBeUndefined();
+		expect(commands.some((c) => c.includes("ls-files"))).toBe(false);
+		expect(commands.some((c) => c.includes("check-ignore"))).toBe(false);
+		expect(warns.some((w) => w.includes("OUTSIDE the project directory"))).toBe(
+			true,
+		);
+		await engine.dispose();
+	});
+
+	test("an ABSOLUTE spec_path under the project directory normalizes to repo-relative and classifies", async () => {
+		// The JSDoc contract promises "repo-relative or absolute" — the old
+		// `join(directory, spec)` MANGLED an absolute path by re-rooting it.
+		const { facade } = makeFs({ "/proj/docs/plans/x.md": "# plan" });
+		const { shell } = makeShell((cmd) => {
+			if (cmd.includes("is-inside-work-tree")) {
+				return { stdout: "true", exitCode: 0 };
+			}
+			if (cmd.includes("ls-files")) {
+				return { exitCode: 1 };
+			}
+			if (cmd.includes("check-ignore")) {
+				return {
+					stdout: ".gitignore:47:docs/plans/\tdocs/plans/x.md",
+					exitCode: 0,
+				};
+			}
+			return { exitCode: 0 };
+		});
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_spec_abs"),
+			shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: INSTANT,
+			specPath: "/proj/docs/plans/x.md",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		const diags = engine.statusOf(handle.runId)?.record.sourceDiagnostics;
+		expect(diags).toHaveLength(1);
+		// Normalized to REPO-RELATIVE before classification.
+		expect(diags?.[0]?.path).toBe("docs/plans/x.md");
+		expect(diags?.[0]?.classification).toBe("ignored");
+		await engine.dispose();
+	});
+
+	test("a spec_path that is a DIRECTORY surfaces an honest 'directory' diagnostic (#14)", async () => {
+		// The in-memory facade has no stat, so use one widened with a stat shim: the
+		// engine prefers a stat-shaped probe and classifies a directory honestly
+		// instead of "missing" (the readFile probe rejects on EISDIR).
+		const { facade } = makeFs();
+		const statFacade = Object.assign(Object.create(facade) as typeof facade, {
+			stat: async (path: string) => {
+				if (path === "/proj/docs") {
+					return { isDirectory: () => true };
+				}
+				throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+			},
+		});
+		const { shell, commands } = makeShell(() => ({
+			stdout: "true",
+			exitCode: 0,
+		}));
+		const engine = createWorkflowEngine({
+			client: makeClient(),
+			directory: "/proj",
+			dataDir: BASE,
+			fs: statFacade,
+			clock,
+			logger: noopLogger,
+			ids: fixedIds("wf_spec_dir"),
+			shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: INSTANT,
+			specPath: "docs",
+			parentSessionID: "ses_parent",
+		});
+		await engine.statusOf(handle.runId)?.settled;
+		const diags = engine.statusOf(handle.runId)?.record.sourceDiagnostics;
+		expect(diags).toEqual([{ path: "docs", classification: "directory" }]);
+		// A directory is never classified against git nor registered for a copy.
+		expect(commands.some((c) => c.includes("ls-files"))).toBe(false);
+		await engine.dispose();
+	});
+});
+
+// ---- #12: parallel unisolated agents — shared-checkpoint honesty -----------
+
+const PARALLEL_TWO = `${META}const r = await parallel([\n() => agent("edit A", { label: "a" }),\n() => agent("edit B", { label: "b" }),\n]);\nreturn r;\n`;
+
+describe("createWorkflowEngine — shared checkpoint marking under parallel() (#12)", () => {
+	test("a checkpoint committed while a sibling is still LIVE is marked shared; the last one is not", async () => {
+		const { facade } = makeFs();
+		const { clock: mclock, bump } = bumpClock(NOW);
+		const { client, sessions } = makeClockedCompletingClient(
+			mclock.now,
+			"DONE",
+		);
+		const repo = makeGitRepo();
+		const engine = createWorkflowEngine({
+			client,
+			directory: "/proj",
+			dataDir: BASE,
+			fs: facade,
+			clock: mclock,
+			logger: noopLogger,
+			ids: fixedIds("wf_shared"),
+			shell: repo.shell,
+		});
+		await engine.ready();
+		const handle = await engine.startRun({
+			source: PARALLEL_TWO,
+			parentSessionID: "ses_parent",
+		});
+		await flush();
+		// Both parallel agents are launched and live. Dirty the tree only NOW — a
+		// pre-startRun edit would be snapshotted as operator-dirty and refused.
+		repo.setDirty("src/A.ts");
+		expect(sessions.length).toBe(2);
+		// Settle agent A while B is STILL live: A's checkpoint sweeps the shared
+		// tree with B mid-flight → marked shared.
+		await driveIdle(engine, sessions[0] as string, bump);
+		// Re-dirty so B's end produces a second, SOLO checkpoint.
+		repo.setDirty("src/B.ts");
+		await driveIdle(engine, sessions[1] as string, bump);
+		await engine.statusOf(handle.runId)?.settled;
+
+		const cps = engine.statusOf(handle.runId)?.record.checkpoints ?? [];
+		expect(cps).toHaveLength(2);
+		expect(cps[0]?.shared).toBe(true);
+		expect(cps[1]?.shared).toBeUndefined();
 		await engine.dispose();
 	});
 });

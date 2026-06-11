@@ -1700,6 +1700,69 @@ describe("createWorkflowStatusTool — no-commit contradiction (Epic 2.2/Issue 4
 		const out = await run(t, { run_id: "wf_nc000004" }, ctx());
 		expect(out).not.toContain("result claims no commit");
 	});
+
+	test("'no commitments' does NOT flag — the match is word-bounded (#14)", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000005",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: {
+						notes: ["There are no commitments beyond the SLA in scope."],
+					},
+					checkpoints: [{ sha: "s1", label: "a", paths: ["a.ts"] }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000005" }, ctx());
+		expect(out).not.toContain("result claims no commit");
+	});
+
+	test("'no commits' (plural) still flags", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_nc000006",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { notes: ["No commits were made."] },
+					checkpoints: [{ sha: "s1", label: "a", paths: ["a.ts"] }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_nc000006" }, ctx());
+		expect(out).toContain("result claims no commit");
+	});
+});
+
+describe("createWorkflowStatusTool — shared-checkpoint marking (#12)", () => {
+	test("a shared checkpoint renders a '(shared)' tag in the ledger", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_sh000001",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+					checkpoints: [
+						{ sha: "abcdef1234", label: "a", paths: ["a.ts"], shared: true },
+						{ sha: "1234567890", label: "b", paths: ["b.ts"] },
+					],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_sh000001", full: true }, ctx());
+		expect(out).toContain("  abcdef1 a (1 files) (shared)");
+		expect(out).toContain("  1234567 b (1 files)");
+		expect(out).not.toContain("  1234567 b (1 files) (shared)");
+	});
 });
 
 describe("createWorkflowStatusTool — source diagnostics (Epic 2.4/Issue 6)", () => {
@@ -1745,5 +1808,24 @@ describe("createWorkflowStatusTool — source diagnostics (Epic 2.4/Issue 6)", (
 		const t = createWorkflowStatusTool(engine);
 		const out = await run(t, { run_id: "wf_sd000002" }, ctx());
 		expect(out).not.toContain("source diagnostics:");
+	});
+
+	test("a 'directory' verdict renders the honest spec-must-be-a-file warning (#14)", async () => {
+		const engine = fakeEngine([
+			{
+				record: makeRecord({
+					id: "wf_sd000003",
+					status: "completed",
+					completedAt: 2_000,
+					returnValue: { ok: true },
+					sourceDiagnostics: [{ path: "docs", classification: "directory" }],
+				}),
+				progress: [],
+			},
+		]);
+		const t = createWorkflowStatusTool(engine);
+		const out = await run(t, { run_id: "wf_sd000003" }, ctx());
+		expect(out).toContain("⚠ docs is a directory, not a file");
+		expect(out).not.toContain("docs is directory");
 	});
 });

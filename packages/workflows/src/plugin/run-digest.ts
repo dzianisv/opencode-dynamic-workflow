@@ -25,6 +25,7 @@ import {
 	totalTokens,
 } from "../tui/format";
 import type { AgentSummary, RunRecord } from "./engine";
+import { oneLine } from "./text";
 
 /** Group label for agents emitted without a phase (matches the reducer/status tool). */
 const NO_PHASE = "(no phase)";
@@ -35,12 +36,6 @@ const NO_PHASE = "(no phase)";
  * one synthetic part — the full conclusion stays in the feed / `workflow_status`.
  */
 const DIGEST_CONCLUSION_CAP = 400;
-
-/** Truncate to `max` chars with a trailing ellipsis; collapses inner newlines to spaces. */
-function oneLine(text: string, max: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
-}
 
 /** The compact `X tok · N tools · Ds` tail for an agent, or a `cached` marker. */
 function statsTail(a: AgentSummary): string {
@@ -114,12 +109,20 @@ function headerLine(record: RunRecord): string {
 	);
 	const tokenSeg = tokenTotal > 0 ? ` · ${formatTokens(tokenTotal)} tok` : "";
 
+	// Defensive against a stale on-disk record (the persistence layer validates
+	// only id/parentSessionID/status — same posture `totalTokens` already takes):
+	// a missing description or non-finite timestamp renders honestly, never
+	// `'undefined'` or `in NaN`.
+	const description =
+		typeof record.description === "string" ? record.description : "(unknown)";
 	const duration =
-		record.completedAt !== undefined
+		typeof record.completedAt === "number" &&
+		Number.isFinite(record.completedAt) &&
+		Number.isFinite(record.createdAt)
 			? ` in ${formatDuration(record.completedAt - record.createdAt)}`
 			: "";
 
-	return `Workflow ${record.id} '${record.description}' ${record.status}${duration} — ${agentSeg}${tokenSeg}`;
+	return `Workflow ${record.id} '${description}' ${record.status}${duration} — ${agentSeg}${tokenSeg}`;
 }
 
 /**

@@ -5,9 +5,9 @@ import {
 	ROUTE_WORKFLOWS,
 	SENTINEL_SUFFIX,
 	SIDEBAR_SLOT_ORDER,
-	slugifyWorkflowName,
 	SUBDIR_CONTROL,
 	SUBDIR_FEED,
+	slugifyWorkflowName,
 	writeCancelSentinel,
 } from "./paths";
 

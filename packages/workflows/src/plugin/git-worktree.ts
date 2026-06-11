@@ -41,8 +41,15 @@
  * `BunShellOutput` carries `.exitCode` and a SYNCHRONOUS `.text()`.
  */
 
-import { copyFile, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import {
+	copyFile,
+	mkdir,
+	readFile,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 /** The host shell primitive — `PluginInput['$']`; NOT a named package export. */
@@ -74,7 +81,14 @@ export interface WorktreeHandle {
 
 /**
  * The outcome of {@link WorktreeManager.mergeBack}:
- * - `{ merged: true }` — clean fast-forward-disabled merge into the main tree.
+ * - `{ merged: true, sha?, paths? }` — clean fast-forward-disabled merge into the
+ *   main tree. `sha` is the merge commit (read back post-merge; absent when the
+ *   read-back failed or the manager is dead) and `paths` the files the merge
+ *   brought onto the branch (`git diff --name-only HEAD^1 HEAD`; absent on the
+ *   dead-latch degrade). The engine records these as a {@link CheckpointRecord}-
+ *   shaped ledger entry — without them a merged agent's work is INVISIBLE to the
+ *   checkpoint ledger (the main tree is clean post-merge, so the per-unit
+ *   checkpointer commits nothing).
  * - `{ conflict: true, branch, files, baseRef }` — a REAL merge conflict (unmerged files
  *   present): the locked Tier 1 shape (design decision #2). `branch` echoes the param;
  *   `baseRef` is the create-time base (the natural 3-way context for a Tier 2 resolver),
@@ -85,7 +99,7 @@ export interface WorktreeHandle {
  *   conflict (which would preserve a worktree for a conflict that never happened).
  */
 export type MergeResult =
-	| { merged: true }
+	| { merged: true; sha?: string; paths?: string[] }
 	| {
 			conflict: true;
 			branch: string;
@@ -124,10 +138,29 @@ export interface WorktreeManager {
 	 * `repoRelPath` is repo-relative (resolved against `directory`). NOT part of the
 	 * runtime {@link WorktreeManagerSeam} — an engine-only, out-of-band channel keyed
 	 * by runId so the runtime mint call (`create({runId,label})`) stays unchanged.
+	 *
+	 * `onEdit` (loud-loss contract): the copied spec is the run's INPUT and is
+	 * settle-invisible — an agent edit to it is NEVER merged (merging would stomp
+	 * the operator's never-committed file). When the settle detects such an edit it
+	 * invokes `onEdit(message)` with a human note naming what happened and where
+	 * (whether) the edited bytes survive, so the loss is LOUD, not silent. The
+	 * engine wires it to a feed `warn` line. Absent → logger-warn only.
 	 */
-	registerSpec(runId: string, repoRelPath: string): void;
+	registerSpec(
+		runId: string,
+		repoRelPath: string,
+		onEdit?: (message: string) => void,
+	): void;
 	/** Drop a run's registered spec (best-effort, at run settle). */
 	unregisterSpec(runId: string): void;
+	/**
+	 * The create-time base HEAD recorded for a minted worktree dir, or `undefined`
+	 * for an unknown dir / a base-capture miss. Engine-only (NOT on the runtime
+	 * {@link WorktreeManagerSeam}): the verifyDiff worktree arm reads it to count
+	 * commits ahead (`git rev-list --count <base>..HEAD`), so work an agent already
+	 * COMMITTED inside its worktree — porcelain clean — still counts as landed.
+	 */
+	baseOf(dir: string): string | undefined;
 }
 
 export interface CreateWorktreeManagerOptions {
@@ -240,11 +273,43 @@ export function createWorktreeManager(
 	// isUnchanged() count commits ahead WITHOUT threading the main ref through callers.
 	const baseByDir = new Map<string, string>();
 
+	// The mint key per dir, so commitWorktreeEdits/mergeBack can stamp the owning
+	// run's forensic `run=<runId>` marker into their commit messages (the same marker
+	// the checkpointer's discard() range guard matches — a scratch/merge commit
+	// without it would read as FOREIGN and block a legitimate rewind).
+	const keyByDir = new Map<string, WorktreeKey>();
+
+	// SETTLE-INVISIBLE paths per dir (Issue 6 second half): files the MANAGER itself
+	// placed into the worktree (the copied declared spec, the linked node_modules) and
+	// that must therefore never count as the AGENT's work. Without this, the copied
+	// spec makes `isUnchanged` always-false and `commitWorktreeEdits` commits-and-
+	// merges the operator's never-committed file into the main branch (bypassing
+	// refuse-don't-stomp) — and when the merge then refuses ("untracked working tree
+	// file would be overwritten"), the settle returns {failed} and a SUCCESSFUL
+	// agent's real work is dropped. Repo-relative paths. An agent that EDITS an
+	// excluded spec still never merges that edit (the rule stands) — but the loss is
+	// now LOUD, not silent: settleSpecEdit detects the divergence at settle and
+	// reports where (whether) the edited bytes survive (see specCopyByDir).
+	const excludeByDir = new Map<string, Set<string>>();
+
 	// Per-run UNTRACKED spec paths (Issue 6 structural half), keyed by runId. The
 	// engine registers a run's declared `spec_path` here ONLY when its classification
 	// verdict is untracked/ignored; doCreate copies it from the main tree into the
-	// fresh worktree (which, born from HEAD, lacks any non-tracked file). Repo-relative.
-	const specByRun = new Map<string, string>();
+	// fresh worktree (which, born from HEAD, lacks any non-tracked file).
+	// Repo-relative. `onEdit` is the loud-loss sink (see registerSpec).
+	const specByRun = new Map<
+		string,
+		{ path: string; onEdit?: (message: string) => void }
+	>();
+
+	// The exact content COPIED into each worktree's spec, keyed by dir. The settle
+	// path compares the copy against this to detect an AGENT EDIT to the spec — an
+	// edit that is deliberately never merged (it would stomp the operator's
+	// never-committed file), so it must be reported LOUDLY rather than vanish.
+	const specCopyByDir = new Map<
+		string,
+		{ path: string; content: string; onEdit?: (message: string) => void }
+	>();
 
 	// The managed worktree root: a SIBLING of the repo, outside the working tree (a
 	// checkout inside the tree is a nested status/ignore hazard; inside .git is illegal).
@@ -315,28 +380,76 @@ export function createWorktreeManager(
 				baseByDir.set(dir, base);
 			}
 		}
+		keyByDir.set(dir, key);
+		const excluded = new Set<string>();
+		excludeByDir.set(dir, excluded);
 		// Issue 6 structural half: the worktree was born from HEAD, so an UNTRACKED
 		// declared spec (ignored or plain-untracked) is absent from it. Copy ONLY that
 		// one registered path from the main tree into the worktree so the isolated
 		// agent can read its source of truth. Fenced — a copy failure (the file
-		// vanished, a permission error) NEVER fails the mint or the agent.
+		// vanished, a permission error) NEVER fails the mint or the agent. The copy
+		// destination is CONTAINED: a registered path whose resolution escapes the
+		// worktree (a `../..` smuggled past the engine's own containment) is refused,
+		// never written outside the checkout.
 		const spec = specByRun.get(key.runId);
 		if (spec !== undefined) {
 			try {
-				const dest = join(dir, spec);
+				const dest = resolve(dir, spec.path);
+				if (dest !== dir && !dest.startsWith(dir + sep)) {
+					throw new Error(`spec path escapes the worktree: ${spec.path}`);
+				}
 				await mkdir(dirname(dest), { recursive: true });
-				await copyFile(join(directory, spec), dest);
+				await copyFile(join(directory, spec.path), dest);
+				// The copied spec is MANAGER-placed, not agent work: exclude it from the
+				// settle path (isUnchanged / commitWorktreeEdits) so it never merges back.
+				excluded.add(spec.path);
+				// Record the copied CONTENT so the settle can detect an agent EDIT to
+				// the spec and report the loss LOUDLY (see settleSpecEdit). Fenced with
+				// the copy — a read failure skips detection, never the mint.
+				specCopyByDir.set(dir, {
+					path: spec.path,
+					content: await readFile(dest, "utf-8"),
+					...(spec.onEdit !== undefined ? { onEdit: spec.onEdit } : {}),
+				});
 			} catch (err) {
 				logger?.warn(
 					"failed to copy declared spec into worktree; the isolated agent may " +
 						"not see its source of truth (non-blocking)",
 					{
 						runId: key.runId,
-						spec,
+						spec: spec.path,
 						error: err instanceof Error ? err.message : String(err),
 					},
 				);
 			}
+		}
+		// Dep-less worktree fix: a fresh `worktree add … HEAD` checkout carries ONLY
+		// tracked files — no node_modules — so a `verifyDiff:{check:'bun test'}` fails
+		// environmentally before it can judge the agent's work. Best-effort: when the
+		// MAIN tree has a node_modules, symlink it into the worktree root (skip when
+		// the path already exists, e.g. tracked or already linked). NEVER fails the
+		// mint — a symlink failure only warns. The link is manager-placed → excluded
+		// from the settle path like the copied spec. Existence probes are SYNCHRONOUS
+		// (existsSync) so the common no-node_modules case adds ZERO event-loop turns
+		// to the mint (engine callers flush microtasks around it). Caveat (documented
+		// in the workflow tool manual): the worktree is HEAD + the agent's edits +
+		// this link; other untracked artifacts (.env, build output) are absent.
+		try {
+			const mainModules = join(directory, "node_modules");
+			const wtModules = join(dir, "node_modules");
+			if (existsSync(mainModules) && !existsSync(wtModules)) {
+				await symlink(mainModules, wtModules, "dir");
+				excluded.add("node_modules");
+			}
+		} catch (err) {
+			logger?.warn(
+				"failed to link node_modules into worktree; a verifyDiff {check} that " +
+					"needs dependencies may fail environmentally (non-blocking)",
+				{
+					runId: key.runId,
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
 		}
 		return { dir, branch };
 	}
@@ -370,26 +483,99 @@ export function createWorktreeManager(
 	 * merges cleanly to a no-op, which the caller's isUnchanged gate already routes to
 	 * cleanup — no work is committed, so none is lost). Runs FROM the worktree dir.
 	 */
+	/**
+	 * Whether a porcelain path is MANAGER-PLACED for this dir (the copied spec, the
+	 * node_modules link) and must stay invisible to the settle path. An untracked
+	 * directory's porcelain entry carries a trailing `/`, so compare normalized.
+	 */
+	function isExcluded(dir: string, path: string): boolean {
+		const excluded = excludeByDir.get(dir);
+		if (excluded === undefined || excluded.size === 0) {
+			return false;
+		}
+		const normalized = path.endsWith("/") ? path.slice(0, -1) : path;
+		return excluded.has(normalized);
+	}
+
+	/**
+	 * Whether a path must be passed to git via `--pathspec-from-file=-` (stdin)
+	 * instead of argv interpolation. Bun's shell LEXER corrupts non-ASCII template
+	 * interpolations (observed on Bun 1.3.10: `café.txt` reaches git as
+	 * `cafcafé.txt` — even through `{raw}`), so a non-ASCII pathspec on argv fails
+	 * `git add`, silently drops the path, and the later `worktree remove --force`
+	 * DELETES the file (the #7 work-loss). stdin bytes are not lexed → exact.
+	 */
+	const needsStdinPathspec = (path: string): boolean =>
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: the ASCII range test is the point.
+		/[^\x00-\x7F]/.test(path);
+
+	/** Stage one path in a worktree, routing non-ASCII paths via stdin. */
+	async function stageWorktreePath(
+		dir: string,
+		path: string,
+	): Promise<boolean> {
+		if (!needsStdinPathspec(path)) {
+			const add = await gitIn(dir)`git add -- ${path}`.quiet();
+			return add.exitCode === 0;
+		}
+		const buf = Buffer.from(`${path}\n`, "utf-8");
+		const add = await gitIn(
+			dir,
+		)`git add --pathspec-from-file=- < ${buf}`.quiet();
+		return add.exitCode === 0;
+	}
+
+	/** The forensic run marker for a worktree commit; parses the branch as fallback. */
+	function runMarkerFor(dir: string, branch: string): string {
+		const runId =
+			keyByDir.get(dir)?.runId ??
+			(branch.startsWith(WF_BRANCH_PREFIX)
+				? branch.slice(WF_BRANCH_PREFIX.length).split("/")[0]
+				: undefined);
+		return runId !== undefined && runId.length > 0 ? ` run=${runId}` : "";
+	}
+
 	async function commitWorktreeEdits(
 		dir: string,
 		branch: string,
 	): Promise<void> {
+		// `-c core.quotePath=false` is load-bearing: with quoting ON, git C-quotes a
+		// non-ASCII path (`"caf\303\251.txt"`) and the unquoter strips only the quotes,
+		// not the octal escapes — the later `git add -- <mangled>` then fails, the path
+		// silently drops, and `worktree remove --force` DELETES the file (work loss).
 		const status = await gitIn(
 			dir,
-		)`git -c diff.renames=false status --porcelain`.quiet();
+		)`git -c core.quotePath=false -c diff.renames=false status --porcelain`.quiet();
 		if (status.exitCode !== 0) {
 			return;
 		}
-		const paths = parsePorcelainPaths(readText(status));
+		const paths = parsePorcelainPaths(readText(status)).filter(
+			(p) => !isExcluded(dir, p),
+		);
 		if (paths.length === 0) {
 			return;
 		}
 		// Stage ONLY explicit pathspecs (never `-A`). Each add is its own fenced call so
-		// one bad pathspec cannot abort the rest; a failed add drops that path.
+		// one bad pathspec cannot abort the rest. A FAILED add is not proof the path is
+		// uncommittable: an ALREADY-STAGED deletion (what `git rm` produces — file gone
+		// from disk, deletion in the index) fails `git add -- <path>` with "pathspec
+		// did not match any files" yet IS committable — probe the index (full cached
+		// list + JS membership, argv-free so non-ASCII paths survive Bun's lexer)
+		// before dropping the path.
 		const staged: string[] = [];
+		let cachedList: string[] | undefined;
 		for (const path of paths) {
-			const add = await gitIn(dir)`git add -- ${path}`.quiet();
-			if (add.exitCode === 0) {
+			if (await stageWorktreePath(dir, path)) {
+				staged.push(path);
+				continue;
+			}
+			if (cachedList === undefined) {
+				const cached = await gitIn(
+					dir,
+				)`git -c core.quotePath=false diff --cached --name-only`.quiet();
+				cachedList = cached.exitCode === 0 ? lines(readText(cached)) : [];
+			}
+			if (cachedList.includes(path)) {
 				staged.push(path);
 			}
 		}
@@ -398,10 +584,19 @@ export function createWorktreeManager(
 		}
 		// Commit with --no-verify (skip operator hooks) + a git GLOBAL `-c` identity
 		// fallback (which MUST precede the subcommand) so a repo with no configured user
-		// still commits. Scoped to the exact staged pathspecs (`-- <paths>`).
-		const commit = await gitIn(
-			dir,
-		)`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${`wf: ${branch}`} -- ${staged}`.quiet();
+		// still commits. Scoped to the exact staged pathspecs — via argv for ASCII
+		// paths, via `--pathspec-from-file=-` when any path would be corrupted by the
+		// shell lexer (see needsStdinPathspec). The message carries the forensic
+		// `run=<runId>` marker so the checkpointer's discard() range guard recognizes
+		// this commit as the run's own.
+		const message = `wf: ${branch}${runMarkerFor(dir, branch)}`;
+		const commit = staged.some(needsStdinPathspec)
+			? await gitIn(
+					dir,
+				)`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} --pathspec-from-file=- < ${Buffer.from(`${staged.join("\n")}\n`, "utf-8")}`.quiet()
+			: await gitIn(
+					dir,
+				)`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} -- ${staged}`.quiet();
 		if (commit.exitCode !== 0) {
 			logger?.warn(
 				"git worktree commit failed before merge-back; the merge may be a no-op " +
@@ -411,6 +606,78 @@ export function createWorktreeManager(
 					stderr: readText({ text: () => commit.stderr.toString() }),
 				},
 			);
+		}
+	}
+
+	/**
+	 * Loud-loss detection for an AGENT EDIT to the copied spec (the run's input).
+	 * The spec is settle-invisible by design — merging it would stomp the operator's
+	 * never-committed file — so an edit can never land; this makes the loss VISIBLE
+	 * instead of silent. Compares the worktree's spec copy against the content
+	 * recorded at copy time and, on divergence, emits ONE note (per dir) through the
+	 * run's `onEdit` sink + the logger:
+	 * - `preserve: true` (the worktree is about to be DESTROYED — the cleanup path):
+	 *   the edited content is copied aside to `<dir>.spec-edited` (a sibling of the
+	 *   checkout, surviving `worktree remove`) and the note names that path; if the
+	 *   copy-aside itself fails, the note states plainly the content was discarded.
+	 * - `preserve: false` (the worktree STAYS ALIVE — the conflict / merge-failed
+	 *   paths): the note names the spec copy inside the preserved worktree.
+	 * A spec copy DELETED by the agent reports as such (nothing to preserve). The
+	 * verify-failed preserve path never reaches the manager, so its (alive) worktree
+	 * carries any edited spec without a dedicated note — the verify warn already
+	 * names the preserved branch. Fenced — never throws into the settle.
+	 */
+	async function settleSpecEdit(dir: string, preserve: boolean): Promise<void> {
+		const rec = specCopyByDir.get(dir);
+		if (rec === undefined) {
+			return;
+		}
+		try {
+			let current: string | undefined;
+			try {
+				current = await readFile(join(dir, rec.path), "utf-8");
+			} catch {
+				current = undefined;
+			}
+			if (current === rec.content) {
+				return;
+			}
+			// Note once per dir, whatever settle path fires first.
+			specCopyByDir.delete(dir);
+			let message: string;
+			if (current === undefined) {
+				message =
+					`agent deleted the copied spec '${rec.path}' in its worktree — the ` +
+					"deletion was NOT merged (the operator's file is untouched); nothing to preserve";
+			} else if (preserve) {
+				const aside = `${dir}.spec-edited`;
+				try {
+					await writeFile(aside, current, "utf-8");
+					message =
+						`agent edited the copied spec '${rec.path}' — spec edits are NEVER ` +
+						"merged (merging would stomp the operator's untracked file); the " +
+						`edited content was preserved at ${aside}`;
+				} catch {
+					message =
+						`agent edited the copied spec '${rec.path}' — spec edits are NEVER ` +
+						"merged (merging would stomp the operator's untracked file); the " +
+						"edited content could NOT be preserved and was DISCARDED with the worktree";
+				}
+			} else {
+				message =
+					`agent edited the copied spec '${rec.path}' — spec edits are NEVER ` +
+					"merged (merging would stomp the operator's untracked file); the " +
+					`edited content survives in the preserved worktree at ${join(dir, rec.path)}`;
+			}
+			rec.onEdit?.(message);
+			logger?.warn(message, { dir, spec: rec.path });
+		} catch (err) {
+			// Detection is observability, never load-bearing — a surprise failure must
+			// not break the settle (degrade, don't detonate).
+			logger?.warn("spec-edit detection failed (non-blocking)", {
+				dir,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 	}
 
@@ -426,10 +693,29 @@ export function createWorktreeManager(
 		await commitWorktreeEdits(dir, branch);
 		// From the MAIN tree, merge the scratch branch with an explicit merge commit
 		// (--no-ff keeps the agent's work a distinguishable unit). Caller serializes this
-		// via the engine's checkpointTail so merges/commits never interleave.
-		const merge = await git()`git merge --no-ff ${branch}`.quiet();
+		// via the engine's checkpointTail so merges/commits never interleave. The merge
+		// message carries the forensic `run=<runId>` marker (same contract as the
+		// scratch commit above) so discard()'s range guard covers merge commits too,
+		// and the identity fallback mirrors commitWorktreeEdits (a merge CREATES a
+		// commit, which needs an author even in a user-less repo).
+		const mergeMessage = `wf merge: ${branch}${runMarkerFor(dir, branch)}`;
+		const merge =
+			await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} merge --no-ff -m ${mergeMessage} ${branch}`.quiet();
 		if (merge.exitCode === 0) {
-			return { merged: true };
+			// Ledger truth for the engine: the merge commit sha + the paths it brought
+			// onto the branch (vs the FIRST parent — exactly "what this merge landed").
+			// Both fenced: a failed read-back degrades to an sha-/path-less merged result
+			// (the merge itself already landed).
+			const rev = await git()`git rev-parse HEAD`.quiet();
+			const sha = rev.exitCode === 0 ? readText(rev).trim() : "";
+			const named =
+				await git()`git -c core.quotePath=false diff --name-only HEAD^1 HEAD`.quiet();
+			const paths = named.exitCode === 0 ? lines(readText(named)) : [];
+			return {
+				merged: true,
+				...(sha.length > 0 ? { sha } : {}),
+				paths,
+			};
 		}
 		// Non-zero is NOT automatically a conflict. git also exits non-zero for "branch
 		// not found", "not something we can merge", and "local changes would be overwritten
@@ -442,9 +728,14 @@ export function createWorktreeManager(
 		await git()`git merge --abort`.quiet();
 		if (files.length > 0) {
 			// REAL conflict → Tier 1: loud, not auto-resolved. Carry branch + baseRef.
+			// The worktree stays ALIVE on this path (the caller skips cleanup), so an
+			// edited spec copy survives in place — note it now, naming that location.
+			await settleSpecEdit(dir, false);
 			return { conflict: true, branch, files, baseRef: baseByDir.get(dir) };
 		}
 		// Non-conflict merge failure → distinct outcome (degrade), not a phantom conflict.
+		// Worktree preserved here too (recoverable) → same in-place spec-edit note.
+		await settleSpecEdit(dir, false);
 		logger?.warn(
 			"git merge failed without conflict markers; degrading (no Tier 1 conflict)",
 			{ branch, stderr: readText({ text: () => merge.stderr.toString() }) },
@@ -458,11 +749,23 @@ export function createWorktreeManager(
 			// clean no-op (the caller would then skip merge-back anyway).
 			return true;
 		}
-		// (1) Any uncommitted worktree edits → changed.
-		const status = await gitIn(dir)`git status --porcelain`.quiet();
-		if (status.exitCode !== 0 || lines(readText(status)).length > 0) {
-			// A non-zero status is treated as "not provably unchanged" → changed (safe:
-			// the caller merges rather than silently dropping work).
+		// (1) Any uncommitted worktree edits → changed. Manager-placed paths (the
+		// copied spec, the node_modules link) are EXCLUDED: they are the run's inputs,
+		// not the agent's work — counting them would make every spec-carrying worktree
+		// "changed" and merge the operator's never-committed file to the main branch.
+		// quotePath off so a non-ASCII path parses to a real filterable pathspec (#7).
+		const status = await gitIn(
+			dir,
+		)`git -c core.quotePath=false -c diff.renames=false status --porcelain`.quiet();
+		if (status.exitCode !== 0) {
+			// A non-zero status is "not provably unchanged" → changed (safe: the caller
+			// merges rather than silently dropping work).
+			return false;
+		}
+		const dirty = parsePorcelainPaths(readText(status)).filter(
+			(p) => !isExcluded(dir, p),
+		);
+		if (dirty.length > 0) {
 			return false;
 		}
 		// (2) Commits ahead of the create-time base → changed. Without a recorded base
@@ -486,10 +789,17 @@ export function createWorktreeManager(
 		if (!(await alive())) {
 			return;
 		}
+		// The checkout is about to be DESTROYED: detect an agent edit to the copied
+		// spec first and preserve the edited bytes aside (loud-loss contract). Runs
+		// before the bookkeeping deletes so the recorded copy content is still there.
+		await settleSpecEdit(dir, true);
 		// Best-effort, fenced: remove the checkout (force, since it may carry the agent's
 		// dirt on a conflict-preserved worktree), then delete the scratch branch. A failed
 		// remove must NOT prevent the branch delete — run both independently.
 		baseByDir.delete(dir);
+		keyByDir.delete(dir);
+		excludeByDir.delete(dir);
+		specCopyByDir.delete(dir);
 		await git()`git worktree remove --force ${dir}`.quiet();
 		await git()`git branch -D ${branch}`.quiet();
 	}
@@ -512,8 +822,15 @@ export function createWorktreeManager(
 		}
 	}
 
-	function registerSpec(runId: string, repoRelPath: string): void {
-		specByRun.set(runId, repoRelPath);
+	function registerSpec(
+		runId: string,
+		repoRelPath: string,
+		onEdit?: (message: string) => void,
+	): void {
+		specByRun.set(runId, {
+			path: repoRelPath,
+			...(onEdit !== undefined ? { onEdit } : {}),
+		});
 	}
 
 	function unregisterSpec(runId: string): void {
@@ -528,5 +845,6 @@ export function createWorktreeManager(
 		sweep,
 		registerSpec,
 		unregisterSpec,
+		baseOf: (dir: string) => baseByDir.get(dir),
 	};
 }

@@ -20,11 +20,15 @@ const body = parseScript(ROLLING_WAVE_SOURCE).bodySource;
 function makeApi(opts: {
 	args: unknown;
 	agent: (prompt: string, o?: AgentOpts) => Promise<unknown>;
+	/** Accumulates every log() message, for red-gate reporting assertions. */
+	logs?: string[];
 }): RuntimeApi {
 	return {
 		agent: opts.agent as RuntimeApi["agent"],
 		phase: () => {},
-		log: () => {},
+		log: (message: string) => {
+			opts.logs?.push(message);
+		},
 		args: opts.args,
 		budget: { total: null, spent: () => 0, remaining: () => Infinity },
 		workflow: (() => {
@@ -50,28 +54,43 @@ type Verdict = { gatesPass: boolean; findings: string[] };
 
 /**
  * Dispatch a stub agent by label prefix. `reviews` maps a review/rereview label
- * to the verdict it should return; `calledLabels` accumulates every label seen so
- * negative assertions (no fix, no later task, no agent at all) can check absence.
- * `rereview:` is matched BEFORE `review:` since both start with "re".
+ * to the verdict it should return (explicit `null` simulates a degraded review
+ * agent); `calledLabels` accumulates every label seen so negative assertions (no
+ * fix, no later task, no agent at all) can check absence. `plan` (when the key is
+ * present) overrides the decompose result; `implementResults` overrides
+ * implement:/fix: results per label so degrade paths (null, merge conflict) are
+ * testable. `rereview:` is matched BEFORE `review:` since both start with "re".
  */
 function dispatchAgent(opts: {
 	tasks: string[];
-	reviews: Record<string, Verdict>;
+	reviews: Record<string, Verdict | null>;
 	calledLabels: string[];
 	implementOpts?: Array<{ label: string; opts?: AgentOpts }>;
+	plan?: unknown;
+	implementResults?: Record<string, unknown>;
+	prompts?: Array<{ label: string; prompt: string }>;
 }) {
-	return async (_prompt: string, o?: AgentOpts) => {
+	return async (prompt: string, o?: AgentOpts) => {
 		const label = o?.label ?? "";
 		opts.calledLabels.push(label);
+		opts.prompts?.push({ label, prompt });
 		if (opts.implementOpts && label.startsWith("implement:")) {
 			opts.implementOpts.push({ label, opts: o });
 		}
-		if (label === "decompose") return { tasks: opts.tasks };
-		if (label.startsWith("rereview:") || label.startsWith("review:")) {
-			return opts.reviews[label] ?? { gatesPass: true, findings: [] };
+		if (label === "decompose") {
+			return "plan" in opts ? opts.plan : { tasks: opts.tasks };
 		}
-		if (label.startsWith("implement:") || label.startsWith("fix:"))
+		if (label.startsWith("rereview:") || label.startsWith("review:")) {
+			return label in opts.reviews
+				? opts.reviews[label]
+				: { gatesPass: true, findings: [] };
+		}
+		if (label.startsWith("implement:") || label.startsWith("fix:")) {
+			if (opts.implementResults && label in opts.implementResults) {
+				return opts.implementResults[label];
+			}
 			return "wrote to disk";
+		}
 		if (label === "synthesize") return "REPORT";
 		return null;
 	};
@@ -81,6 +100,7 @@ type RollingWaveResult = {
 	goal: string;
 	completed: string[];
 	remaining: string[];
+	failed?: { task: string; reason: string; branch?: string } | null;
 	report: unknown;
 	error?: string;
 };
@@ -184,5 +204,145 @@ describe("built-in rolling-wave — control flow", () => {
 		await evaluateScript(body, apiNoCmd);
 		const implementedNoCmd = noCmd.find((c) => c.label === "implement:0");
 		expect(implementedNoCmd?.opts?.verifyDiff).toBe(true);
+	});
+
+	test("a null decompose plan falls back to the goal as a single task", async () => {
+		const calledLabels: string[] = [];
+		const api = makeApi({
+			args: { goal: "just do it" },
+			agent: dispatchAgent({
+				tasks: [],
+				reviews: {},
+				calledLabels,
+				plan: null,
+			}),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		expect(result.completed).toEqual(["just do it"]);
+		expect(calledLabels.filter((l) => l.startsWith("implement:"))).toEqual([
+			"implement:0",
+		]);
+	});
+
+	test("a null review verdict is stop-on-red — no fix, no later task, not done", async () => {
+		const calledLabels: string[] = [];
+		const api = makeApi({
+			args: { goal: "g" },
+			agent: dispatchAgent({
+				tasks: ["t0", "t1"],
+				reviews: { "review:0": null },
+				calledLabels,
+			}),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		expect(result.completed).toEqual([]);
+		expect(result.remaining).toEqual(["t0", "t1"]);
+		expect(calledLabels).not.toContain("fix:0");
+		expect(calledLabels).not.toContain("implement:1");
+	});
+
+	test("a null implement is a red gate — review never dispatched, wave stops", async () => {
+		const calledLabels: string[] = [];
+		const logs: string[] = [];
+		const api = makeApi({
+			args: { goal: "g" },
+			logs,
+			agent: dispatchAgent({
+				tasks: ["t0", "t1"],
+				reviews: {},
+				calledLabels,
+				implementResults: { "implement:0": null },
+			}),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		// A degraded implement means the work did NOT land; reviewing the cumulative
+		// diff anyway could pass on prior tasks' changes (green-on-red).
+		expect(calledLabels).not.toContain("review:0");
+		expect(calledLabels).not.toContain("implement:1");
+		expect(result.completed).toEqual([]);
+		expect(result.remaining).toEqual(["t0", "t1"]);
+		expect(result.failed?.task).toBe("t0");
+		expect(logs.join("\n")).toContain("t0");
+	});
+
+	test("a conflict implement is a red gate that surfaces the preserved branch", async () => {
+		const calledLabels: string[] = [];
+		const logs: string[] = [];
+		const api = makeApi({
+			args: { goal: "g" },
+			logs,
+			agent: dispatchAgent({
+				tasks: ["t0", "t1"],
+				reviews: {},
+				calledLabels,
+				implementResults: {
+					"implement:0": {
+						status: "conflict",
+						branch: "workflow/implement-0",
+						files: ["a.ts"],
+						baseRef: "deadbeef",
+					},
+				},
+			}),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		expect(calledLabels).not.toContain("review:0");
+		expect(result.completed).toEqual([]);
+		expect(result.failed?.task).toBe("t0");
+		expect(result.failed?.branch).toBe("workflow/implement-0");
+		expect(logs.join("\n")).toContain("workflow/implement-0");
+	});
+
+	test("a degraded fix is a red gate — re-review never dispatched", async () => {
+		const calledLabels: string[] = [];
+		const api = makeApi({
+			args: { goal: "g" },
+			agent: dispatchAgent({
+				tasks: ["t0", "t1"],
+				reviews: { "review:0": { gatesPass: false, findings: ["f"] } },
+				calledLabels,
+				implementResults: { "fix:0": null },
+			}),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		expect(calledLabels).toContain("fix:0");
+		expect(calledLabels).not.toContain("rereview:0");
+		expect(calledLabels).not.toContain("implement:1");
+		expect(result.completed).toEqual([]);
+		expect(result.failed?.task).toBe("t0");
+	});
+
+	test("decompose output is truncated to MAX_TASKS (20)", async () => {
+		const calledLabels: string[] = [];
+		const tasks = Array.from({ length: 25 }, (_, i) => "t" + i);
+		const api = makeApi({
+			args: { goal: "g" },
+			agent: dispatchAgent({ tasks, reviews: {}, calledLabels }),
+		});
+		const result = (await evaluateScript(body, api)) as RollingWaveResult;
+		expect(result.completed.length).toBe(20);
+		expect(calledLabels).toContain("implement:19");
+		expect(calledLabels).not.toContain("implement:20");
+	});
+
+	test("review prompts disclose the cumulative diff scope and prior tasks", async () => {
+		const prompts: Array<{ label: string; prompt: string }> = [];
+		const api = makeApi({
+			args: { goal: "g" },
+			agent: dispatchAgent({
+				tasks: ["t0", "t1"],
+				reviews: {},
+				calledLabels: [],
+				prompts,
+			}),
+		});
+		await evaluateScript(body, api);
+		const second = prompts.find((p) => p.label === "review:1");
+		expect(second?.prompt).toContain("CUMULATIVE");
+		// Prior completed tasks are listed so the reviewer can attribute changes.
+		expect(second?.prompt).toContain("t0");
+		expect(second?.prompt).toContain("ONLY");
+		const first = prompts.find((p) => p.label === "review:0");
+		expect(first?.prompt).toContain("CUMULATIVE");
 	});
 });

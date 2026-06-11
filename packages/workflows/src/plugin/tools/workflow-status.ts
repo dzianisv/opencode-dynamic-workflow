@@ -304,7 +304,12 @@ function renderCheckpoints(record: RunRecord): string[] {
 	for (const cp of cps) {
 		const sha7 = cp.sha?.slice(0, 7) ?? "(no sha)";
 		const phase = cp.phase !== undefined ? ` phase=${cp.phase}` : "";
-		lines.push(`  ${sha7} ${cp.label}${phase} (${cp.paths.length} files)`);
+		// `shared` (parallel unisolated agents on one tree): attribution is
+		// approximate — the commit may carry a live sibling's files under this label.
+		const shared = cp.shared === true ? " (shared)" : "";
+		lines.push(
+			`  ${sha7} ${cp.label}${phase} (${cp.paths.length} files)${shared}`,
+		);
 	}
 	return lines;
 }
@@ -312,9 +317,11 @@ function renderCheckpoints(record: RunRecord): string[] {
 /**
  * Flag a synthesized "no commit" claim contradicted by real checkpoint commits
  * (Epic 2.2, Issue 4). Returns a warning ONLY when BOTH: (1) real checkpoints
- * exist, AND (2) the agent's `returnValue` text contains the literal token
- * "no commit" (conservative — a false flag erodes trust more than a missed one).
- * `undefined` `returnValue` never throws and never flags.
+ * exist, AND (2) the agent's `returnValue` text contains a WORD-BOUNDED
+ * "no commit"/"no commits" (conservative — a false flag erodes trust more than a
+ * missed one; a bare substring match also fired on "no commitments"/"no
+ * commitment to…", which is not a commit claim at all). `undefined`
+ * `returnValue` never throws and never flags.
  */
 function noCommitContradiction(record: RunRecord): string | undefined {
 	const n = record.checkpoints?.length ?? 0;
@@ -322,7 +329,7 @@ function noCommitContradiction(record: RunRecord): string | undefined {
 		return undefined;
 	}
 	const text = JSON.stringify(record.returnValue);
-	if (text === undefined || !text.toLowerCase().includes("no commit")) {
+	if (text === undefined || !/\bno commits?\b/i.test(text)) {
 		return undefined;
 	}
 	return (
@@ -346,6 +353,13 @@ function renderSourceDiagnostics(record: RunRecord): string[] {
 	const lines: string[] = ["", "source diagnostics:"];
 	for (const d of diags) {
 		const rule = d.rule !== undefined ? ` (${d.rule})` : "";
+		if (d.classification === "directory") {
+			lines.push(
+				`  ⚠ ${d.path} is a directory, not a file — spec_path must reference ` +
+					"the source-of-truth FILE; no classification or worktree copy was done",
+			);
+			continue;
+		}
 		lines.push(
 			`  ⚠ ${d.path} is ${d.classification}${rule} — not a tracked artifact; ` +
 				"it will not travel with the branch and may be invisible to isolated agents",

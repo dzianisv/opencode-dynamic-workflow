@@ -77,8 +77,17 @@ export interface AgentOpts {
 	 * git restore — a phantom pass). BEST-EFFORT: it proves "something is on disk vs
 	 * HEAD" (or a command exits 0), NOT that the agent's claim is correct. INERT on a
 	 * no-shell / non-git checkout (the result passes through unchanged — never a
-	 * fabricated failure). Like {@link AgentOpts.contextDiff}, a post-condition is NOT
-	 * part of {@link computeCallKey} — it must not void the resume cache.
+	 * fabricated failure). `verifyDiff: false` is identical to ABSENT (no isolation
+	 * implied, no check run) — a computed flag may legitimately pass `false`. Like
+	 * {@link AgentOpts.contextDiff}, a post-condition is NOT part of
+	 * {@link computeCallKey} — it must not void the resume cache.
+	 *
+	 * For an ISOLATED agent (explicit `isolation:'worktree'`, or the worktree this
+	 * option itself implies on a git-backed engine), verify GATES the merge-back: a
+	 * failed post-condition means the worktree is NOT merged to the main branch — the
+	 * work is preserved on the scratch branch (recoverable, named in the warn/note)
+	 * and the agent degrades to null so a resume re-runs it cleanly, never on top of
+	 * its own failed-but-landed edits.
 	 */
 	verifyDiff?: boolean | { check?: string };
 }
@@ -223,6 +232,11 @@ export type ProgressEmitter = (e: ProgressEvent) => void;
  *   `null` so a resumed run re-attempts rather than replaying a false `ok`. NEVER a
  *   silent cleanup — that would re-introduce the #5 lost-work catastrophe through the
  *   isolation path. The batch is NOT detonated.
+ * - `skill_not_found`: `skills` named a skill the resolver does not know. The call
+ *   THROWS a SkillNotFoundError to the script (fail-loud authoring contract — the
+ *   one deliberate exception to degrade-don't-detonate), but the diagnostic is still
+ *   emitted so the feed's ✗ carries a reason instead of an unexplained error end.
+ *   Skills resolve BEFORE the worktree mint, so a typo never burns a mint.
  */
 export type DiagnosticReason =
 	| "schema_no_call"
@@ -236,7 +250,8 @@ export type DiagnosticReason =
 	| "empty_diff"
 	| "verify_failed"
 	| "merge_conflict"
-	| "merge_failed";
+	| "merge_failed"
+	| "skill_not_found";
 
 /**
  * A post-mortem diagnostic for a single failed/empty `agent()` call (Task 7.2.1).
@@ -341,7 +356,7 @@ export interface WorktreeManagerSeam {
 		dir: string,
 		branch: string,
 	): Promise<
-		| { merged: true }
+		| { merged: true; sha?: string; paths?: string[] }
 		| {
 				conflict: true;
 				branch: string;

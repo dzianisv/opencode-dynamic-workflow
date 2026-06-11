@@ -27,7 +27,7 @@
  * records seed the notification queue and stay readable via `statusOf`.
  */
 
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
 	type Clock,
 	ConcurrencyManager,
@@ -54,6 +54,7 @@ import type {
 	AgentDiagnostic,
 	BudgetView,
 	JournalEntry,
+	WorktreeManagerSeam,
 } from "../runtime/types";
 import { createTokenBudget, type TokenBudget } from "./budget";
 import { BUILTIN_WORKFLOWS } from "./builtins";
@@ -71,6 +72,7 @@ import {
 	type BunShell,
 	type Checkpointer,
 	createGitCheckpointer,
+	parsePorcelain,
 } from "./git-checkpoint";
 import { createWorktreeManager, type WorktreeManager } from "./git-worktree";
 import { createJournal, type Journal, type JournalFs } from "./journal";
@@ -152,6 +154,14 @@ export interface CheckpointRecord {
 	phase?: string;
 	/** Mode flips (Epic 2.3): path → `"<oldmode>→<newmode>"`; absent on none. */
 	modeFlips?: Record<string, string>;
+	/**
+	 * The checkpoint committed while OTHER unisolated agents were still live
+	 * (parallel() on one shared tree). Attribution is then HONESTLY APPROXIMATE:
+	 * the commit may carry a still-running sibling's half-written files under this
+	 * entry's `label` — the checkpointer cannot tell whose bytes are whose without
+	 * isolation. Absent (the common case) when no sibling was in flight.
+	 */
+	shared?: boolean;
 }
 
 /**
@@ -578,13 +588,31 @@ export function createWorkflowEngine(
 	// before, breaking resume in production (live-harness Scenario C regression).
 	const fs = opts.fs ?? nodeFsFacade();
 	const logger = opts.logger;
-	/** Fenced on-disk existence probe (Epic 2.4): a readFile that resolves → exists. */
-	const fileExists = async (absPath: string): Promise<boolean> => {
+	/**
+	 * Fenced on-disk probe (Epic 2.4): `"file" | "dir" | "missing"`. Prefers the
+	 * facade's OPTIONAL `stat` (now a first-class {@link FsFacade} member; the
+	 * production `node:fs/promises` facade exposes it natively), so the probe costs
+	 * one metadata syscall instead of reading the whole file for a boolean, and a
+	 * DIRECTORY classifies honestly instead of as "missing" (readFile on a
+	 * directory rejects with EISDIR). The readFile fallback covers a stat-less
+	 * in-memory test fs (which models no directories).
+	 */
+	const probePath = async (
+		absPath: string,
+	): Promise<"file" | "dir" | "missing"> => {
+		if (fs.stat !== undefined) {
+			try {
+				const st = await fs.stat(absPath);
+				return st.isDirectory() ? "dir" : "file";
+			} catch {
+				return "missing";
+			}
+		}
 		try {
 			await fs.readFile(absPath, "utf-8");
-			return true;
+			return "file";
 		} catch {
-			return false;
+			return "missing";
 		}
 	};
 	// The ONE canonical base, shared with the background-agents plugin. ALWAYS a
@@ -1014,33 +1042,80 @@ export function createWorkflowEngine(
 		// (a `docs/plans/…md` matched by `.gitignore`) is surfaced rather than silently
 		// trusted, AND so an untracked/ignored spec gets copied into worktree-isolated
 		// agents (which see only HEAD). Records ONLY operator-relevant verdicts
-		// (`ignored`/`missing`); `tracked`/`untracked` are unremarkable noise. The whole
-		// block is fenced — a classification failure NEVER blocks or breaks startRun.
-		// No `spec_path` → no classification, no diagnostic, no copy (do not guess).
+		// (`ignored`/`missing`/`directory`); `tracked`/`untracked` are unremarkable
+		// noise. The whole block is fenced — a classification failure NEVER blocks or
+		// breaks startRun. No `spec_path` → no classification, no diagnostic, no copy.
+		//
+		// CONTAINMENT (model-supplied input): the JSDoc contract is "repo-relative or
+		// absolute" — `join(directory, spec)` would MANGLE an absolute path (re-rooting
+		// it under the project) and a `../..` would escape the repo entirely (and later
+		// be COPIED into worktrees from outside it). Resolve absolute-aware, require
+		// the result inside `directory`, and normalize to repo-relative before
+		// classify/registerSpec so every downstream consumer sees one canonical shape.
+		// The workflow tool rejects an escaping path loudly at its boundary; this
+		// engine-side check covers programmatic callers (warn + skip, non-blocking).
+		// The repo-relative spec path registered for worktree copies (when any): the
+		// verify porcelain probe below must IGNORE it — it is manager-placed input,
+		// not agent output, and counting it would make verifyDiff:true vacuously pass
+		// for every spec-carrying worktree.
+		let registeredSpecPath: string | undefined;
 		if (args.specPath !== undefined) {
 			try {
-				const specPath = args.specPath;
-				const exists = await fileExists(join(opts.directory, specPath));
-				const verdict = await classifyPath(
-					opts.shell,
-					opts.directory,
-					specPath,
-					exists,
-				);
-				if (
-					verdict.classification === "ignored" ||
-					verdict.classification === "missing"
-				) {
-					record.sourceDiagnostics = [verdict];
-				}
-				// Untracked/ignored → absent from a fresh `worktree add … HEAD` checkout.
-				// Register so the worktree manager copies it into every worktree this run
-				// mints. Tracked (already in HEAD) and missing (not on disk) never copy.
-				if (
-					verdict.classification === "untracked" ||
-					verdict.classification === "ignored"
-				) {
-					worktreeManager.registerSpec(runId, specPath);
+				const rawSpec = args.specPath;
+				const root = resolve(opts.directory);
+				const absSpec = isAbsolute(rawSpec)
+					? resolve(rawSpec)
+					: resolve(root, rawSpec);
+				if (absSpec !== root && !absSpec.startsWith(root + sep)) {
+					logger?.warn(
+						"declared spec_path resolves OUTSIDE the project directory — " +
+							"ignored (no classification, no worktree copy)",
+						{ runId, specPath: rawSpec, resolved: absSpec },
+					);
+				} else {
+					const specPath = relative(root, absSpec);
+					const probe = await probePath(absSpec);
+					if (probe === "dir" || specPath.length === 0) {
+						// A directory is not a spec FILE: surface it honestly (the old
+						// readFile-probe misclassified it as "missing") and never register it
+						// for a worktree copy (copyFile on a dir would fail anyway).
+						record.sourceDiagnostics = [
+							{ path: specPath || ".", classification: "directory" },
+						];
+					} else {
+						const verdict = await classifyPath(
+							opts.shell,
+							opts.directory,
+							specPath,
+							probe === "file",
+						);
+						if (
+							verdict.classification === "ignored" ||
+							verdict.classification === "missing"
+						) {
+							record.sourceDiagnostics = [verdict];
+						}
+						// Untracked/ignored → absent from a fresh `worktree add … HEAD`
+						// checkout. Register so the worktree manager copies it into every
+						// worktree this run mints. Tracked (already in HEAD) and missing (not
+						// on disk) never copy.
+						if (
+							verdict.classification === "untracked" ||
+							verdict.classification === "ignored"
+						) {
+							// The loud-loss sink: an agent edit to the copied spec is never
+							// merged (it would stomp the operator's untracked file) — the
+							// manager detects it at settle and reports through here, so the
+							// note lands on the run's feed + progress, not just the log.
+							worktreeManager.registerSpec(runId, specPath, (message) => {
+								const at = clock.now();
+								runs.get(runId)?.progress.push({ type: "warn", message, at });
+								feeds.get(runId)?.append({ type: "warn", message, at });
+								logger?.warn(message, { runId });
+							});
+							registeredSpecPath = specPath;
+						}
+					}
 				}
 			} catch (err) {
 				logger?.warn("source-path classification failed (non-blocking)", {
@@ -1125,6 +1200,16 @@ export function createWorkflowEngine(
 		}): void => {
 			checkpointTail = checkpointTail.then(async () => {
 				try {
+					// Mis-attribution honesty (parallel() on the shared tree): the commit
+					// below sweeps EVERYTHING dirty-and-not-baseline at this moment —
+					// including a still-LIVE unisolated sibling's half-written files — under
+					// THIS agent's label. The checkpointer cannot tell whose bytes are whose
+					// without isolation, so when any other launched agent is still in flight
+					// at commit time (launchMeta holds entries; this agent's own entry was
+					// dropped at its agent:end, before this tail link runs), the checkpoint
+					// is marked `shared` on the ledger + feed line. Evaluated AT COMMIT time,
+					// not enqueue time, so the verdict matches what the commit actually swept.
+					const shared = launchMeta.size > 0;
 					const res = await runCheckpointer.checkpoint({
 						runId,
 						label: meta.label,
@@ -1138,9 +1223,11 @@ export function createWorkflowEngine(
 							sessionID: meta.sessionID,
 							...(res.sha !== undefined ? { sha: res.sha } : {}),
 							paths: res.paths ?? [],
+							...(meta.phase !== undefined ? { phase: meta.phase } : {}),
 							...(res.modeFlips !== undefined
 								? { modeFlips: res.modeFlips }
 								: {}),
+							...(shared ? { shared: true } : {}),
 							at: clock.now(),
 						});
 						// Epic 2.1/2.2/2.3: accumulate the engine's git truth onto the record
@@ -1155,6 +1242,7 @@ export function createWorkflowEngine(
 							...(res.modeFlips !== undefined
 								? { modeFlips: res.modeFlips }
 								: {}),
+							...(shared ? { shared: true } : {}),
 						});
 					}
 				} catch (err) {
@@ -1210,6 +1298,48 @@ export function createWorkflowEngine(
 			record.checkpoints.push(cp);
 		};
 
+		// Ledger truth for ISOLATED agents: after a successful merge-back the main tree
+		// is CLEAN (the work landed as a merge commit), so the per-unit checkpointer
+		// commits nothing and the run's `files changed (engine-computed)` / checkpoint
+		// ledger would stay empty despite real merge commits — and the
+		// noCommitContradiction guard could never fire. This per-run view of the
+		// engine-wide manager intercepts mergeBack and records the merge commit
+		// (sha + the paths it brought in, reported by the manager) as a
+		// CheckpointRecord + `agent:checkpoint` feed line, attributed to the agent
+		// label parsed from the scratch branch (`wf/<runId>/<label>` — the manager's
+		// own naming). Everything else passes through untouched.
+		const runWorktreeManager: WorktreeManagerSeam = {
+			create: (key) => worktreeManager.create(key),
+			isUnchanged: (dir) => worktreeManager.isUnchanged(dir),
+			cleanup: (dir, branch) => worktreeManager.cleanup(dir, branch),
+			sweep: () => worktreeManager.sweep(),
+			mergeBack: async (dir, branch) => {
+				const res = await worktreeManager.mergeBack(dir, branch);
+				if (
+					"merged" in res &&
+					(res.sha !== undefined || (res.paths?.length ?? 0) > 0)
+				) {
+					const prefix = `wf/${runId}/`;
+					const label = branch.startsWith(prefix)
+						? branch.slice(prefix.length)
+						: branch;
+					feed.append({
+						type: "agent:checkpoint",
+						label,
+						...(res.sha !== undefined ? { sha: res.sha } : {}),
+						paths: res.paths ?? [],
+						at: clock.now(),
+					});
+					recordCheckpoint({
+						...(res.sha !== undefined ? { sha: res.sha } : {}),
+						paths: res.paths ?? [],
+						label,
+					});
+				}
+				return res;
+			},
+		};
+
 		const run = createWorkflowRun({
 			runner,
 			parentSessionID: args.parentSessionID,
@@ -1218,9 +1348,10 @@ export function createWorkflowEngine(
 			registry,
 			// Top-level run: its workflow() global can nest one level (spec §8).
 			resolveSubWorkflow,
-			// Epic H.1.6: the engine-owned worktree manager, threaded to every run so the
-			// future isolation mint-point (H.1.2) reaches it. Inert today (no-shell → no-op).
-			worktreeManager,
+			// Epic H.1.6: the engine-owned worktree manager — wrapped per-run so a
+			// successful merge-back lands on THIS run's checkpoint ledger (see
+			// runWorktreeManager above). Inert on a no-shell engine (create → null).
+			worktreeManager: runWorktreeManager,
 			...(budget !== undefined ? { budget } : {}),
 			// Pre-launch checkpoint barrier (Task 2.1.5): the runtime awaits this opaque
 			// thunk after gate.acquire and before runner.launch, so the next agent's
@@ -1309,25 +1440,64 @@ export function createWorkflowEngine(
 						return { passed: false, available: false };
 					}
 				}
-				// `true` or `{}` → git-diff-nonempty mode (the {} collapse).
+				// `true` or `{}` → git-nonempty-delta mode (the {} collapse).
 				// Epic H.1.3: for an isolation:'worktree' agent the edits live in the
 				// WORKTREE checkout, not the main tree, so the main checkpointer's
-				// main-tree-bound diff is empty and would falsely fail the agent. When the
-				// runtime supplies the worktree dir, re-root the diff to it: run `git diff`
-				// (working tree vs HEAD — uncommitted edits, which is where a worktree
-				// agent's work lives pre-merge) bound to the worktree via cwd. Fenced +
-				// quieted (TTY safety, parity with the {check} branch). Absent v.directory
-				// → the main-tree checkpointer diff as today.
+				// main-tree-bound delta is empty and would falsely fail the agent. When
+				// the runtime supplies the worktree dir, probe the WORKTREE's porcelain
+				// status — NOT `git diff`, which is BLIND to untracked files: an agent
+				// whose only output is a NEW module would read as "no delta" and be
+				// falsely downgraded with verify_failed. `status --porcelain` lists
+				// modified AND untracked entries (quotePath off so non-ASCII paths are
+				// real lines, not C-quoted blobs). Work the agent already COMMITTED
+				// inside its worktree leaves porcelain clean, so the verdict is
+				// "porcelain non-empty (minus manager-placed paths) OR commits ahead of
+				// the mint base" — `git rev-list --count <base>..HEAD` in the worktree,
+				// the base read from the manager's create-time record. Committed work
+				// IS landed work: merge-back merges the scratch branch, carrying agent
+				// commits exactly like staged-by-the-settle edits. Fenced + quieted
+				// (TTY safety, parity with the {check} branch). A non-zero status →
+				// unprovable → inert. Absent v.directory → the main-tree checkpointer
+				// diff (untracked-aware since the #1 fix) as today.
 				if (v.directory !== undefined && opts.shell !== undefined) {
 					try {
 						const res = await opts.shell
 							.cwd(v.directory)
-							.nothrow()`git diff`.quiet();
-						const text = res.exitCode === 0 ? res.text() : "";
-						return {
-							passed: text.trim().length > 0,
-							available: true,
-						};
+							.nothrow()`git -c core.quotePath=false status --porcelain`.quiet();
+						if (res.exitCode !== 0) {
+							return { passed: false, available: false };
+						}
+						// MANAGER-PLACED paths (the copied spec, the node_modules link) are
+						// the run's inputs, not the agent's work — subtract them so a
+						// spec-carrying worktree cannot vacuously pass verifyDiff:true.
+						const agentWork = parsePorcelain(res.text()).filter((p) => {
+							const normalized = p.endsWith("/") ? p.slice(0, -1) : p;
+							return (
+								normalized !== "node_modules" &&
+								normalized !== registeredSpecPath
+							);
+						});
+						if (agentWork.length > 0) {
+							return { passed: true, available: true };
+						}
+						// Porcelain clean: count commits ahead of the worktree's mint base.
+						// No recorded base (an orphan dir / base-capture miss) → ahead-ness
+						// is uncountable; fall through to the porcelain-only verdict
+						// (passed:false on a clean tree — the pre-existing behavior).
+						const base = worktreeManager.baseOf(v.directory);
+						if (base !== undefined) {
+							const ahead = await opts.shell
+								.cwd(v.directory)
+								.nothrow()`git rev-list --count ${base}..HEAD`.quiet();
+							if (ahead.exitCode === 0) {
+								const n = Number.parseInt(ahead.text().trim(), 10);
+								return {
+									passed: Number.isFinite(n) && n > 0,
+									available: true,
+								};
+							}
+						}
+						return { passed: false, available: true };
 					} catch {
 						// A thrown shell → emptiness is unprovable → inert (available:false),
 						// never a fabricated failure (parity with the {check} branch).
@@ -1554,6 +1724,12 @@ export function createWorkflowEngine(
 				// invariant a viewer relies on. On cancel, the aborted agents' ends have
 				// already enqueued their checkpoints, so this drains those too.
 				await drainCheckpoints();
+				// RE-PERSIST after the drain: the drained links appended to
+				// `record.checkpoints` AFTER settleRecord/persistRecord above ran (a
+				// one-agent run's last checkpoint is enqueued by its agent:end and only
+				// commits here), so without this second save the persisted ledger is
+				// routinely EMPTY while the in-memory record is full.
+				persistRecord(handle.record);
 				// Promote/discard the run's checkpoint commits (Epic 4.1), AFTER the chain
 				// drains (so the marker is at the true tip) and BEFORE run:end. Use the
 				// record's terminal status — a stopRun pre-flips it to `cancelled`, which
@@ -1578,8 +1754,12 @@ export function createWorkflowEngine(
 				} else {
 					persistRecord(handle.record);
 				}
-				// Drain the checkpoint chain before run:end on the error path too.
+				// Drain the checkpoint chain before run:end on the error path too, then
+				// re-persist so drained-in checkpoint entries reach disk (mirrors the
+				// success branch — the drain appends to record.checkpoints after the
+				// persist above).
 				await drainCheckpoints();
+				persistRecord(handle.record);
 				// A thrown run is always non-success → discard (Epic 4.1).
 				await settleCheckpoints("error");
 				await finalizeFeed(handle, {});
@@ -1724,6 +1904,20 @@ export function createWorkflowEngine(
 			logger?.warn("worktree sweep failed at engine ready (non-blocking)", {
 				error: err instanceof Error ? err.message : String(err),
 			});
+		}
+		// Stale-marker sweep (mirrors the worktree sweep above): a run that crashed
+		// between checkpoint and terminal never ran promote()/discard(), so its
+		// `refs/wf-checkpoints/<runId>` marker GC-pins its checkpoint commits forever.
+		// ready() runs once at engine construction, BEFORE any run starts (startRun
+		// awaits readyPromise), so every marker found here is by construction stale.
+		// Doubly fenced (the method never rejects; the wrap guards a surprise anyway).
+		try {
+			await probeCheckpointer.sweepMarkers();
+		} catch (err) {
+			logger?.warn(
+				"checkpoint marker sweep failed at engine ready (non-blocking)",
+				{ error: err instanceof Error ? err.message : String(err) },
+			);
 		}
 		const recovered = await runStore.load();
 		const seed: RunRecord[] = [];

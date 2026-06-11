@@ -1603,6 +1603,132 @@ describe("createAgentPrimitive — worktree merge-back on settle (Task H.1.3)", 
 
 		expect(await agent("mutate", { isolation: "worktree" })).toBe("OK");
 	});
+
+	test("a FAILED verify GATES the merge: worktree preserved, NO mergeBack, NO cleanup, null result", async () => {
+		// The #2 semantic: verify is a GATE, not an observation. Before the fix the
+		// finally merged the worktree back even after verify failed — the failed
+		// agent's work silently landed on the branch, and a resume re-ran the agent on
+		// top of its own landed edits. Now a failed verify preserves the worktree +
+		// scratch branch (like the conflict path) and the merge NEVER runs.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false, // the worktree DOES carry (failed) work
+		});
+		const { agent, events, diags } = harness({
+			runner,
+			worktreeManager: manager,
+			verifyResult: async () => ({ passed: false, available: true }),
+		});
+
+		const result = await agent("mutate", {
+			isolation: "worktree",
+			verifyDiff: true,
+		});
+
+		// Downgraded to null (re-runs on resume) — never the agent's "OK" text.
+		expect(result).toBeNull();
+		// The merge was GATED: no mergeBack, no cleanup (worktree+branch preserved).
+		expect(manager.mergeBacks).toEqual([]);
+		expect(manager.cleanups).toEqual([]);
+		// Diagnostic + a feed-visible note/warn NAMING the preserved branch.
+		expect(diags.some((d) => d.reason === "verify_failed")).toBe(true);
+		const end = events.find((e) => e.type === "agent:end") as {
+			note?: string;
+		};
+		expect(end.note).toContain("verify_failed");
+		expect(end.note).toContain("wf/run-1/iso");
+		const warn = events.find(
+			(e) =>
+				e.type === "warn" &&
+				e.message.includes("NOT merged") &&
+				e.message.includes("wf/run-1/iso"),
+		);
+		expect(warn).toBeDefined();
+	});
+
+	test("a PASSED verify still merges and cleans up (the gate only blocks failures)", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+		});
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			verifyResult: async () => ({ passed: true, available: true }),
+		});
+
+		expect(await agent("mutate", { verifyDiff: true })).toBe("OK");
+		expect(manager.mergeBacks).toHaveLength(1);
+		expect(manager.cleanups).toHaveLength(1);
+	});
+
+	test("an INERT verify (available:false) does not gate the merge", async () => {
+		// available:false means emptiness/exit is UNPROVABLE (no-shell / non-git): the
+		// result passes through AND the merge proceeds — never a fabricated gate.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+			isUnchanged: async () => false,
+		});
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			verifyResult: async () => ({ passed: false, available: false }),
+		});
+
+		expect(await agent("mutate", { verifyDiff: true })).toBe("OK");
+		expect(manager.mergeBacks).toHaveLength(1);
+	});
+});
+
+// ---- #10: verifyDiff:false must behave exactly like an absent option -------
+
+describe("createAgentPrimitive — verifyDiff:false is inert (a computed flag)", () => {
+	test("verifyDiff:false mints NO worktree and runs NO verify", async () => {
+		// The type is `boolean | {check?}`, so `verifyDiff: computedFlag` can pass
+		// `false`. Gating on `!== undefined` minted a surprise worktree and could null
+		// the result; truthiness gating makes `false` byte-identical to absent.
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager();
+		const verifyCalls: unknown[] = [];
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			directory: "/repo/main",
+			verifyResult: async (v) => {
+				verifyCalls.push(v);
+				return { passed: false, available: true }; // would null the result if run
+			},
+		});
+
+		expect(await agent("mutate", { verifyDiff: false })).toBe("OK");
+		expect(manager.creates).toHaveLength(0);
+		expect(verifyCalls).toHaveLength(0);
+		// Launched in the run-wide directory, exactly like a plain agent.
+		expect(runner.launches[0]?.directory).toBe("/repo/main");
+	});
+
+	test("verifyDiff:{} (empty object) still verifies — only literal false is inert", async () => {
+		const runner = new FakeRunner({ status: "completed", summaryText: "OK" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		});
+		const verifyCalls: unknown[] = [];
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			verifyResult: async (v) => {
+				verifyCalls.push(v);
+				return { passed: true, available: true };
+			},
+		});
+
+		expect(await agent("mutate", { verifyDiff: {} })).toBe("OK");
+		expect(manager.creates).toHaveLength(1);
+		expect(verifyCalls).toHaveLength(1);
+	});
 });
 
 // ---- Task 2.1.5: pre-launch checkpoint barrier ---------------------------
@@ -1807,6 +1933,85 @@ describe("createAgentPrimitive — skills injection (Task 2.2.2)", () => {
 		await expect(agent("do it", { skills: ["ring:typo"] })).rejects.toThrow(
 			/Unknown skill: "ring:typo"/,
 		);
+		expect(runner.launches).toHaveLength(0);
+	});
+
+	test("an unknown skill emits a skill_not_found diagnostic + a noted agent:end (no reasonless ✗)", async () => {
+		// #11: the skill-failure path used to be the ONLY error path producing a
+		// reasonless error end in the feed. It must now carry a typed diagnostic and
+		// a human note, while STILL throwing to the script (fail-loud unchanged).
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent, events, diags } = harness({
+			runner,
+			resolveSkills: async () => {
+				throw new FakeSkillNotFoundError("ring:typo");
+			},
+		});
+		await expect(agent("do it", { skills: ["ring:typo"] })).rejects.toThrow();
+		expect(diags).toHaveLength(1);
+		expect(diags[0]?.reason).toBe("skill_not_found");
+		const end = events.find((e) => e.type === "agent:end") as {
+			status: string;
+			note?: string;
+		};
+		expect(end.status).toBe("error");
+		expect(end.note).toContain("skill_not_found");
+		// A visible start/end pair framed the failure for the feed.
+		expect(events.some((e) => e.type === "agent:start")).toBe(true);
+	});
+
+	test("skills resolve BEFORE the worktree mint — a typo never burns a mint", async () => {
+		// #11: a created worktree is a real resource (checkout + scratch branch).
+		// Resolution order: gate → skills → mint, so the authoring bug aborts first.
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const manager = recordingWorktreeManager({
+			createReturns: { dir: "/tmp/wf/run-1/iso", branch: "wf/run-1/iso" },
+		});
+		const { agent } = harness({
+			runner,
+			worktreeManager: manager,
+			resolveSkills: async () => {
+				throw new FakeSkillNotFoundError("ring:typo");
+			},
+		});
+		await expect(
+			agent("do it", { skills: ["ring:typo"], isolation: "worktree" }),
+		).rejects.toThrow();
+		expect(manager.creates).toHaveLength(0);
+		expect(manager.cleanups).toHaveLength(0);
+	});
+
+	test("the skill throw does not poison the gate — a follow-up call still launches", async () => {
+		// The early-abort path must release its concurrency slot. A limit-1 gate would
+		// deadlock the second call if the first leaked its slot.
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const gate = new ConcurrencyManager({ defaultConcurrency: 1 });
+		let firstCall = true;
+		const { agent } = harness({
+			runner,
+			gate,
+			resolveSkills: async (names) => {
+				if (firstCall) {
+					firstCall = false;
+					throw new FakeSkillNotFoundError(names[0] ?? "?");
+				}
+				return [];
+			},
+		});
+		await expect(agent("a", { skills: ["ring:typo"] })).rejects.toThrow();
+		expect(await agent("b", { skills: ["ring:ok"] })).toBe("DONE");
+	});
+
+	test("a NON-SkillNotFound resolveSkills rejection degrades to null (await_failed), not a throw", async () => {
+		const runner = new FakeRunner({ summaryText: "DONE" });
+		const { agent, diags } = harness({
+			runner,
+			resolveSkills: async () => {
+				throw new Error("disk exploded");
+			},
+		});
+		expect(await agent("do it", { skills: ["ring:a"] })).toBeNull();
+		expect(diags[0]?.reason).toBe("await_failed");
 		expect(runner.launches).toHaveLength(0);
 	});
 

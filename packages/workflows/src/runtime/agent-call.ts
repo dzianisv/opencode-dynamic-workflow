@@ -338,6 +338,9 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		if (reason === "merge_conflict") {
 			return "merge_conflict — worktree merge-back conflicted; worktree preserved for Tier 2 resolution";
 		}
+		if (reason === "skill_not_found") {
+			return "skill_not_found — unknown skill name; the step aborted before launch (fail-loud authoring contract)";
+		}
 		const raw =
 			rawLen !== undefined ? `; raw ${humanizeChars(rawLen)} preserved` : "";
 		return `null — ${reason}${raw}`;
@@ -490,6 +493,50 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// 5. Gate the launch on the run's concurrency slots.
 		await gate.acquire(runId);
 
+		// 5s. skills (Epic 2.2): resolve canonical skill names to synthetic
+		// contextParts BEFORE the worktree mint, so an authoring typo fails before
+		// burning a mint (a created worktree is a real resource: a checkout + a
+		// scratch branch). Fail-loud contract: an unknown name (SkillNotFoundError)
+		// ABORTS the call by THROWING to the script — but it still releases the held
+		// slot, emits a visible start/end pair, and fires a typed skill_not_found
+		// diagnostic so the feed's ✗ carries a reason. Any OTHER resolveSkills
+		// rejection keeps the degrade-to-null discipline (await_failed), matching the
+		// pre-launch fencing of the rest of this body. ABSENT seam → inert.
+		let skillParts: Array<{ type: "text"; text: string; synthetic: true }> = [];
+		if (opts.skills?.length && resolveSkills !== undefined) {
+			try {
+				skillParts = await resolveSkills(opts.skills);
+			} catch (err) {
+				gate.release(runId);
+				emit({
+					type: "agent:start",
+					label,
+					phase,
+					promptPreview: promptPreviewOf(prompt),
+				});
+				const skillMiss =
+					err instanceof Error && err.name === "SkillNotFoundError";
+				const reason: DiagnosticReason = skillMiss
+					? "skill_not_found"
+					: "await_failed";
+				emit({
+					type: "warn",
+					message: `agent '${label}' failed: ${describeError(err)}`,
+				});
+				onDiagnostic?.({ label, index, reason });
+				emit({
+					type: "agent:end",
+					label,
+					status: "error",
+					note: diagnosticNote(reason),
+				});
+				if (skillMiss) {
+					throw err;
+				}
+				return null;
+			}
+		}
+
 		// 5w. Per-agent worktree isolation (Epic H.1.2). Minted AFTER gate.acquire — a
 		// created worktree holds a real resource (a checkout + scratch branch), so we
 		// do not mint one the gate would have rejected. On success the worktree's dir
@@ -510,8 +557,13 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// degrade-to-null on a mint miss (the script demanded a guarantee), while an
 		// IMPLIED isolation (verifyDiff-only) falls through to run unisolated on a mint
 		// miss — honoring verifyDiff's INERT-on-no-shell contract (types.ts:60-66).
+		// Gate on TRUTHINESS, not presence: `verifyDiff: false` (a computed flag) must
+		// behave exactly like an absent option — no surprise worktree, no check.
+		// `verifySpec` collapses `false` to undefined ONCE so both this gate and the
+		// post-settle verify (§ verifyDiff below) read the same narrowed value.
 		const explicitIsolation = opts.isolation === "worktree";
-		const wantsIsolation = explicitIsolation || opts.verifyDiff !== undefined;
+		const verifySpec = opts.verifyDiff === false ? undefined : opts.verifyDiff;
+		const wantsIsolation = explicitIsolation || verifySpec !== undefined;
 		if (wantsIsolation) {
 			// Fold the unique per-call `index` into the mint key so the worktree manager
 			// (which derives both the branch and the checkout dir from this label and
@@ -640,6 +692,16 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 		// the agent degrades to null (the finally returns null and journals nothing, so a
 		// resumed run re-attempts). Set in the worktree settle; read by the finally.
 		let mergeFailed = false;
+		// Verify GATES the merge for an isolated agent: a failed post-condition makes
+		// the finally's settle SKIP the merge-back and PRESERVE the worktree + scratch
+		// branch (recoverable) instead of landing failed work on the main branch. Set
+		// in the verify block below; read by settleWorktree in the finally.
+		let verifyFailed = false;
+		// The catch below RETHROWS a SkillNotFoundError (fail-loud authoring contract).
+		// The finally's conflict/merge_failed value-substituting returns are only safe
+		// when NO exception is in flight — this flag tells them to stand down so they
+		// never swallow the rethrow.
+		let rethrowing = false;
 		// The try body's settled non-null result, hoisted so the finally can journal it
 		// AFTER the worktree merge-back settles (a conflict supersedes it). For a
 		// worktree agent the `onRecord` is deferred to the finally; this carries the
@@ -654,19 +716,13 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 				promptPreview: promptPreviewOf(prompt),
 			});
 
-			// 6a. skills (Epic 2.2): resolve canonical skill names to synthetic
-			// contextParts and merge them FIRST (so they precede any contextDiff part).
-			// Deliberately OUTSIDE a fence: an unknown skill name throws a SkillNotFoundError
-			// that must ABORT the launch (re-thrown past the degrade-to-null catch below),
-			// NOT be swallowed to a silent null — fail-loud is the contract (the deliberate
-			// contrast with contextDiff, where empty/error degrades quietly). ABSENT seam →
-			// skills is inert (no parts, no throw).
+			// 6a. skills (Epic 2.2): merge the PRE-RESOLVED skill parts FIRST (so they
+			// precede any contextDiff part). Resolution itself moved to 5s — BEFORE the
+			// worktree mint — so an unknown skill name aborts before a mint is burned;
+			// the fail-loud throw and its diagnostics live there.
 			const contextParts: { type: "text"; text: string; synthetic: true }[] =
 				[];
-			if (opts.skills?.length && resolveSkills !== undefined) {
-				const parts = await resolveSkills(opts.skills);
-				contextParts.push(...parts);
-			}
+			contextParts.push(...skillParts);
 
 			// 6b. contextDiff (Epic 4.1): resolve the engine-computed real git diff
 			// (since run start) for a review. The diff rides a SYNTHETIC contextPart, not
@@ -699,7 +755,16 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 						status = "error";
 						return null;
 					}
-					contextParts.push({ type: "text", text: diff.text, synthetic: true });
+					// `!isEmpty` no longer implies non-empty TEXT: the emptiness verdict
+					// also counts UNTRACKED files (which `git diff` cannot render). An
+					// untracked-only delta runs the review but injects no empty diff part.
+					if (diff.text.trim().length > 0) {
+						contextParts.push({
+							type: "text",
+							text: diff.text,
+							synthetic: true,
+						});
+					}
 				}
 			}
 
@@ -831,13 +896,17 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// result to null so it RE-RUNS on resume (a hollow success is never
 			// journaled) — the #7 fix against a settled-but-empty unit. available:false
 			// (no-shell / non-git) is INERT: the result survives, never a fabricated
-			// failure. The downgrade nulls the RESULT only; it does NOT un-commit — the
-			// engine still checkpoints this agent (the bytes are on disk; agent:end still
-			// carries the sessionID), so P2 recovery holds. Fenced: a thrown verify
-			// degrades to pass-through, never a thrown agent() (degrade, don't detonate).
-			// Runs only when the agent itself produced a result to verify.
+			// failure. For an UNISOLATED agent the downgrade nulls the RESULT only; it
+			// does NOT un-commit — the engine still checkpoints it (the bytes are on
+			// disk; agent:end still carries the sessionID), so P2 recovery holds. For an
+			// ISOLATED agent, verify GATES the merge: `verifyFailed` makes the finally's
+			// settle PRESERVE the worktree+scratch branch instead of merging, so failed
+			// work never silently lands on the main branch (and a resume never re-runs
+			// the agent on top of its own landed edits). Fenced: a thrown verify
+			// degrades to pass-through, never a thrown agent() (degrade, don't
+			// detonate). Runs only when the agent itself produced a result to verify.
 			if (
-				opts.verifyDiff !== undefined &&
+				verifySpec !== undefined &&
 				verifyResult !== undefined &&
 				result !== null &&
 				result !== undefined
@@ -847,7 +916,7 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					| undefined;
 				try {
 					verdict = await verifyResult({
-						verifyDiff: opts.verifyDiff,
+						verifyDiff: verifySpec,
 						...(sessionId !== undefined ? { sessionId } : {}),
 						// Epic H.1.3: re-root the verify shell to the WORKTREE checkout for
 						// an isolated agent — its edits live there, not in the main tree.
@@ -858,7 +927,11 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 					verdict = undefined;
 				}
 				if (verdict !== undefined && verdict.available && !verdict.passed) {
-					endNote = diagnosticNote("verify_failed");
+					verifyFailed = true;
+					endNote =
+						worktree !== undefined
+							? `${diagnosticNote("verify_failed")} — worktree preserved on branch ${worktree.branch} (NOT merged)`
+							: diagnosticNote("verify_failed");
 					onDiagnostic?.({
 						label,
 						index,
@@ -890,14 +963,16 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			}
 			return result;
 		} catch (err) {
-			// Fail-loud exception (Epic 2.2): an unknown skill name (resolveSkills →
-			// SkillNotFoundError, resolved at 6a above the launch) is an authoring bug that
-			// must reach the script as a real error, NOT degrade to a silent null like a
-			// launch/await failure. Discriminated structurally by name so the runtime stays
-			// plugin-agnostic (the error class lives in the plugin layer). Re-thrown here,
-			// before the worktree-settle finally — no worktree did real work (the launch
-			// never happened), so the finally's conflict/mergeFailed overrides cannot fire.
+			// Fail-loud exception (Epic 2.2): an unknown skill name (SkillNotFoundError)
+			// is an authoring bug that must reach the script as a real error, NOT degrade
+			// to a silent null like a launch/await failure. Skills now resolve at 5s
+			// (before the mint and before this try), so this branch is a DEFENSIVE
+			// backstop; discriminated structurally by name so the runtime stays
+			// plugin-agnostic. `rethrowing` tells the finally's conflict/mergeFailed
+			// value-substituting returns to stand down — a `return` in a finally would
+			// otherwise SWALLOW this in-flight exception.
 			if (err instanceof Error && err.name === "SkillNotFoundError") {
+				rethrowing = true;
 				throw err;
 			}
 			// launch()/awaitCompletion() throwing is a degrade, not a detonation.
@@ -933,11 +1008,25 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			if (worktree !== undefined && worktreeManager !== undefined) {
 				const mgr = worktreeManager;
 				const wt = worktree;
-				// The serialized settle: unchanged → cleanup (CC auto-cleanup-if-
-				// unchanged, no merge commit); else mergeBack from the main tree. A clean
-				// merge (or a non-conflict {failed}) → cleanup; a real CONFLICT → preserve
-				// the worktree+branch (SKIP cleanup) for Tier 2 and surface merge_conflict.
+				// The serialized settle: a FAILED VERIFY gates the merge (preserve, never
+				// land failed work); unchanged → cleanup (CC auto-cleanup-if-unchanged, no
+				// merge commit); else mergeBack from the main tree. A clean merge →
+				// cleanup; a real CONFLICT or a non-conflict {failed} → preserve the
+				// worktree+branch (SKIP cleanup) for Tier 2 / recovery.
 				const settleWorktree = async (): Promise<void> => {
+					if (verifyFailed) {
+						// Verify GATES the merge (the #2 semantic): the post-condition failed,
+						// so the worktree's work must NOT land on the main branch — merging it
+						// would silently ship failed work AND make a resume re-run the agent on
+						// top of its own landed edits. PRESERVE the worktree + scratch branch
+						// exactly like the conflict path (recoverable; the startup sweep
+						// reclaims it if abandoned) and name the branch loud.
+						emit({
+							type: "warn",
+							message: `agent '${label}' verify FAILED — its work was NOT merged; worktree preserved on branch ${wt.branch} for inspection/recovery`,
+						});
+						return;
+					}
 					if (await mgr.isUnchanged(wt.dir)) {
 						await mgr.cleanup(wt.dir, wt.branch);
 						return;
@@ -1041,19 +1130,20 @@ export function createAgentPrimitive(deps: AgentPrimitiveDeps): AgentFn {
 			// A `return` in the finally overrides whatever the try returned (the agent's
 			// text), so the script receives the first-class `{status:'conflict', …}`
 			// result. Only on conflict — a clean settle leaves the try's return intact.
-			// The override is SAFE here: the catch above always resolves to `return null`
-			// and never rethrows, so there is no in-flight exception/return for this to
-			// swallow — it is a deliberate value substitution (locked design decision #2).
-			if (conflictResult !== undefined) {
-				// biome-ignore lint/correctness/noUnsafeFinally: deliberate Tier 1 conflict result override; catch never rethrows (see comment above).
+			// THE REAL INVARIANT: the catch above degrades every error to `return null`
+			// EXCEPT a SkillNotFoundError, which it RETHROWS with `rethrowing` set. A
+			// finally `return` while that exception is in flight would SWALLOW it — so
+			// both value-substituting returns are guarded on `!rethrowing` (a deliberate
+			// substitution is only safe when nothing is propagating).
+			if (conflictResult !== undefined && !rethrowing) {
+				// biome-ignore lint/correctness/noUnsafeFinally: deliberate Tier 1 conflict result override; guarded on !rethrowing so an in-flight rethrow is never swallowed (see comment above).
 				return conflictResult;
 			}
 			// merge_failed degrades the agent to null (the work did not reach the main
-			// tree; the worktree+branch are preserved for recovery). Same safe override as
-			// the conflict path: the catch never rethrows, so substituting the value
-			// swallows no in-flight exception.
-			if (mergeFailed) {
-				// biome-ignore lint/correctness/noUnsafeFinally: deliberate merge_failed degrade-to-null; catch never rethrows (see comment above).
+			// tree; the worktree+branch are preserved for recovery). Same guarded
+			// substitution as the conflict path.
+			if (mergeFailed && !rethrowing) {
+				// biome-ignore lint/correctness/noUnsafeFinally: deliberate merge_failed degrade-to-null; guarded on !rethrowing so an in-flight rethrow is never swallowed (see comment above).
 				return null;
 			}
 		}

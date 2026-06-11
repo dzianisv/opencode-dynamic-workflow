@@ -53,7 +53,8 @@ function fakeEngine(opts: {
 
 const DIR = "/proj";
 const SCRIPT_PATH = "/data/workflow-scripts/wf_1.js";
-const VALID = 'export const meta = { name: "saved", description: "d" }\nreturn 1';
+const VALID =
+	'export const meta = { name: "saved", description: "d" }\nreturn 1';
 const DEST = "/proj/.opencode/workflows/myflow.js";
 
 describe("saveRunAsWorkflow", () => {
@@ -84,19 +85,21 @@ describe("saveRunAsWorkflow", () => {
 		expect(fs.files.has(DEST)).toBe(false);
 	});
 
-	test.each([["../escape"], [""], ["a/b"], [".."]])(
-		"a bad name %p refuses and writes nothing",
-		async (badName) => {
-			const fs = makeFs({ [SCRIPT_PATH]: VALID });
-			const engine = fakeEngine({ runId: "wf_1", scriptPath: SCRIPT_PATH });
-			const r = await saveRunAsWorkflow(
-				{ engine, fs, directory: DIR },
-				{ runId: "wf_1", name: badName },
-			);
-			expect(r.ok).toBe(false);
-			expect([...fs.files.keys()]).toEqual([SCRIPT_PATH]);
-		},
-	);
+	test.each([
+		["../escape"],
+		[""],
+		["a/b"],
+		[".."],
+	])("a bad name %p refuses and writes nothing", async (badName) => {
+		const fs = makeFs({ [SCRIPT_PATH]: VALID });
+		const engine = fakeEngine({ runId: "wf_1", scriptPath: SCRIPT_PATH });
+		const r = await saveRunAsWorkflow(
+			{ engine, fs, directory: DIR },
+			{ runId: "wf_1", name: badName },
+		);
+		expect(r.ok).toBe(false);
+		expect([...fs.files.keys()]).toEqual([SCRIPT_PATH]);
+	});
 
 	test("a built-in name refuses (would never load)", async () => {
 		const fs = makeFs({ [SCRIPT_PATH]: VALID });

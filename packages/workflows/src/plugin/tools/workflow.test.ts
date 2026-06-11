@@ -605,6 +605,64 @@ describe("createWorkflowTool — spec_path coercion (Issue 6)", () => {
 			expect(calls[0]?.specPath).toBeUndefined();
 		}
 	});
+
+	test("a spec_path escaping the project directory is REJECTED at the tool boundary (#6)", async () => {
+		// spec_path is model-supplied: `join(directory, '../../etc/passwd')` used to
+		// escape the repo (and the engine would later COPY it into worktrees). The
+		// tool must refuse with an honest error and never reach startRun.
+		for (const escapee of [
+			"../outside.md",
+			"../../etc/passwd",
+			"docs/../../outside.md",
+			"/etc/passwd",
+		]) {
+			const calls: { specPath?: string }[] = [];
+			const { facade } = makeFs();
+			const t = createWorkflowTool(stubEngine(calls), {
+				directory: DIRECTORY,
+				fs: facade,
+			});
+			const out = await run(
+				t,
+				{ script: HANGING, spec_path: escapee },
+				ctx("ses_parent"),
+			);
+			expect(out).toContain("spec_path must resolve inside the project");
+			expect(calls).toHaveLength(0);
+		}
+	});
+
+	test("an ABSOLUTE spec_path under the project directory normalizes to repo-relative (#6)", async () => {
+		// The documented contract is "repo-relative or absolute" — joinPath used to
+		// MANGLE an absolute path by re-rooting it under the project directory.
+		const calls: { specPath?: string }[] = [];
+		const { facade } = makeFs();
+		const t = createWorkflowTool(stubEngine(calls), {
+			directory: DIRECTORY,
+			fs: facade,
+		});
+		await run(
+			t,
+			{ script: HANGING, spec_path: "/proj/docs/plans/plan.md" },
+			ctx("ses_parent"),
+		);
+		expect(calls[0]?.specPath).toBe("docs/plans/plan.md");
+	});
+
+	test("a repo-relative spec_path with an INTERNAL ../ that stays inside normalizes cleanly (#6)", async () => {
+		const calls: { specPath?: string }[] = [];
+		const { facade } = makeFs();
+		const t = createWorkflowTool(stubEngine(calls), {
+			directory: DIRECTORY,
+			fs: facade,
+		});
+		await run(
+			t,
+			{ script: HANGING, spec_path: "docs/sub/../plans/plan.md" },
+			ctx("ses_parent"),
+		);
+		expect(calls[0]?.specPath).toBe("docs/plans/plan.md");
+	});
 });
 
 describe("createWorkflowTool — resume", () => {

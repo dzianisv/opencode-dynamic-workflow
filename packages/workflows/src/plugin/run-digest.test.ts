@@ -142,6 +142,32 @@ describe("renderRunDigest", () => {
 		).toBe(true);
 	});
 
+	test("a stale on-disk record (missing description, bad timestamps) renders defensively", () => {
+		// The persistence layer validates only id/parentSessionID/status — a stale
+		// record may lack the rest. The header must never print 'undefined' or NaN.
+		const stale = {
+			id: "wf_stale",
+			parentSessionID: "ses_p",
+			status: "completed",
+		} as unknown as RunRecord;
+		const digest = renderRunDigest(stale);
+		const header = digest.split("\n")[0] ?? "";
+		expect(header).toContain("Workflow wf_stale '(unknown)' completed");
+		expect(header).not.toContain("undefined");
+		expect(header).not.toContain("NaN");
+		expect(digest).toContain("Inspect with workflow_status run_id=wf_stale.");
+	});
+
+	test("a non-finite createdAt suppresses the duration segment", () => {
+		const digest = renderRunDigest(
+			record({ createdAt: Number.NaN, completedAt: 5000 }),
+		);
+		const header = digest.split("\n")[0] ?? "";
+		expect(header).toContain("Workflow wf_abc 'demo' completed —");
+		expect(header).not.toContain(" in ");
+		expect(header).not.toContain("NaN");
+	});
+
 	test("an error run still renders its agents (post-mortem)", () => {
 		const digest = renderRunDigest(
 			record({

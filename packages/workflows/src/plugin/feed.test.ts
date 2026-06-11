@@ -519,4 +519,66 @@ describe("readFeedCounts", () => {
 		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
 		expect(counts.checkpoints).toEqual([]);
 	});
+
+	test("a checkpoint line with a MISSING/garbage label harvests as '(unknown)', never poisons the ledger (#14)", async () => {
+		// Valid JSON but a malformed line: `paths` was guarded, `label` was not — a
+		// label-less line used to land `label: undefined` in the rehydrated ledger
+		// (which the render paths assume is a string).
+		const noLabel = JSON.stringify({
+			type: "agent:checkpoint",
+			sha: "feedface",
+			paths: ["x.ts"],
+			at: 1,
+		});
+		const numericLabel = JSON.stringify({
+			type: "agent:checkpoint",
+			label: 42,
+			paths: ["y.ts"],
+			at: 2,
+		});
+		const path = "/feed/wf_badlabel.jsonl";
+		const counts = await readFeedCounts(
+			path,
+			readFs(path, `${noLabel}\n${numericLabel}`),
+		);
+		expect(counts.checkpoints).toEqual([
+			{ sha: "feedface", paths: ["x.ts"], label: "(unknown)" },
+			{ paths: ["y.ts"], label: "(unknown)" },
+		]);
+	});
+
+	test("phase and shared on a checkpoint line are carried into the rehydrated ledger (#14)", async () => {
+		const events: FeedEvent[] = [
+			{
+				type: "agent:checkpoint",
+				label: "agent-a",
+				sessionID: "ses_a",
+				sha: "abc1234",
+				paths: ["a.ts"],
+				phase: "Implement",
+				shared: true,
+				at: 1,
+			},
+			{
+				// A merge-back ledger line: no sessionID, no phase — still harvests.
+				type: "agent:checkpoint",
+				label: "iso-0",
+				sha: "def5678",
+				paths: ["b.ts"],
+				at: 2,
+			},
+		];
+		const path = "/feed/wf_phase.jsonl";
+		const counts = await readFeedCounts(path, readFs(path, feedFile(events)));
+		expect(counts.checkpoints).toEqual([
+			{
+				sha: "abc1234",
+				paths: ["a.ts"],
+				label: "agent-a",
+				phase: "Implement",
+				shared: true,
+			},
+			{ sha: "def5678", paths: ["b.ts"], label: "iso-0" },
+		]);
+	});
 });

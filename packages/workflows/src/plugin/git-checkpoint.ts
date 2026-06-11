@@ -10,11 +10,15 @@
  * Granularity (the epic's redefinition): per-agent-call on ONE shared working tree,
  * commit-and-continue — HEAD advances, the tree is NEVER reset. A later dependent
  * agent therefore sees prior agents' edits because they live committed on the same
- * tree. Independent parallel agents touching DISJOINT paths each get their own
- * sequential commit (the engine serializes the chain). Two agents racing the SAME
- * path is an intra-unit collision commits cannot PREVENT — H.1 (worktree isolation)
- * owns prevention; P2 makes the loser's overwrite recoverable, which is the honest
- * contract.
+ * tree. Under `parallel()` with UNISOLATED agents the attribution is HONESTLY
+ * APPROXIMATE: the first-settling agent's checkpoint commits EVERYTHING dirty-and-
+ * not-baseline at that moment — including a still-running sibling's half-written
+ * files — under the first agent's label (the engine marks such checkpoints
+ * `shared`). Per-agent attribution under parallel mutation requires isolation
+ * (H.1 worktrees); on the shared tree, P2's contract is recoverability, not
+ * attribution. Two agents racing the SAME path is likewise an intra-unit collision
+ * commits cannot PREVENT — H.1 owns prevention; P2 makes the loser's overwrite
+ * recoverable, which is the honest contract.
  *
  * Operator safety (refuse-don't-stomp): the checkpointer NEVER `git add -A`. At run
  * start it snapshots the paths ALREADY dirty (the operator's in-flight edits) and
@@ -143,6 +147,16 @@ export interface Checkpointer {
 	 * checkpointer is dead. Fenced — never rejects.
 	 */
 	discard(): Promise<void>;
+	/**
+	 * Startup sweep (mirrors the worktree manager's `sweep()`): delete EVERY stale
+	 * `refs/wf-checkpoints/*` marker. A run that crashed between checkpoint and
+	 * terminal leaves its marker behind, GC-pinning its checkpoint commits forever —
+	 * promote()/discard() never ran. Called once at engine ready, BEFORE any run
+	 * starts, so every marker found is by construction stale (same single-engine
+	 * assumption the worktree sweep already makes). Fenced — never rejects; no-op on
+	 * a dead/no-shell checkpointer.
+	 */
+	sweepMarkers(): Promise<void>;
 }
 
 export interface CreateGitCheckpointerOptions {
@@ -191,6 +205,19 @@ export function parsePorcelain(stdout: string): string[] {
 		}
 	}
 	return out;
+}
+
+/**
+ * Whether a path must be passed to git via `--pathspec-from-file=-` (stdin)
+ * instead of argv interpolation. Bun's shell LEXER corrupts non-ASCII template
+ * interpolations (observed on Bun 1.3.10: `café.txt` reaches git as
+ * `cafcafé.txt`, even through `{raw}`), so a non-ASCII pathspec on argv fails
+ * and the path silently vanishes from the checkpoint (#7). stdin bytes are not
+ * lexed → exact.
+ */
+function needsStdinPathspec(path: string): boolean {
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: the ASCII range test is the point.
+	return /[^\x00-\x7F]/.test(path);
 }
 
 /** Strip git's C-style quoting from a porcelain path (only quoted when special). */
@@ -344,8 +371,12 @@ export function createGitCheckpointer(
 		if (dead) {
 			return [];
 		}
+		// `-c core.quotePath=false`: with quoting ON, git C-quotes a non-ASCII path
+		// (`"caf\303\251.txt"`) and the unquoter strips only the wrapping quotes, not
+		// the octal escapes — the later `git add -- <mangled>` pathspec then fails and
+		// the path is silently dropped from the checkpoint (unrecoverable work).
 		const res =
-			await git()`git -c diff.renames=false status --porcelain`.quiet();
+			await git()`git -c core.quotePath=false -c diff.renames=false status --porcelain`.quiet();
 		if (res.exitCode !== 0) {
 			return [];
 		}
@@ -384,7 +415,21 @@ export function createGitCheckpointer(
 				? await git()`git diff ${base}`.quiet()
 				: await git()`git diff`.quiet();
 		const text = res.exitCode === 0 ? readText(res) : "";
-		return { text, isEmpty: text.trim().length === 0, available: true };
+		// EMPTINESS must not be blind to UNTRACKED files: `git diff` never lists them,
+		// so an agent whose only output is a NEW module would read as "empty" and a
+		// verifyDiff post-condition would falsely fail it (and an empty-diff review
+		// refusal would falsely fire). Probe porcelain alongside the diff and subtract
+		// the operator's baseline-dirty set (a pre-existing untracked file is not run
+		// work). The TEXT stays the raw `git diff` — contextDiff consumers keep their
+		// exact diff; only the emptiness VERDICT widens.
+		const newDirty = (await dirtyPaths()).filter(
+			(p) => !preexistingDirty.has(p),
+		);
+		return {
+			text,
+			isEmpty: text.trim().length === 0 && newDirty.length === 0,
+			available: true,
+		};
 	}
 
 	async function checkpoint(meta: CheckpointMeta): Promise<CheckpointResult> {
@@ -426,10 +471,16 @@ export function createGitCheckpointer(
 
 		// (5) Stage ONLY explicit pathspecs — NEVER `git add -A`. Each path is its own
 		// fenced add so one bad pathspec cannot abort the rest; a failed add drops that
-		// path from the commit set rather than throwing.
+		// path from the commit set rather than throwing. A NON-ASCII path is routed via
+		// `--pathspec-from-file=-` on stdin: Bun's shell lexer corrupts non-ASCII argv
+		// interpolations (`café.txt` reaches git as `cafcafé.txt`), so the argv add
+		// would fail and the path would silently vanish from the checkpoint (#7).
 		const staged: string[] = [];
 		for (const path of toCommit) {
-			const add = await git()`git add -- ${path}`.quiet();
+			const stdinPath = needsStdinPathspec(path);
+			const add = stdinPath
+				? await git()`git add --pathspec-from-file=- < ${Buffer.from(`${path}\n`, "utf-8")}`.quiet()
+				: await git()`git add -- ${path}`.quiet();
 			if (add.exitCode === 0) {
 				staged.push(path);
 				continue;
@@ -439,10 +490,18 @@ export function createGitCheckpointer(
 			// mv` both produce, porcelain column-1 `D`) makes `git add -- <path>` fail
 			// with `fatal: pathspec did not match any files`, yet the deletion is already
 			// in the index and the scoped `git commit -- <staged>` commits it. Probe the
-			// index before dropping the path: if `--cached --name-only` lists it, keep it.
-			const cached =
-				await git()`git diff --cached --name-only -- ${path}`.quiet();
-			if (cached.exitCode === 0 && readText(cached).trim().length > 0) {
+			// index before dropping the path: if the cached set lists it, keep it. The
+			// non-ASCII probe lists the WHOLE cached set and checks membership in JS
+			// (argv-free, lexer-safe); the ASCII probe stays pathspec-scoped.
+			const cached = stdinPath
+				? await git()`git -c core.quotePath=false diff --cached --name-only`.quiet()
+				: await git()`git diff --cached --name-only -- ${path}`.quiet();
+			const cachedHit = stdinPath
+				? readText(cached)
+						.split("\n")
+						.some((l) => l.trim() === path)
+				: cached.exitCode === 0 && readText(cached).trim().length > 0;
+			if (cached.exitCode === 0 && cachedHit) {
 				staged.push(path);
 			} else {
 				logger?.warn("git checkpoint add failed; skipping path", {
@@ -469,8 +528,9 @@ export function createGitCheckpointer(
 		// too, not just worktree-dirty paths. BunShell escapes the interpolated array
 		// element-wise, so each pathspec is a single safely-quoted argument.
 		const message = commitMessageFor(meta);
-		const commit =
-			await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} -- ${staged}`.quiet();
+		const commit = staged.some(needsStdinPathspec)
+			? await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} --pathspec-from-file=- < ${Buffer.from(`${staged.join("\n")}\n`, "utf-8")}`.quiet()
+			: await git()`git -c user.name=${ENGINE_USER_NAME} -c user.email=${ENGINE_USER_EMAIL} commit --no-verify -m ${message} -- ${staged}`.quiet();
 		if (commit.exitCode !== 0) {
 			logger?.warn("git checkpoint commit failed", {
 				runId: meta.runId,
@@ -549,24 +609,41 @@ export function createGitCheckpointer(
 			return;
 		}
 		const ref = checkpointRefFor(ownRunId);
-		// (a) Current branch tip and (b) the run's marker tip.
+		// (a) Current branch tip and (b) the run's marker tip (forensic warn context).
 		const branch = await git()`git rev-parse HEAD`.quiet();
 		const branchTip = branch.exitCode === 0 ? readText(branch).trim() : "";
 		const marker = await git()`git rev-parse ${ref}`.quiet();
 		const markerTip = marker.exitCode === 0 ? readText(marker).trim() : "";
-		// (c) OPERATOR-LAYERING GUARD: rewind ONLY when a baseline exists, the marker
-		// tip read succeeded, and the branch tip still equals the marker tip (nothing
-		// was layered on top of the run's last checkpoint). Otherwise SKIP the rewind —
-		// blindly repointing to baseline would discard an operator's / another run's
-		// commit. A NON-destructive `update-ref HEAD <baseline>`: it follows the
-		// checked-out branch symref and moves ONLY the pointer, never the index/working
-		// tree, so the abandoned run's edits survive on disk as uncommitted changes.
-		if (
-			baselineHead !== null &&
-			markerTip.length > 0 &&
-			branchTip === markerTip
-		) {
-			const rewind = await git()`git update-ref HEAD ${baselineHead}`.quiet();
+		// (c) FOREIGN-COMMIT GUARD: rewind ONLY when a baseline exists AND every
+		// commit in `baseline..HEAD` carries THIS run's forensic `run=<runId>` marker
+		// in its subject (checkpoint commits, worktree scratch commits, and merge-back
+		// commits all stamp it). A bare tip-equality check is NOT enough: two
+		// CONCURRENT runs interleave checkpoint commits on one branch, so run A's
+		// rewind-to-baseline would orphan run B's commits even when A's marker happens
+		// to sit at the tip. ANY foreign commit in the range (an operator's, a sibling
+		// run's) → SKIP the rewind (keep the marker cleanup) and warn. A NON-destructive
+		// `update-ref HEAD <baseline>`: it follows the checked-out branch symref and
+		// moves ONLY the pointer, never the index/working tree, so the abandoned run's
+		// edits survive on disk as uncommitted changes.
+		const base = baselineHead;
+		let ownsRange = base !== null;
+		if (base !== null && ownsRange) {
+			const log = await git()`git log --format=%s ${base}..HEAD`.quiet();
+			if (log.exitCode !== 0) {
+				ownsRange = false;
+			} else {
+				const runMarker = `run=${ownRunId}`;
+				for (const raw of readText(log).split("\n")) {
+					const subject = raw.trim();
+					if (subject.length > 0 && !subject.includes(runMarker)) {
+						ownsRange = false;
+						break;
+					}
+				}
+			}
+		}
+		if (base !== null && ownsRange) {
+			const rewind = await git()`git update-ref HEAD ${base}`.quiet();
 			if (rewind.exitCode !== 0) {
 				logger?.debug("git checkpoint discard rewind failed", {
 					runId: ownRunId,
@@ -574,13 +651,14 @@ export function createGitCheckpointer(
 				});
 			}
 		} else {
-			// Diverged or no baseline: surface the residue SHA(s) the operator can
+			// A foreign commit in the range (operator / concurrent run), an unreadable
+			// log, or no baseline: surface the residue SHA(s) the operator can
 			// inspect/clean before GC (ISSUES.md Issue 1 fallback).
 			logger?.warn(
-				"git checkpoint discard skipped the branch rewind: the branch tip no " +
-					"longer matches this run's checkpoint marker (work was layered on top, " +
-					"or there is no run-start baseline) — the run's checkpoint commits are " +
-					"left in place; inspect/clean them manually",
+				"git checkpoint discard skipped the branch rewind: the baseline..tip " +
+					"range contains commits that do not belong to this run (an operator's " +
+					"or a concurrent run's), or there is no run-start baseline — this " +
+					"run's checkpoint commits are left in place; inspect/clean them manually",
 				{ runId: ownRunId, markerTip, branchTip, baselineRef: baselineHead },
 			);
 		}
@@ -595,6 +673,32 @@ export function createGitCheckpointer(
 		}
 	}
 
+	async function sweepMarkers(): Promise<void> {
+		// Liveness via ready() (idempotent probe; presumedAlive instances adopt the
+		// upstream verdict). Dead/no-shell → silent no-op.
+		if (!(await ready())) {
+			return;
+		}
+		const refs =
+			await git()`git for-each-ref --format=%(refname) ${WF_CHECKPOINT_REF_PREFIX}`.quiet();
+		if (refs.exitCode !== 0) {
+			return;
+		}
+		for (const raw of readText(refs).split("\n")) {
+			const ref = raw.trim();
+			if (ref.length === 0 || !ref.startsWith(WF_CHECKPOINT_REF_PREFIX)) {
+				continue;
+			}
+			const del = await git()`git update-ref -d ${ref}`.quiet();
+			if (del.exitCode !== 0) {
+				logger?.debug("stale checkpoint marker delete failed", {
+					ref,
+					stderr: readText({ text: () => del.stderr.toString() }),
+				});
+			}
+		}
+	}
+
 	return {
 		ready,
 		baseline,
@@ -604,5 +708,6 @@ export function createGitCheckpointer(
 		baselineRef: () => baselineHead,
 		promote,
 		discard,
+		sweepMarkers,
 	};
 }
