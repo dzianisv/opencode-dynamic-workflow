@@ -1,15 +1,24 @@
-export const VERSION = "0.0.0";
-
-export type { CompletionConfig, TerminalStatus } from "./completion";
+export type {
+	CompletionConfig,
+	GateMessage,
+	GatePart,
+	IntervalFactory,
+	TerminalStatus,
+	TimerFactory,
+} from "./completion";
 export type {
 	AcquireResult,
 	ConcurrencyConfig,
 	SlotHolder,
 } from "./concurrency";
 export { ConcurrencyManager, WaiterCancelledError } from "./concurrency";
+export { humanizeDuration } from "./format";
+export type { FsFacade } from "./fs";
+export { nodeFsFacade } from "./fs";
 export type { IdGenerator, IdGeneratorOptions } from "./ids";
 export { createIdGenerator } from "./ids";
 export type {
+	NoticeRecord,
 	NotificationQueue,
 	NotificationQueueLogger,
 	NotificationQueueOpts,
@@ -23,19 +32,27 @@ export {
 	createWakeOnNotify,
 } from "./notify-hooks";
 export type {
-	FsFacade,
+	StoredRecord,
 	TaskStore,
 	TaskStoreLogger,
 	TaskStoreOptions,
 } from "./persistence";
-export { createTaskStore, resolveDataBaseDir } from "./persistence";
-export type { SdkSessionClient, SdkWakeSessionClient } from "./sdk-adapter";
-export { adaptSdkClient, adaptWakeClient } from "./sdk-adapter";
+export {
+	createTaskStore,
+	isValidTask,
+	resolveDataBaseDir,
+} from "./persistence";
+export type { SdkSessionClient } from "./sdk-adapter";
+export { adaptSdkClient } from "./sdk-adapter";
 export type {
 	EngineClient,
 	PersistFn,
+	PromptModel,
+	SessionCreateBody,
+	SessionPromptAsyncBody,
 	SessionRunnerConfig,
 	SessionRunnerDeps,
+	SessionRunnerLogger,
 	SessionStatus,
 	SessionStatusMap,
 } from "./session-runner";
@@ -47,6 +64,8 @@ export type {
 	ReadOpts,
 	SessionRunner,
 	TaskOutput,
+	TaskOutputMessage,
+	TaskOutputPart,
 	TaskStatus,
 	TextPartInput,
 } from "./types";
@@ -58,7 +77,6 @@ export type {
 	WakeClient,
 	WakeNotifier,
 	WakeNotifierDeps,
-	WakeSessionStatus,
-	WakeSessionStatusMap,
+	WakeQueue,
 } from "./wake-notifier";
-export { createWakeNotifier } from "./wake-notifier";
+export { createWakeNotifier, MAX_WAKE_ROUNDS } from "./wake-notifier";

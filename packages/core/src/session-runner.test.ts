@@ -100,6 +100,8 @@ function makeClient() {
 		promptCalls,
 		abortCalls,
 		resolveCreate: (id: string) => createDeferred.resolve({ data: { id } }),
+		// A real-SDK shape the adapter normalizes no-content responses to (#8).
+		resolveCreateEmpty: () => createDeferred.resolve({ data: undefined }),
 		rejectCreate: (err: unknown) => createDeferred.reject(err),
 		resolvePrompt: () => promptDeferred.resolve(),
 		rejectPrompt: (err: unknown) => promptDeferred.reject(err),
@@ -768,21 +770,124 @@ describe("createSessionRunner — list", () => {
 	});
 });
 
-describe("createSessionRunner — unimplemented methods", () => {
-	test("awaitCompletion/cancel/resume/readOutput/handleEvent/dispose are present", () => {
+describe("createSessionRunner — session.create resolves with no id (finding #8)", () => {
+	test("no-content create: launch rejects, task error, slot released, next launch on limit-1 succeeds", async () => {
 		const h = makeClient();
+		const concurrency = new ConcurrencyManager({ defaultConcurrency: 1 });
 		const runner = createSessionRunner({
 			client: h.client,
-			concurrency: new ConcurrencyManager(),
+			concurrency,
 			ids: createIdGenerator(),
 			clock: fixedClock(),
 		});
-		expect(typeof runner.awaitCompletion).toBe("function");
-		expect(typeof runner.cancel).toBe("function");
-		expect(typeof runner.resume).toBe("function");
-		expect(typeof runner.readOutput).toBe("function");
-		expect(typeof runner.handleEvent).toBe("function");
-		expect(typeof runner.dispose).toBe("function");
+		const model = "anthropic/opus";
+
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		expect(concurrency.runningCount(model)).toBe(1);
+
+		// The sdk-adapter normalizes a no-content success to { data: undefined }.
+		h.resolveCreateEmpty();
+
+		await expect(launched).rejects.toThrow(/no session id/);
+		await flush();
+
+		const task = at(runner.list(), 0);
+		expect(task.status).toBe("error");
+		expect(task.error).toContain("no session id");
+		expect(h.promptCalls).toHaveLength(0);
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// the slot really came back: a fresh launch on the limit-1 manager runs.
+		h.reset();
+		const next = runner.launch(baseReq({ model, description: "next" }));
+		await flush();
+		expect(concurrency.runningCount(model)).toBe(1);
+		h.resolveCreate("ses_next");
+		const nextTask = await next;
+		expect(nextTask.status).toBe("running");
+	});
+});
+
+describe("createSessionRunner — launch step 2 persist rejection (finding #4)", () => {
+	test("pending-registration persist rejects: routed through the gate (error flip), no 45-min ghost", async () => {
+		const h = makeClient();
+		const concurrency = new ConcurrencyManager();
+		let rejectPendingWrite = true;
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+			persist: async (t) => {
+				if (rejectPendingWrite && t.status === "pending") {
+					rejectPendingWrite = false;
+					throw new Error("disk full");
+				}
+			},
+		});
+		const model = "anthropic/opus";
+
+		await expect(runner.launch(baseReq({ model }))).rejects.toThrow(
+			"disk full",
+		);
+		await flush();
+
+		// The registered task is NOT left as a pending ghost: it landed terminal
+		// error through the gate (which persists + notifies), not a raw rethrow.
+		const task = at(runner.list(), 0);
+		expect(task.status).toBe("error");
+		expect(task.error).toContain("disk full");
+		// No slot/session was ever acquired/created for it.
+		expect(h.createCalls).toHaveLength(0);
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// And the runner still works.
+		const next = runner.launch(baseReq({ model, description: "next" }));
+		await flush();
+		h.resolveCreate("ses_next");
+		expect((await next).status).toBe("running");
+	});
+});
+
+describe("createSessionRunner — running-promotion persist rejection (finding #8 slot-leak guards)", () => {
+	test("launch arm: persist rejects on the running write → error flip, slot released, no prompt, next launch on limit-1 succeeds", async () => {
+		const h = makeClient();
+		const concurrency = new ConcurrencyManager({ defaultConcurrency: 1 });
+		let rejectRunningWrite = true;
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+			persist: async (t) => {
+				if (rejectRunningWrite && t.status === "running") {
+					rejectRunningWrite = false;
+					throw new Error("running write failed");
+				}
+			},
+		});
+		const model = "anthropic/opus";
+
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		h.resolveCreate("ses_child");
+
+		await expect(launched).rejects.toThrow("running write failed");
+		await flush();
+
+		const task = at(runner.list(), 0);
+		expect(task.status).toBe("error");
+		expect(h.promptCalls).toHaveLength(0); // dispatch never happened
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// next launch on the limit-1 manager succeeds (the slot was released).
+		h.reset();
+		const next = runner.launch(baseReq({ model, description: "next" }));
+		await flush();
+		expect(concurrency.runningCount(model)).toBe(1);
+		h.resolveCreate("ses_next");
+		expect((await next).status).toBe("running");
 	});
 });
 
@@ -1614,6 +1719,471 @@ describe("createSessionRunner — restart recovery", () => {
 		// No session.get for a recovered TERMINAL task.
 		expect(h.getCalls).not.toContain("ses_term");
 
+		await runner.dispose();
+	});
+});
+
+// ===========================================================================
+// Findings #1e/#2/#3/#7/#8 — resume cluster, teardown fence, status veto,
+// terminal eviction, recovery promotion.
+// ===========================================================================
+
+describe("createSessionRunner — fetchStatus undefined data is a veto, not idle (finding #1e)", () => {
+	test("status resolving { data: undefined } blocks completion; a readable map completes", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const clock = mutableClock(1000);
+		const timers = makeTimers();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			setTimer: timers.setTimer,
+			setIntervalFn: timers.setIntervalFn,
+			config: { minIdleMs: 5000, pollMs: 5000 },
+		});
+		h.setNextCreateId("ses_v");
+		h.setMessages("ses_v", [
+			{
+				info: { role: "assistant", time: { created: 1000, completed: 1000 } },
+				parts: [{ type: "text", text: "done" }],
+			},
+		]);
+		const launched = runner.launch(baseReq({ model: "anthropic/opus" }));
+		await flush();
+		const task = await launched;
+
+		// "status call failed to produce a map" ≠ "session absent from the map":
+		// the former must read as a FAILED read (conservative veto), never as idle.
+		h.client.session.status = () => Promise.resolve({ data: undefined });
+		await completeViaIdle(runner, timers, clock, "ses_v", 1000, 5000);
+		expect(runner.list()[0]?.status).toBe("running");
+
+		// a successful read with the session ABSENT from the map → idle-equivalent.
+		h.client.session.status = () => Promise.resolve({ data: {} });
+		clock.set(20000);
+		await completeViaIdle(runner, timers, clock, "ses_v", 20000 - 5001, 5000);
+		expect(runner.list()[0]?.status).toBe("completed");
+		void task;
+	});
+});
+
+describe("createSessionRunner — cancel re-check across the running-promotion persist (finding #3d)", () => {
+	test("launch: cancel during the running persist → no prompt dispatched to the aborted session", async () => {
+		const h = makeClient();
+		const concurrency = new ConcurrencyManager();
+		let persistGate: Deferred<void> | undefined;
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock: fixedClock(),
+			persist: async (t) => {
+				if (t.status === "running" && !persistGate) {
+					persistGate = defer<void>();
+					await persistGate.promise;
+				}
+			},
+		});
+		const model = "anthropic/opus";
+
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		h.resolveCreate("ses_child");
+		// drain microtasks until launch is suspended at the running persist.
+		while (!persistGate) {
+			await Promise.resolve();
+		}
+
+		// cancel lands while the persist is still pending.
+		const task = at(runner.list(), 0);
+		const cancelled = runner.cancel(task.id);
+		await flush();
+		// release the persist — launch resumes past the await and must SKIP dispatch.
+		persistGate.resolve();
+		const result = await launched;
+		await cancelled;
+		await flush();
+
+		expect(result.status).toBe("cancelled");
+		expect(h.promptCalls).toHaveLength(0); // never prompted the aborted session
+		expect(h.abortCalls).toEqual([{ id: "ses_child" }]); // gate teardown aborted
+		expect(concurrency.runningCount(model)).toBe(0);
+	});
+});
+
+describe("createSessionRunner — resume cluster (finding #3)", () => {
+	const MIN_IDLE = 5000;
+
+	function makeResumeHarness(
+		h: ReturnType<typeof makeLifecycleClient>,
+		opts: {
+			limit?: number;
+			persist?: (t: BgTask) => Promise<void>;
+		} = {},
+	) {
+		const concurrency = new ConcurrencyManager({
+			defaultConcurrency: opts.limit ?? 5,
+		});
+		const clock = mutableClock(1000);
+		const timers = makeTimers();
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			...(opts.persist ? { persist: opts.persist } : {}),
+			setTimer: timers.setTimer,
+			setIntervalFn: timers.setIntervalFn,
+			config: { minIdleMs: MIN_IDLE, pollMs: 5000 },
+		});
+		return { runner, concurrency, clock, timers };
+	}
+
+	test("in-flight guard: a second concurrent resume rejects; no double slot, single prompt", async () => {
+		const h = makeLifecycleClient();
+		const { runner, concurrency } = makeResumeHarness(h);
+		const model = "anthropic/opus";
+		h.setNextCreateId("ses_g");
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		const task = await launched;
+		await runner.cancel(task.id);
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		h.freshPrompt();
+		const promptsBefore = h.promptCalls.length;
+		const r1 = runner.resume(task.id, "first");
+		const r2 = runner.resume(task.id, "second");
+
+		await expect(r2).rejects.toThrow(/resumeInFlight/);
+		const resumed = await r1;
+		expect(resumed.status).toBe("running");
+		// pre-fix this leaked a slot permanently via heldSlots.set overwrite.
+		expect(concurrency.runningCount(model)).toBe(1);
+		expect(h.promptCalls.length).toBe(promptsBefore + 1);
+
+		await runner.cancel(task.id);
+		expect(concurrency.runningCount(model)).toBe(0);
+	});
+
+	test("resume replays the launch's tools config (structured-output nudge path), not the bare guard", async () => {
+		const h = makeLifecycleClient();
+		const { runner } = makeResumeHarness(h);
+		h.setNextCreateId("ses_t");
+		const launched = runner.launch(
+			baseReq({
+				model: "anthropic/opus",
+				toolsOverride: { structured_output: true, read: true },
+			}),
+		);
+		await flush();
+		const task = await launched;
+		await runner.cancel(task.id);
+
+		h.freshPrompt();
+		await runner.resume(task.id, "nudge: call the tool");
+
+		const lastPrompt = at(h.promptCalls, h.promptCalls.length - 1);
+		// The live consumer this fixes: the workflows structured-output nudge
+		// resumes a task whose launch enabled structured_output — replaying a bare
+		// SPAWN_GUARD would resume the child WITHOUT its result tool.
+		expect(lastPrompt.body.tools).toEqual({
+			...RECURSION_GUARD,
+			structured_output: true,
+			read: true,
+		});
+		await runner.cancel(task.id);
+	});
+
+	test("bounded wait: a queued resume acquire times out, rejects cleanly, leaks nothing", async () => {
+		const h = makeLifecycleClient();
+		const { runner, concurrency, timers } = makeResumeHarness(h, { limit: 1 });
+		const model = "anthropic/opus";
+
+		// B: launch + cancel → terminal, slot back to 0.
+		h.setNextCreateId("ses_b");
+		const b = await (async () => {
+			const p = runner.launch(baseReq({ model, description: "B" }));
+			await flush();
+			return p;
+		})();
+		await runner.cancel((await b).id);
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// A: launch → running, holds the only slot.
+		h.setNextCreateId("ses_a");
+		h.freshPrompt();
+		const a = runner.launch(baseReq({ model, description: "A" }));
+		await flush();
+		await a;
+		expect(concurrency.runningCount(model)).toBe(1);
+
+		// resume B → its acquire queues (invisible to the stale poll: B is terminal).
+		const resumed = runner.resume((await b).id, "again");
+		await flush();
+		expect(concurrency.queueLength(model)).toBe(1);
+
+		// fire the bounded-wait timer → the waiter is cancelled and resume rejects.
+		timers.fireAllTimers();
+		await expect(resumed).rejects.toThrow(/resumeTimeout/);
+		expect(concurrency.queueLength(model)).toBe(0);
+		// B stays terminal; A still holds its slot; nothing leaked.
+		expect(runner.list().find((t) => t.description === "B")?.status).toBe(
+			"cancelled",
+		);
+		expect(concurrency.runningCount(model)).toBe(1);
+
+		// slot accounting still sane: cancel A → 0, and a fresh launch acquires.
+		await runner.cancel((await a).id);
+		expect(concurrency.runningCount(model)).toBe(0);
+	});
+
+	test("cancel during resume-acquire: queued waiter rejected, resume resolves terminal, no slot leak (mirror of the launch test)", async () => {
+		const h = makeLifecycleClient();
+		const { runner, concurrency } = makeResumeHarness(h, { limit: 1 });
+		const model = "anthropic/opus";
+
+		// B: launch + cancel → terminal.
+		h.setNextCreateId("ses_b");
+		const b = runner.launch(baseReq({ model, description: "B" }));
+		await flush();
+		await runner.cancel((await b).id);
+
+		// A: holds the only slot.
+		h.setNextCreateId("ses_a");
+		h.freshPrompt();
+		const a = runner.launch(baseReq({ model, description: "A" }));
+		await flush();
+		await a;
+		expect(concurrency.runningCount(model)).toBe(1);
+
+		// resume B queues; then cancel B mid-acquire.
+		const promptsBefore = h.promptCalls.length;
+		const resumed = runner.resume((await b).id, "again");
+		await flush();
+		expect(concurrency.queueLength(model)).toBe(1);
+
+		await runner.cancel((await b).id);
+		const out = await resumed; // resolves with the (still-terminal) task
+		expect(out.status).toBe("cancelled");
+		expect(concurrency.queueLength(model)).toBe(0);
+		expect(h.promptCalls.length).toBe(promptsBefore); // no resume prompt
+		expect(concurrency.runningCount(model)).toBe(1); // A's slot untouched
+
+		await runner.cancel((await a).id);
+		expect(concurrency.runningCount(model)).toBe(0);
+	});
+
+	test("resume arm of the slot-leak guard: persist rejects on the running write → error flip, slot released, next launch on limit-1 succeeds", async () => {
+		const h = makeLifecycleClient();
+		let rejectRunningWrite = false;
+		const { runner, concurrency } = makeResumeHarness(h, {
+			limit: 1,
+			persist: async (t) => {
+				if (rejectRunningWrite && t.status === "running") {
+					rejectRunningWrite = false;
+					throw new Error("resume write failed");
+				}
+			},
+		});
+		const model = "anthropic/opus";
+		h.setNextCreateId("ses_p");
+		const launched = runner.launch(baseReq({ model }));
+		await flush();
+		const task = await launched;
+		await runner.cancel(task.id);
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		h.freshPrompt();
+		rejectRunningWrite = true;
+		await expect(runner.resume(task.id, "again")).rejects.toThrow(
+			"resume write failed",
+		);
+		await flush();
+
+		expect(runner.list()[0]?.status).toBe("error");
+		expect(concurrency.runningCount(model)).toBe(0);
+
+		// the released slot is actually usable on the limit-1 manager.
+		h.setNextCreateId("ses_next");
+		h.freshPrompt();
+		const next = runner.launch(baseReq({ model, description: "next" }));
+		await flush();
+		expect((await next).status).toBe("running");
+		expect(concurrency.runningCount(model)).toBe(1);
+	});
+
+	test("resume fences on an in-flight terminal teardown (finding #2): no late clobber of the resumed task", async () => {
+		const h = makeLifecycleClient();
+		let terminalPersistGate: Deferred<void> | undefined;
+		const { runner } = makeResumeHarness(h, {
+			persist: async (t) => {
+				// Defer ONLY the terminal write so the teardown stays in flight.
+				if (
+					(t.status === "error" ||
+						t.status === "cancelled" ||
+						t.status === "completed") &&
+					!terminalPersistGate
+				) {
+					terminalPersistGate = defer<void>();
+					await terminalPersistGate.promise;
+				}
+			},
+		});
+		h.setNextCreateId("ses_f");
+		const launched = runner.launch(baseReq({ model: "anthropic/opus" }));
+		await flush();
+		const task = await launched;
+
+		// Flip via a session.error event (NOT cancel — cancel itself now joins):
+		// the flip is synchronous, the teardown detaches and blocks on persist.
+		await runner.handleEvent({
+			type: "session.error",
+			properties: {
+				sessionID: "ses_f",
+				error: { name: "ProviderAuthError", data: { message: "boom" } },
+			},
+		} as never);
+		expect(runner.list()[0]?.status).toBe("error");
+		while (!terminalPersistGate) {
+			await Promise.resolve();
+		}
+
+		// resume sees the terminal status but must WAIT for the teardown to settle.
+		h.freshPrompt();
+		const resumed = runner.resume(task.id, "go again");
+		let resumedSettled = false;
+		resumed.then(() => {
+			resumedSettled = true;
+		});
+		await flush();
+		expect(resumedSettled).toBe(false); // fenced on the in-flight teardown
+
+		terminalPersistGate.resolve();
+		const out = await resumed;
+		await flush();
+		// the OLD teardown's stamps did not survive onto the resumed task.
+		expect(out.status).toBe("running");
+		expect(out.completedAt).toBeUndefined();
+		expect(out.error).toBeUndefined();
+		await runner.cancel(task.id);
+	});
+});
+
+describe("createSessionRunner — terminal task eviction (finding #7)", () => {
+	test("terminal tasks past the TTL are evicted from memory at the next terminal teardown; recent ones stay readable", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const clock = mutableClock(1000);
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			config: { terminalTtlMs: 10_000 },
+		});
+		const model = "anthropic/opus";
+
+		// task 1: terminal at t=1000.
+		h.setNextCreateId("ses_t1");
+		const t1 = runner.launch(baseReq({ model, description: "t1" }));
+		await flush();
+		await runner.cancel((await t1).id);
+		expect(runner.list()).toHaveLength(1);
+
+		// well within the TTL: still listed and readable.
+		clock.set(5000);
+		h.setMessages("ses_t1", []);
+		const out1 = await runner.readOutput((await t1).id);
+		expect(out1.status).toBe("cancelled");
+
+		// past the TTL: the NEXT terminal teardown sweeps it out.
+		clock.set(20_000);
+		h.setNextCreateId("ses_t2");
+		h.freshPrompt();
+		const t2 = runner.launch(baseReq({ model, description: "t2" }));
+		await flush();
+		await runner.cancel((await t2).id);
+		await flush();
+
+		const ids = runner.list().map((t) => t.description);
+		expect(ids).toEqual(["t2"]); // t1 evicted, t2 (recent) kept
+		await expect(runner.readOutput((await t1).id)).rejects.toThrow(
+			/Unknown task/,
+		);
+	});
+
+	test("terminal tasks beyond the cap are evicted oldest-first", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const clock = mutableClock(1000);
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			config: { maxTerminalTasks: 2 },
+		});
+		const model = "anthropic/opus";
+
+		for (let i = 1; i <= 4; i++) {
+			clock.set(1000 * i);
+			h.setNextCreateId(`ses_c${i}`);
+			h.freshPrompt();
+			const t = runner.launch(baseReq({ model, description: `c${i}` }));
+			await flush();
+			await runner.cancel((await t).id);
+			await flush();
+		}
+
+		// only the 2 newest terminal tasks survive.
+		expect(runner.list().map((t) => t.description)).toEqual(["c3", "c4"]);
+	});
+});
+
+describe("createSessionRunner — restart recovery promotes pending (finding #8)", () => {
+	test("recovered PENDING task with a live session is promoted to running and completes via idle", async () => {
+		const h = makeLifecycleClient();
+		const concurrency = new ConcurrencyManager();
+		const clock = mutableClock(2000);
+		const timers = makeTimers();
+		h.setMessages("ses_pend", [
+			{
+				info: { role: "assistant", time: { created: 1500, completed: 1500 } },
+				parts: [{ type: "text", text: "done" }],
+			},
+		]);
+
+		const runner = createSessionRunner({
+			client: h.client,
+			concurrency,
+			ids: createIdGenerator(),
+			clock,
+			startPoll: false,
+			setTimer: timers.setTimer,
+			setIntervalFn: timers.setIntervalFn,
+			config: { minIdleMs: 5000, pollMs: 5000 },
+			recoveredTasks: [
+				recoveredTask({
+					id: "bg_pend0001",
+					sessionID: "ses_pend",
+					status: "pending",
+					startedAt: 1500,
+				}),
+			],
+		});
+
+		await flush();
+		expect(at(runner.list(), 0).status).toBe("running");
+
+		await completeViaIdle(runner, timers, clock, "ses_pend", 1500, 5000);
+		expect(at(runner.list(), 0).status).toBe("completed");
 		await runner.dispose();
 	});
 });

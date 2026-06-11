@@ -1,101 +1,54 @@
 /**
- * TaskStore — atomic per-task persistence with restart recovery.
+ * TaskStore — atomic per-record persistence with restart recovery.
  *
- * One file per task (`<taskId>.json`). A write serializes the FULL {@link BgTask}
- * to `<taskId>.json.tmp` then `rename`s it over the target — atomic on POSIX, so
- * a crash mid-write never leaves a torn task file (only a `.tmp` orphan, swept on
+ * One file per record (`<id>.json`). A write serializes the FULL record to
+ * `<id>.json.tmp` then `rename`s it over the target — atomic on POSIX, so
+ * a crash mid-write never leaves a torn file (only a `.tmp` orphan, swept on
  * the next load). This deliberately avoids the defect catalog of the prior
  * implementation (.references/better-opencode-async-agents/src/storage.ts:77-121):
- *  - NO whole-file read-modify-write: each task is independent, so concurrent
- *    saves of different tasks never clobber each other.
+ *  - NO whole-file read-modify-write: each record is independent, so concurrent
+ *    saves of different ids never clobber each other.
  *  - NO silent `{}` on corruption: a bad file is logged and SKIPPED individually,
  *    the rest still load.
- *  - NO dropped fields: the whole BgTask is serialized and round-trips intact.
+ *  - NO dropped fields: the whole record is serialized and round-trips intact.
+ *
+ * The store is GENERIC over the persisted record type (review finding #3): it
+ * only reads `id` (file naming), `status` (TTL sweep), and `completedAt` (TTL
+ * sweep) — the {@link StoredRecord} constraint. The default record type is
+ * {@link BgTask} with {@link isValidTask} as the load-time validator; a consumer
+ * persisting a different shape (the workflows engine's RunRecord) passes its own
+ * `validate` — the overloads REQUIRE one, so the asserted load type is honest.
  *
  * Collaborators (fs facade, logger, clock) are injected factory-DI so tests run
  * against a real temp dir without touching the host's XDG data home.
  */
 
-import {
-	appendFile,
-	lstat,
-	mkdir,
-	readdir,
-	readFile,
-	realpath,
-	rename,
-	rm,
-	stat,
-	writeFile,
-} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { type FsFacade, nodeFsFacade } from "./fs";
 import type { BgTask, Clock, TaskStatus } from "./types";
 import { isTerminal } from "./types";
 
-/**
- * The exact fs surface the store uses. Defaults to `node:fs/promises`; injectable
- * so a test can swap an in-memory facade if it ever needs to (real temp dirs are
- * simpler and used by the suite, but the seam is here).
- */
-export interface FsFacade {
-	mkdir(path: string, opts: { recursive: true }): Promise<unknown>;
-	readdir(path: string): Promise<string[]>;
-	readFile(path: string, enc: "utf-8"): Promise<string>;
-	writeFile(path: string, data: string, enc: "utf-8"): Promise<void>;
-	rename(from: string, to: string): Promise<void>;
-	rm(path: string, opts: { force: true }): Promise<void>;
-	/**
-	 * Optional native append. `node:fs/promises` exposes an O(1) `appendFile`, so a
-	 * facade backed by it gets append-only writers (the workflow feed) for free; an
-	 * in-memory test facade may omit it and have callers synthesize a read-modify-
-	 * write fallback. Optional so existing facades that never append still satisfy
-	 * the type.
-	 */
-	appendFile?(path: string, data: string, enc: "utf-8"): Promise<void>;
-	/**
-	 * Optional stat probe (follows symlinks). The workflows engine's `probePath`
-	 * already reached this on the production node facade via a structural cast —
-	 * this member formalizes that exact shape (same signature, so the cast keeps
-	 * working). In-memory test facades may omit it; callers must fall back.
-	 */
-	stat?(path: string): Promise<{ isDirectory(): boolean }>;
-	/**
-	 * Optional lstat probe (does NOT follow symlinks) — lets a directory walk
-	 * tell a symlink from a real entry. Optional like {@link stat}.
-	 */
-	lstat?(path: string): Promise<{
-		isDirectory(): boolean;
-		isSymbolicLink(): boolean;
-	}>;
-	/**
-	 * Optional canonical-path resolution. A recursive walk uses it to keep a
-	 * visited-set of REAL paths, turning a cyclic symlink into a no-op revisit
-	 * instead of an unbounded recursion. Facades without it must rely on a
-	 * depth cap instead.
-	 */
-	realpath?(path: string): Promise<string>;
-}
+// Re-exported for source compatibility: FsFacade lived here before its
+// extraction into ./fs (review finding #6).
+export type { FsFacade } from "./fs";
 
-const defaultFs: FsFacade = {
-	mkdir: (path, opts) => mkdir(path, opts),
-	readdir: (path) => readdir(path),
-	readFile: (path, enc) => readFile(path, enc),
-	writeFile: (path, data, enc) => writeFile(path, data, enc),
-	rename: (from, to) => rename(from, to),
-	rm: (path, opts) => rm(path, opts),
-	appendFile: (path, data, enc) => appendFile(path, data, enc),
-	stat: (path) => stat(path),
-	lstat: (path) => lstat(path),
-	realpath: (path) => realpath(path),
-};
+/**
+ * The structural minimum the store itself reads off a persisted record:
+ * `id` names the file, `status` + `completedAt` drive the TTL sweep.
+ */
+export interface StoredRecord {
+	id: string;
+	status: TaskStatus;
+	completedAt?: number;
+}
 
 export interface TaskStoreLogger {
 	debug?(msg: string, meta?: Record<string, unknown>): void;
 	error?(msg: string, meta?: Record<string, unknown>): void;
 }
 
-export interface TaskStoreOptions {
+export interface TaskStoreOptions<T extends StoredRecord = BgTask> {
 	/** Override the storage directory (tests pass a temp dir). */
 	baseDir?: string;
 	/** Injectable fs facade; defaults to `node:fs/promises`. */
@@ -104,14 +57,20 @@ export interface TaskStoreOptions {
 	clock?: Clock;
 	/** Terminal tasks older than this (by `completedAt`) are swept on load. Default 24h. */
 	ttlMs?: number;
+	/**
+	 * Load-time validator: a parsed file failing it is corrupt and skipped.
+	 * Defaults to {@link isValidTask} (the BgTask validator); a store typed at a
+	 * non-BgTask record MUST pass its own (enforced by the factory overloads).
+	 */
+	validate?: (value: unknown) => value is T;
 }
 
-export interface TaskStore {
-	/** Persist the full task atomically. Concurrent saves of the SAME id serialize. */
-	save(task: BgTask): Promise<void>;
-	/** Read every persisted task (for engine start). Sweeps debris + TTL-expired files. */
-	load(): Promise<BgTask[]>;
-	/** Remove a task's file. Absent file → silent no-op. */
+export interface TaskStore<T extends StoredRecord = BgTask> {
+	/** Persist the full record atomically. Concurrent saves of the SAME id serialize. */
+	save(task: T): Promise<void>;
+	/** Read every persisted record (for engine start). Sweeps debris + TTL-expired files. */
+	load(): Promise<T[]>;
+	/** Remove a record's file. Absent file → silent no-op. */
 	delete(taskId: string): Promise<void>;
 	/** Drain all queued writes. Call before process exit. */
 	dispose(): Promise<void>;
@@ -155,41 +114,113 @@ function errorText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+function isTaskStatus(value: unknown): value is TaskStatus {
+	return (
+		value === "pending" ||
+		value === "running" ||
+		value === "completed" ||
+		value === "error" ||
+		value === "cancelled"
+	);
+}
+
+/** Optional field check: absent is fine; present must satisfy `check`. */
+function optional(value: unknown, check: (v: unknown) => boolean): boolean {
+	return value === undefined || check(value);
+}
+
+const isString = (v: unknown): boolean => typeof v === "string";
+const isFiniteNumber = (v: unknown): boolean =>
+	typeof v === "number" && Number.isFinite(v);
+const isBoolean = (v: unknown): boolean => typeof v === "boolean";
+
+/** A plain object whose every value is a boolean (the BgTask `tools` map). */
+function isBooleanMap(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return false;
+	}
+	return Object.values(value).every((v) => typeof v === "boolean");
+}
+
 /**
- * Minimal validation of a parsed task file. A file failing this is corrupt and
- * is skipped (not loaded). We require the discriminating fields the engine needs
- * to even register a task: id, parentSessionID, and a known status.
+ * Full validation of a parsed {@link BgTask} file (review finding #1). A file
+ * failing this is corrupt and is skipped (not loaded). EVERY required field is
+ * checked — a recovered task missing `createdAt` would otherwise produce NaN
+ * activity math that permanently disables both completion and the stale sweep —
+ * and every optional field is type-checked when present (wrong-typed optionals
+ * are corruption, not data).
  */
-function isValidTask(value: unknown): value is BgTask {
+export function isValidTask(value: unknown): value is BgTask {
 	if (typeof value !== "object" || value === null) {
 		return false;
 	}
 	const v = value as Record<string, unknown>;
+	// Required fields.
 	if (typeof v.id !== "string" || v.id.length === 0) {
 		return false;
 	}
 	if (typeof v.parentSessionID !== "string") {
 		return false;
 	}
-	const status = v.status;
+	if (!isTaskStatus(v.status)) {
+		return false;
+	}
+	if (typeof v.description !== "string") {
+		return false;
+	}
+	if (typeof v.agent !== "string") {
+		return false;
+	}
+	if (!isFiniteNumber(v.createdAt)) {
+		return false;
+	}
+	// `depth`/`concurrencyKey` have been stamped by every launch since the first
+	// release, so they are validated as REQUIRED — the asserted `value is BgTask`
+	// stays honest with no silent defaulting.
+	if (!isFiniteNumber(v.depth)) {
+		return false;
+	}
+	if (typeof v.concurrencyKey !== "string") {
+		return false;
+	}
+	// Optional fields: absent is fine, wrong-typed presence is corruption.
 	if (
-		status !== "pending" &&
-		status !== "running" &&
-		status !== "completed" &&
-		status !== "error" &&
-		status !== "cancelled"
+		!optional(v.sessionID, isString) ||
+		!optional(v.model, isString) ||
+		!optional(v.error, isString) ||
+		!optional(v.startedAt, isFiniteNumber) ||
+		!optional(v.completedAt, isFiniteNumber) ||
+		!optional(v.notified, isBoolean) ||
+		!optional(v.tools, isBooleanMap)
 	) {
 		return false;
 	}
 	return true;
 }
 
-export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
+/**
+ * Factory overloads (review finding #3): omitting `validate` is only legal for
+ * the default BgTask record type; any other record type must bring an honest
+ * validator, so `load()`'s asserted element type is never a lie.
+ */
+export function createTaskStore(
+	opts?: TaskStoreOptions<BgTask>,
+): TaskStore<BgTask>;
+export function createTaskStore<T extends StoredRecord>(
+	opts: TaskStoreOptions<T> & { validate: (value: unknown) => value is T },
+): TaskStore<T>;
+export function createTaskStore<T extends StoredRecord>(
+	opts: TaskStoreOptions<T> = {},
+): TaskStore<T> {
 	const baseDir = opts.baseDir ?? defaultBaseDir();
-	const fs = opts.fs ?? defaultFs;
+	const fs = opts.fs ?? nodeFsFacade();
 	const logger = opts.logger;
 	const clock = opts.clock ?? defaultClock;
 	const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+	// Sound by the overload contract: `validate` may only be omitted through the
+	// BgTask overload, so when this default applies, T IS BgTask.
+	const validate =
+		opts.validate ?? (isValidTask as unknown as (value: unknown) => value is T);
 
 	// Per-task write queue: chains saves for the SAME id so they serialize in
 	// call order (last queued payload wins, no interleaved/torn writes). Different
@@ -211,11 +242,10 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 	}
 
 	/** The atomic write: tmp file → rename over target. */
-	async function writeAtomic(task: BgTask): Promise<void> {
+	async function writeAtomic(taskId: string, data: string): Promise<void> {
 		await ensureDir();
-		const target = pathFor(task.id);
+		const target = pathFor(taskId);
 		const tmp = `${target}.tmp`;
-		const data = JSON.stringify(task);
 		await fs.writeFile(tmp, data, "utf-8");
 		await fs.rename(tmp, target);
 	}
@@ -242,12 +272,13 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 		return next;
 	}
 
-	async function save(task: BgTask): Promise<void> {
-		// Snapshot the task at call time so a later in-place mutation by the caller
-		// cannot retroactively change what THIS save writes (the gate mutates the
-		// shared BgTask object). Last queued snapshot wins.
-		const snapshot: BgTask = { ...task };
-		return enqueue(task.id, () => writeAtomic(snapshot));
+	async function save(task: T): Promise<void> {
+		// Serialize AT CALL TIME (review finding #2): the JSON string is a DEEP
+		// snapshot, so a later in-place mutation by the caller — including nested
+		// arrays like the workflows engine's agents[]/checkpoints[] — cannot
+		// retroactively change what THIS save writes. Last queued snapshot wins.
+		const data = JSON.stringify(task);
+		return enqueue(task.id, () => writeAtomic(task.id, data));
 	}
 
 	async function deleteTask(taskId: string): Promise<void> {
@@ -256,7 +287,7 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 		});
 	}
 
-	async function load(): Promise<BgTask[]> {
+	async function load(): Promise<T[]> {
 		let entries: string[];
 		try {
 			entries = await fs.readdir(baseDir);
@@ -274,7 +305,7 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 		}
 
 		const now = clock.now();
-		const out: BgTask[] = [];
+		const out: T[] = [];
 
 		for (const name of entries) {
 			// Crashed-write debris: delete silently, never parse.
@@ -298,7 +329,7 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 				continue;
 			}
 
-			if (!isValidTask(parsed)) {
+			if (!validate(parsed)) {
 				logger?.error?.("skipping corrupt task file (failed validation)", {
 					file: name,
 				});
@@ -308,7 +339,7 @@ export function createTaskStore(opts: TaskStoreOptions = {}): TaskStore {
 			// TTL sweep: only TERMINAL tasks with a `completedAt` past the TTL are
 			// expired. A running/pending task is NEVER swept regardless of age.
 			if (
-				isTerminal(parsed.status as TaskStatus) &&
+				isTerminal(parsed.status) &&
 				typeof parsed.completedAt === "number" &&
 				now - parsed.completedAt > ttlMs
 			) {

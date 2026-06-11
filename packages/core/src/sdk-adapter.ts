@@ -12,9 +12,22 @@
  * adapter that calls each method with the exact shape the engine uses and narrows
  * the `RequestResult`-style `{ data, ... }` result down to what the engine reads.
  *
+ * ERROR SEMANTICS (the load-bearing part): the generated client defaults
+ * `ThrowOnError = false` — an HTTP error RESOLVES as `{ data: undefined, error }`,
+ * it does not reject (verified against `@opencode-ai/sdk` 1.16.2; nothing in this
+ * repo passes `throwOnError`). The engine was written assuming throw semantics:
+ * session-gone detection, restart recovery, resume verification, prompt-failure
+ * flips, the completion gate's status veto, and the wake notifier's suppression
+ * all live in `catch` blocks. So {@link unwrap} converts every `error`-carrying
+ * envelope into a THROW, on EVERY method of this adapter. This is the single
+ * choke point that restores throw semantics for the whole engine.
+ *
  * Both the Phase 2 (`background-agents`) and Phase 4 (`workflows`) plugins need
- * this identical adapter, so it lives in core, written once. The smoke harness
- * (Task 1.5.1 / 2.3.2) re-verifies it live against a real opencode process.
+ * this identical adapter, so it lives in core, written once — and the wake
+ * notifier's `WakeClient` is a structural SUBSET of {@link EngineClient}, so the
+ * ONE adapted client serves both the engine and the wake (review finding #5; the
+ * former `adaptWakeClient` duplicate was deleted). The smoke harness (Task
+ * 1.5.1 / 2.3.2) re-verifies it live against a real opencode process.
  *
  * Input is typed STRUCTURALLY ({@link SdkSessionClient}) rather than by importing
  * `ReturnType<typeof createOpencodeClient>`: the structural type sidesteps
@@ -30,22 +43,40 @@ import type {
 	SessionPromptAsyncBody,
 	SessionStatusMap,
 } from "./session-runner";
-import type { WakeClient, WakeSessionStatusMap } from "./wake-notifier";
 
 /**
  * A `RequestResult`-style envelope: the SDK resolves method calls to an object
- * carrying `data` (plus request/response metadata the adapter ignores). `data`
- * may be `undefined`/`null` on no-content responses.
+ * carrying `data` and `error` (plus request/response metadata the adapter
+ * ignores). Exactly one of the two is populated: success → `{ data, error:
+ * undefined }`; HTTP error → `{ data: undefined, error }`. `data` may also be
+ * `undefined`/`null` on no-content successes.
  */
 interface SdkResult<T> {
 	data?: T | null;
+	error?: unknown;
+}
+
+/**
+ * Restore throw semantics at the adapter boundary: an envelope carrying `error`
+ * becomes a rejection. An `Error` instance is rethrown as-is (preserves stack);
+ * anything else (the SDK's structured error payloads) is wrapped so the message
+ * carries the full payload.
+ */
+function unwrap<T extends { error?: unknown }>(res: T): T {
+	if (res.error !== undefined) {
+		throw res.error instanceof Error
+			? res.error
+			: new Error(JSON.stringify(res.error));
+	}
+	return res;
 }
 
 /**
  * The structural subset of the real SDK client's `session` surface the adapter
  * forwards to. Each method accepts the engine's concrete call shape; the real
  * generated client satisfies this (its generic signatures are broader). Return
- * types are the raw `{ data }` envelope, which the adapter narrows.
+ * types are the raw `{ data, error }` envelope, which the adapter unwraps
+ * (throw-on-error) and narrows.
  */
 export interface SdkSessionClient {
 	session: {
@@ -62,87 +93,63 @@ export interface SdkSessionClient {
 		promptAsync(opts: {
 			path: { id: string };
 			body: SessionPromptAsyncBody;
-		}): Promise<unknown>;
-		abort(opts: { path: { id: string } }): Promise<unknown>;
+		}): Promise<SdkResult<unknown>>;
+		abort(opts: { path: { id: string } }): Promise<SdkResult<unknown>>;
 		messages(opts: { path: { id: string } }): Promise<SdkResult<GateMessage[]>>;
-		get(opts: { path: { id: string } }): Promise<unknown>;
+		get(opts: { path: { id: string } }): Promise<SdkResult<unknown>>;
 		/** Global turn-liveness status map (audit row f) — Task 7.1.1 completion veto. */
 		status(): Promise<SdkResult<SessionStatusMap>>;
 	};
 }
 
 /**
- * The structural subset the wake notifier (Task 6.3.1) needs: the GLOBAL
- * `session.status` map read (audit row f) and `session.promptAsync` to the parent
- * (audit row b). The real generated client satisfies this (broader, compatible
- * generic signatures); like {@link SdkSessionClient} this avoids importing the
- * full client type and keeps core free of a value-level SDK dependency.
- */
-export interface SdkWakeSessionClient {
-	session: {
-		status(): Promise<SdkResult<WakeSessionStatusMap>>;
-		promptAsync(opts: {
-			path: { id: string };
-			body: {
-				agent?: string;
-				parts: Array<{ type: "text"; text: string }>;
-			};
-		}): Promise<unknown>;
-	};
-}
-
-/**
  * Wrap a real SDK client as the engine's structural {@link EngineClient}. Each
- * method forwards the engine's call shape verbatim and narrows the `{ data }`
- * result to exactly what the engine reads. This is the single place that breaks
- * loudly if the live SDK ever drifts from the audited shapes.
+ * method forwards the engine's call shape verbatim, THROWS when the envelope
+ * carries `error` (see {@link unwrap} — the engine's catch-based error paths
+ * depend on it), and narrows the `{ data }` result to exactly what the engine
+ * reads. This is the single place that breaks loudly if the live SDK ever
+ * drifts from the audited shapes.
  */
 export function adaptSdkClient(client: SdkSessionClient): EngineClient {
 	return {
 		session: {
 			create: async (opts) => {
-				const res = await client.session.create({
-					body: opts.body,
-					// Epic H.1 (inert seam): forward the create-time directory query ONLY
-					// when present, so the live SDK call is byte-identical to today when
-					// no query is passed — preserving this adapter's "single drift-
-					// detection point" contract.
-					...(opts.query !== undefined ? { query: opts.query } : {}),
-				});
+				const res = unwrap(
+					await client.session.create({
+						body: opts.body,
+						// Epic H.1 (inert seam): forward the create-time directory query ONLY
+						// when present, so the live SDK call is byte-identical to today when
+						// no query is passed — preserving this adapter's "single drift-
+						// detection point" contract.
+						...(opts.query !== undefined ? { query: opts.query } : {}),
+					}),
+				);
 				return { data: res.data ? { id: res.data.id } : undefined };
 			},
 			promptAsync: async (opts) =>
-				client.session.promptAsync({ path: opts.path, body: opts.body }),
-			abort: async (opts) => client.session.abort({ path: opts.path }),
+				unwrap(
+					await client.session.promptAsync({
+						path: opts.path,
+						body: opts.body,
+					}),
+				),
+			abort: async (opts) =>
+				unwrap(await client.session.abort({ path: opts.path })),
 			messages: async (opts) => {
-				const res = await client.session.messages({ path: opts.path });
+				const res = unwrap(await client.session.messages({ path: opts.path }));
 				return { data: res.data ?? undefined };
 			},
-			get: async (opts) => client.session.get({ path: opts.path }),
+			// An HTTP-404 `get` THROWS (via unwrap), so `sessionExists` /
+			// restart-recovery / `resume()` verification observe a rejection — the
+			// session-gone semantics the runner's catch blocks were written for.
+			get: async (opts) =>
+				unwrap(await client.session.get({ path: opts.path })),
+			// A failed status read THROWS, so the gate's conservative veto blocks
+			// completion instead of misreading the failure as "absent = idle".
 			status: async () => {
-				const res = await client.session.status();
+				const res = unwrap(await client.session.status());
 				return { data: res.data ?? undefined };
 			},
-		},
-	};
-}
-
-/**
- * Wrap a real SDK client as the wake notifier's structural {@link WakeClient}
- * (Task 6.3.2). Narrows `session.status`'s `{ data }` envelope to the global
- * status map and forwards `session.promptAsync` (no `agent` — the parent keeps its
- * own). Written once in core; both plugins consume it from their entry, keeping
- * the wake wiring thin composition rather than per-plugin SDK plumbing.
- */
-export function adaptWakeClient(client: SdkWakeSessionClient): WakeClient {
-	return {
-		session: {
-			status: async () => {
-				const res = await client.session.status();
-				return { data: res.data ?? undefined };
-			},
-			promptAsync: async (opts) =>
-				client.session.promptAsync({ path: opts.path, body: opts.body }),
 		},
 	};
 }

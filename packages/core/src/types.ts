@@ -25,7 +25,8 @@ export function isTerminal(status: TaskStatus): boolean {
 }
 
 export interface BgTask {
-	id: string; // "bg_" + 8-char suffix, collision-checked
+	id: string; // prefix + 8-char suffix, collision-checked (prefix is configurable
+	// per IdGenerator — background-agents mints "bg_", workflows mints "wf_")
 	sessionID?: string; // set once the child session exists
 	parentSessionID: string;
 	description: string;
@@ -39,6 +40,16 @@ export interface BgTask {
 	concurrencyKey: string;
 	model?: string; // launch `model` string (provider/model), retained so resume
 	// can re-acquire the same concurrency slot. Added in Task 1.3.4.
+	/**
+	 * The EFFECTIVE tools map dispatched with the launch prompt — the recursion
+	 * guard (unless `noSpawnTools: false`) merged with the launch's
+	 * `toolsOverride`. Stored (and persisted: the task store serializes the full
+	 * BgTask) so `resume()` replays the SAME tool config instead of a bare
+	 * recursion guard — e.g. the workflows structured-output nudge resumes a
+	 * child whose launch enabled `structured_output`. Absent on tasks persisted
+	 * before this field existed → resume falls back to the bare guard.
+	 */
+	tools?: Record<string, boolean>;
 	notified?: boolean; // notification-queue flush state (Epic 1.4)
 }
 

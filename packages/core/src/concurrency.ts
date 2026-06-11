@@ -95,11 +95,6 @@ export class ConcurrencyManager {
 		return this.waiting.get(this.keyFor(model))?.length ?? 0;
 	}
 
-	/** The synchronously-available id of an in-flight acquire. */
-	waiterId(result: AcquireResult): string {
-		return result.id;
-	}
-
 	/**
 	 * Acquire a slot. Resolves immediately when under the limit (or unlimited),
 	 * otherwise enqueues FIFO and resolves when a slot is handed off.

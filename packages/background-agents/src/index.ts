@@ -28,7 +28,6 @@
 
 import {
 	adaptSdkClient,
-	adaptWakeClient,
 	createChatMessageHook,
 	createToastNotifier,
 	createWakeNotifier,
@@ -78,16 +77,19 @@ export const BackgroundAgentsPlugin: Plugin = async ({ client }) => {
 		logger,
 	);
 
+	// ONE adapted client serves both the engine and the wake notifier —
+	// WakeClient is a structural subset of EngineClient (finding #5).
+	const adapted = adaptSdkClient(client);
+
 	const { runner, queue, fetchSessionMessages } = await createEngine({
-		client: adaptSdkClient(client),
+		client: adapted,
 		logger,
 		onNotify,
 	});
 
 	wake = createWakeNotifier({
-		client: adaptWakeClient(client),
+		client: adapted,
 		queue,
-		clock: { now: () => Date.now() },
 		logger,
 	});
 

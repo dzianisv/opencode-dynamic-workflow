@@ -41,7 +41,6 @@
 
 import {
 	adaptSdkClient,
-	adaptWakeClient,
 	createToastNotifier,
 	createWakeNotifier,
 	createWakeOnNotify,
@@ -96,8 +95,12 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory, $ }) => {
 		logger,
 	);
 
+	// ONE adapted client serves both the engine and the wake notifier —
+	// WakeClient is a structural subset of EngineClient (finding #5).
+	const adapted = adaptSdkClient(client);
+
 	const engine = createWorkflowEngine({
-		client: adaptSdkClient(client),
+		client: adapted,
 		directory,
 		onNotify,
 		logger,
@@ -109,9 +112,8 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory, $ }) => {
 	await engine.ready();
 
 	wake = createWakeNotifier({
-		client: adaptWakeClient(client),
+		client: adapted,
 		queue: engine.queue,
-		clock: { now: () => Date.now() },
 		logger,
 	});
 

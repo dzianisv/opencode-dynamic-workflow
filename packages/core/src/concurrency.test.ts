@@ -192,7 +192,7 @@ describe("ConcurrencyManager — acquire / release / queueing", () => {
 
 		await mgr.acquire(model); // holds slot, count = 1
 		const queued = mgr.acquire(model); // queued
-		const id = await mgr.waiterId(queued);
+		const id = queued.id;
 
 		mgr.cancelWaiter(model, id); // settle (reject) the only waiter
 		await expect(queued).rejects.toBeInstanceOf(WaiterCancelledError);
@@ -209,7 +209,7 @@ describe("ConcurrencyManager — cancellation", () => {
 
 		await mgr.acquire(model);
 		const queued = mgr.acquire(model);
-		const id = await mgr.waiterId(queued);
+		const id = queued.id;
 
 		mgr.release(model); // resolves the waiter via handoff
 		await queued; // resolved
@@ -227,7 +227,7 @@ describe("ConcurrencyManager — cancellation", () => {
 
 		await mgr.acquire(model);
 		const queued = mgr.acquire(model);
-		const id = await mgr.waiterId(queued);
+		const id = queued.id;
 
 		mgr.cancelWaiter(model, id);
 		await expect(queued).rejects.toBeInstanceOf(WaiterCancelledError);
@@ -240,7 +240,6 @@ describe("ConcurrencyManager — cancellation", () => {
 
 		await mgr.acquire(model);
 		const queued = mgr.acquire(model);
-		await mgr.waiterId(queued);
 
 		expect(() => mgr.cancelWaiter(model, "no-such-id")).not.toThrow();
 		expect(mgr.queueLength(model)).toBe(1);
@@ -291,7 +290,7 @@ describe("ConcurrencyManager — cancellation", () => {
 
 		await mgr.acquire(model);
 		const queued = mgr.acquire(model);
-		const id = await mgr.waiterId(queued);
+		const id = queued.id;
 
 		// Hand off the slot (resolves the waiter)...
 		mgr.release(model);
@@ -321,19 +320,19 @@ describe("ConcurrencyManager — FIFO under interleaving", () => {
 		};
 
 		const w1 = mgr.acquire(model);
-		const id1 = mgr.waiterId(w1);
+		const id1 = w1.id;
 		track(w1, "w1");
 
 		const w2 = mgr.acquire(model);
-		const id2 = mgr.waiterId(w2);
+		const id2 = w2.id;
 		track(w2, "w2");
 
 		const w3 = mgr.acquire(model);
-		mgr.waiterId(w3);
+
 		track(w3, "w3");
 
 		const w4 = mgr.acquire(model);
-		mgr.waiterId(w4);
+
 		track(w4, "w4");
 
 		expect(mgr.queueLength(model)).toBe(4);
@@ -355,5 +354,38 @@ describe("ConcurrencyManager — FIFO under interleaving", () => {
 		await w4;
 
 		expect(order).toEqual(["w3", "w4"]);
+	});
+});
+
+describe("ConcurrencyManager — provider-key slot sharing (finding #8)", () => {
+	test("two models under one providerConcurrency key contend for the same slot; release hands off across models", async () => {
+		const mgr = new ConcurrencyManager({
+			providerConcurrency: { anthropic: 1 },
+		});
+
+		// opus takes the provider's only slot…
+		await mgr.acquire("anthropic/opus");
+		expect(mgr.runningCount("anthropic/opus")).toBe(1);
+		// …and a DIFFERENT model under the same provider sees the same key/count.
+		expect(mgr.runningCount("anthropic/sonnet")).toBe(1);
+
+		// sonnet must queue: it shares the provider slot, not a per-model one.
+		const queued = mgr.acquire("anthropic/sonnet");
+		expect(await settledState(queued)).toBe("pending");
+		expect(mgr.queueLength("anthropic/opus")).toBe(1); // same queue, either name
+
+		// an unrelated provider is unaffected.
+		await mgr.acquire("openai/gpt");
+		expect(mgr.queueLength("openai/gpt")).toBe(0);
+
+		// releasing under the OPUS name hands the slot to the queued SONNET waiter.
+		mgr.release("anthropic/opus");
+		expect(await settledState(queued)).toBe("resolved");
+		expect(mgr.runningCount("anthropic/sonnet")).toBe(1); // handoff: count stable
+		expect(mgr.queueLength("anthropic/sonnet")).toBe(0);
+
+		// draining under the SONNET name returns the provider key to baseline.
+		mgr.release("anthropic/sonnet");
+		expect(mgr.runningCount("anthropic/opus")).toBe(0);
 	});
 });

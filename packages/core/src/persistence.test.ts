@@ -2,8 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTaskStore, resolveDataBaseDir } from "./persistence";
-import type { BgTask, Clock } from "./types";
+import { type FsFacade, nodeFsFacade } from "./fs";
+import {
+	createTaskStore,
+	isValidTask,
+	resolveDataBaseDir,
+} from "./persistence";
+import type { BgTask, Clock, TaskStatus } from "./types";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -321,5 +326,400 @@ describe("resolveDataBaseDir", () => {
 		delete process.env.OPENCODE_DRAWERS_DATA_DIR;
 		delete process.env.XDG_DATA_HOME;
 		expect(typeof resolveDataBaseDir()).toBe("string");
+	});
+});
+
+// ---- finding #1: full BgTask validation -------------------------------------
+
+describe("isValidTask — validation arms", () => {
+	/** A valid raw task object the arms below corrupt one field at a time. */
+	function raw(over: Record<string, unknown> = {}): Record<string, unknown> {
+		return { ...fullTask(), tools: { bash: true, bg_task: false }, ...over };
+	}
+
+	test("a fully-populated task validates", () => {
+		expect(isValidTask(raw())).toBe(true);
+	});
+
+	test("a minimal task (only required fields) validates", () => {
+		expect(
+			isValidTask({
+				id: "bg_min00001",
+				parentSessionID: "p",
+				description: "d",
+				agent: "build",
+				status: "running",
+				createdAt: 1000,
+				depth: 0,
+				concurrencyKey: "k",
+			}),
+		).toBe(true);
+	});
+
+	test("non-object and null are rejected", () => {
+		expect(isValidTask(null)).toBe(false);
+		expect(isValidTask("string")).toBe(false);
+		expect(isValidTask(42)).toBe(false);
+		expect(isValidTask(undefined)).toBe(false);
+	});
+
+	test.each([
+		["missing id", { id: undefined }],
+		["empty id", { id: "" }],
+		["non-string id", { id: 7 }],
+		["missing parentSessionID", { parentSessionID: undefined }],
+		["non-string parentSessionID", { parentSessionID: 1 }],
+		["missing status", { status: undefined }],
+		["unknown status", { status: "exploded" }],
+		["missing description", { description: undefined }],
+		["non-string description", { description: 5 }],
+		["missing agent", { agent: undefined }],
+		["non-string agent", { agent: {} }],
+		["missing createdAt", { createdAt: undefined }],
+		["non-number createdAt", { createdAt: "1000" }],
+		["NaN createdAt", { createdAt: Number.NaN }],
+		["missing depth", { depth: undefined }],
+		["non-number depth", { depth: "0" }],
+		["missing concurrencyKey", { concurrencyKey: undefined }],
+		["non-string concurrencyKey", { concurrencyKey: 9 }],
+	] as Array<
+		[string, Record<string, unknown>]
+	>)("required field arm rejects: %s", (_name, over) => {
+		expect(isValidTask(raw(over))).toBe(false);
+	});
+
+	test.each([
+		["non-string sessionID", { sessionID: 42 }],
+		["non-string model", { model: 42 }],
+		["non-string error", { error: { message: "x" } }],
+		["non-number startedAt", { startedAt: "1100" }],
+		["non-number completedAt", { completedAt: "1200" }],
+		["NaN completedAt", { completedAt: Number.NaN }],
+		["non-boolean notified", { notified: "yes" }],
+		["non-object tools", { tools: "bash" }],
+		["array tools", { tools: ["bash"] }],
+		["tools with non-boolean value", { tools: { bash: "yes" } }],
+	] as Array<
+		[string, Record<string, unknown>]
+	>)("wrong-typed optional arm rejects: %s", (_name, over) => {
+		expect(isValidTask(raw(over))).toBe(false);
+	});
+
+	test("optionals may be absent; tools of booleans is accepted", () => {
+		const t = raw();
+		delete t.sessionID;
+		delete t.model;
+		delete t.error;
+		delete t.startedAt;
+		delete t.completedAt;
+		delete t.notified;
+		delete t.tools;
+		expect(isValidTask(t)).toBe(true);
+		expect(isValidTask(raw({ tools: {} }))).toBe(true);
+	});
+
+	test("load skips a task missing createdAt (NaN-activity zombie guard)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "drawers-valid-"));
+		try {
+			const { logger, errors } = makeLogger();
+			const bad = raw({ id: "bg_nocreate1", createdAt: undefined });
+			delete bad.createdAt;
+			await writeFile(
+				join(dir, "bg_nocreate1.json"),
+				JSON.stringify(bad),
+				"utf-8",
+			);
+			const store = createTaskStore({
+				baseDir: dir,
+				clock: fixedClock(),
+				logger,
+			});
+			const loaded = await store.load();
+			await store.dispose();
+			expect(loaded).toEqual([]);
+			expect(errors.length).toBeGreaterThanOrEqual(1);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ---- finding #2: save() snapshots at call time (deep, not shallow) ----------
+
+describe("save snapshot isolation", () => {
+	test("mutating a NESTED array after save() returns cannot change what lands on disk", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "drawers-snap-"));
+		try {
+			interface DeepRecord {
+				id: string;
+				parentSessionID: string;
+				status: TaskStatus;
+				completedAt?: number;
+				agents: Array<{ label: string }>;
+			}
+			const isDeep = (value: unknown): value is DeepRecord =>
+				typeof value === "object" && value !== null && "agents" in value;
+			const store = createTaskStore<DeepRecord>({
+				baseDir: dir,
+				clock: fixedClock(),
+				validate: isDeep,
+			});
+			const record: DeepRecord = {
+				id: "wf_deep0001",
+				parentSessionID: "p",
+				status: "running",
+				agents: [{ label: "alpha" }],
+			};
+			// Take the promise WITHOUT awaiting, then mutate the nested array (the
+			// workflows engine accumulates agents[]/checkpoints[] in place) before
+			// the queued write lands.
+			const pending = store.save(record);
+			record.agents.push({ label: "beta" });
+			const first = record.agents[0];
+			if (first) {
+				first.label = "mutated";
+			}
+			await pending;
+			await store.dispose();
+
+			const onDisk = JSON.parse(
+				await readFile(join(dir, "wf_deep0001.json"), "utf-8"),
+			) as DeepRecord;
+			expect(onDisk.agents).toEqual([{ label: "alpha" }]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ---- finding #3: pluggable validation for non-BgTask records ----------------
+
+describe("createTaskStore — generic record type with custom validator", () => {
+	interface RunLikeRecord {
+		id: string;
+		parentSessionID: string;
+		status: TaskStatus;
+		completedAt?: number;
+		scriptPath: string;
+	}
+
+	function isRunLike(value: unknown): value is RunLikeRecord {
+		if (typeof value !== "object" || value === null) {
+			return false;
+		}
+		const v = value as Record<string, unknown>;
+		return (
+			typeof v.id === "string" &&
+			typeof v.parentSessionID === "string" &&
+			typeof v.status === "string" &&
+			typeof v.scriptPath === "string"
+		);
+	}
+
+	test("round-trips a non-BgTask record through an honest validator (no casts)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "drawers-generic-"));
+		try {
+			const store = createTaskStore<RunLikeRecord>({
+				baseDir: dir,
+				clock: fixedClock(),
+				validate: isRunLike,
+			});
+			const record: RunLikeRecord = {
+				id: "wf_run00001",
+				parentSessionID: "p",
+				status: "completed",
+				completedAt: 999_500,
+				scriptPath: "/tmp/script.ts",
+			};
+			await store.save(record);
+			await store.dispose();
+
+			const reopened = createTaskStore<RunLikeRecord>({
+				baseDir: dir,
+				clock: fixedClock(),
+				validate: isRunLike,
+			});
+			const loaded = await reopened.load();
+			await reopened.dispose();
+			expect(loaded).toEqual([record]);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("custom validator rejections are skipped + logged like BgTask corruption", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "drawers-generic2-"));
+		try {
+			const { logger, errors } = makeLogger();
+			await writeFile(
+				join(dir, "wf_bad00001.json"),
+				JSON.stringify({ id: "wf_bad00001", parentSessionID: "p" }),
+				"utf-8",
+			);
+			const store = createTaskStore<RunLikeRecord>({
+				baseDir: dir,
+				clock: fixedClock(),
+				validate: isRunLike,
+				logger,
+			});
+			expect(await store.load()).toEqual([]);
+			await store.dispose();
+			expect(errors.length).toBeGreaterThanOrEqual(1);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ---- finding #9: failure injection through the FsFacade seam ----------------
+
+describe("createTaskStore — fs failure injection", () => {
+	let baseDir: string;
+
+	beforeEach(async () => {
+		baseDir = await mkdtemp(join(tmpdir(), "drawers-fail-"));
+	});
+
+	afterEach(async () => {
+		await rm(baseDir, { recursive: true, force: true });
+	});
+
+	/** Wrap the real facade, overriding selected methods. */
+	function failingFs(over: Partial<FsFacade>): FsFacade {
+		return { ...nodeFsFacade(), ...over };
+	}
+
+	test("(a) writeFile failure rejects the caller's save promise and logs", async () => {
+		const { logger, errors } = makeLogger();
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(),
+			logger,
+			fs: failingFs({
+				writeFile: async () => {
+					throw new Error("disk full");
+				},
+			}),
+		});
+		await expect(store.save(fullTask({ id: "bg_failwr01" }))).rejects.toThrow(
+			"disk full",
+		);
+		await store.dispose();
+		expect(errors.some((e) => e.msg.includes("save failed"))).toBe(true);
+	});
+
+	test("(a) rename failure rejects the caller's save promise and logs", async () => {
+		const { logger, errors } = makeLogger();
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(),
+			logger,
+			fs: failingFs({
+				rename: async () => {
+					throw new Error("rename boom");
+				},
+			}),
+		});
+		await expect(store.save(fullTask({ id: "bg_failrn01" }))).rejects.toThrow(
+			"rename boom",
+		);
+		await store.dispose();
+		expect(errors.some((e) => e.msg.includes("save failed"))).toBe(true);
+	});
+
+	test("(b) the chain recovers — a later save of the same id lands after one failure", async () => {
+		let failures = 0;
+		const real = nodeFsFacade();
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(),
+			fs: failingFs({
+				writeFile: async (path, data, enc) => {
+					if (failures === 0) {
+						failures += 1;
+						throw new Error("transient");
+					}
+					return real.writeFile(path, data, enc);
+				},
+			}),
+		});
+		await expect(
+			store.save(fullTask({ id: "bg_recover1", description: "first" })),
+		).rejects.toThrow("transient");
+		await store.save(fullTask({ id: "bg_recover1", description: "second" }));
+		await store.dispose();
+
+		const onDisk = JSON.parse(
+			await readFile(join(baseDir, "bg_recover1.json"), "utf-8"),
+		) as BgTask;
+		expect(onDisk.description).toBe("second");
+	});
+
+	test("(c) non-ENOENT readdir failure → [] + log", async () => {
+		const { logger, errors } = makeLogger();
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(),
+			logger,
+			fs: failingFs({
+				readdir: async () => {
+					const err = new Error("permission denied") as Error & {
+						code: string;
+					};
+					err.code = "EACCES";
+					throw err;
+				},
+			}),
+		});
+		expect(await store.load()).toEqual([]);
+		await store.dispose();
+		expect(errors.some((e) => e.msg.includes("readdir"))).toBe(true);
+	});
+
+	test("(d) TTL-sweep rm failure → log + continue loading the rest", async () => {
+		const now = 1_000_000_000;
+		const ttlMs = 1000;
+		// Seed two files with a healthy store: one expired, one fresh.
+		const seedStore = createTaskStore({ baseDir, clock: fixedClock(now) });
+		await seedStore.save(
+			fullTask({ id: "bg_expired1", completedAt: now - ttlMs - 1 }),
+		);
+		await seedStore.save(
+			fullTask({ id: "bg_fresh001", completedAt: now - 10 }),
+		);
+		await seedStore.dispose();
+
+		const { logger, errors } = makeLogger();
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(now),
+			ttlMs,
+			logger,
+			fs: failingFs({
+				rm: async () => {
+					throw new Error("rm boom");
+				},
+			}),
+		});
+		const loaded = await store.load();
+		await store.dispose();
+		expect(loaded.map((t) => t.id)).toEqual(["bg_fresh001"]);
+		expect(errors.some((e) => e.msg.includes("ttl sweep"))).toBe(true);
+	});
+
+	test("(e) dispose after a failed write resolves (does not hang)", async () => {
+		const store = createTaskStore({
+			baseDir,
+			clock: fixedClock(),
+			fs: failingFs({
+				writeFile: async () => {
+					throw new Error("always fails");
+				},
+			}),
+		});
+		await expect(store.save(fullTask({ id: "bg_hang0001" }))).rejects.toThrow(
+			"always fails",
+		);
+		await expect(store.dispose()).resolves.toBeUndefined();
 	});
 });

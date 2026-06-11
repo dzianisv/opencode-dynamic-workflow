@@ -22,8 +22,8 @@
 
 import {
 	createChatMessageHook,
-	type NotificationQueue,
 	type NotificationQueueLogger,
+	type TaskNotice,
 } from "@drawers/core";
 import type { Hooks } from "@opencode-ai/plugin";
 import type { RunHandle, WorkflowEngine } from "./engine";
@@ -71,7 +71,9 @@ function makeDigestPart(opts: {
  */
 export function createWorkflowChatMessageHook(
 	engine: WorkflowEngine,
-	queue: NotificationQueue,
+	// Structurally the one member the terminal flush uses, so the engine's
+	// RunRecord-typed queue passes without widening (finding #3).
+	queue: { flushFor(parentSessionID: string): TaskNotice[] },
 	logger?: NotificationQueueLogger,
 ): ChatMessageHook {
 	const terminalHook = createChatMessageHook(queue, logger);

@@ -24,7 +24,8 @@ export interface IdGeneratorOptions {
 
 export interface IdGenerator {
 	/**
-	 * Returns a fresh `bg_*` ID not present in `liveIds`. Regenerates on
+	 * Returns a fresh prefix-namespaced ID (default `bg_*`; the prefix is
+	 * configurable per generator) not present in `liveIds`. Regenerates on
 	 * collision and throws after {@link MAX_ATTEMPTS} attempts rather than
 	 * looping forever.
 	 */
@@ -38,7 +39,12 @@ export function createIdGenerator(opts: IdGeneratorOptions = {}): IdGenerator {
 	function candidate(): string {
 		let suffix = "";
 		for (let i = 0; i < SUFFIX_LENGTH; i += 1) {
-			const index = Math.floor(random() * ALPHABET.length) % ALPHABET.length;
+			const raw = Math.floor(random() * ALPHABET.length) % ALPHABET.length;
+			// A misbehaving injected `random` (NaN, negative) would otherwise index
+			// out of the alphabet and leak literal "undefined" into the id
+			// (`bg_undefined…`). Clamp to a valid index instead — the id stays
+			// well-formed even under a broken source.
+			const index = Number.isFinite(raw) && raw >= 0 ? raw : 0;
 			suffix += ALPHABET[index];
 		}
 		return `${prefix}${suffix}`;

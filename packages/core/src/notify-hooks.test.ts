@@ -42,6 +42,7 @@ function makeQueue(
 	return {
 		push: notImpl("push") as NotificationQueue["push"],
 		flushFor: flushImpl,
+		consume: notImpl("consume") as NotificationQueue["consume"],
 		pending: notImpl("pending") as NotificationQueue["pending"],
 		seed: notImpl("seed") as NotificationQueue["seed"],
 	};
@@ -122,7 +123,8 @@ describe("createChatMessageHook", () => {
 		expect(visible.text).toContain("✅");
 		expect(visible.text).toContain("bg_abc12345");
 		expect(visible.text).toContain("do the thing");
-		expect(visible.text).toContain("32s");
+		// Rendered by the ONE shared humanizeDuration (finding #7): 32_000 → 32.0s.
+		expect(visible.text).toContain("32.0s");
 
 		// synthetic part: model-only retrieval hint.
 		expect(synthetic.type).toBe("text");
@@ -250,6 +252,25 @@ describe("createToastNotifier", () => {
 		expect(logger.errors).toHaveLength(1);
 		expect(logger.errors[0]?.[0]).toContain("showToast");
 	});
+
+	// Finding #8: the user-supplied toastTitle render callback must not escape
+	// the fence — a throw is swallowed + logged, the notifier never propagates.
+	test("a throwing toastTitle render override is swallowed and logged", () => {
+		const logger = makeLogger();
+		const calls: unknown[] = [];
+		const showToast = (data: unknown) => {
+			calls.push(data);
+			return Promise.resolve();
+		};
+		const notify = createToastNotifier(showToast as never, logger, {
+			toastTitle: () => {
+				throw new Error("title boom");
+			},
+		});
+		expect(() => notify(makeNotice())).not.toThrow();
+		expect(calls).toHaveLength(0);
+		expect(logger.errors).toHaveLength(1);
+	});
 });
 
 // ---- Task 6.3.2: createWakeOnNotify — toast + active wake composition -------
@@ -311,5 +332,24 @@ describe("createWakeOnNotify", () => {
 		await Promise.resolve();
 		expect(logger.errors).toHaveLength(1);
 		expect(logger.errors[0]?.[0]).toContain("wake");
+	});
+
+	// Finding #8: a THROWING toast callback must not escape the composed
+	// onNotify (which the queue invokes on the push path) — the wake still fires
+	// and the throw is logged.
+	test("a throwing toast is fenced and logged; the wake still fires", () => {
+		const logger = makeLogger();
+		const wake = makeWake();
+		const onNotify = createWakeOnNotify(
+			() => {
+				throw new Error("toast boom");
+			},
+			() => wake,
+			logger,
+		);
+		expect(() => onNotify(makeNotice())).not.toThrow();
+		expect(wake.seen).toHaveLength(1);
+		expect(logger.errors).toHaveLength(1);
+		expect(logger.errors[0]?.[0]).toContain("toast");
 	});
 });

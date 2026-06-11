@@ -30,11 +30,8 @@
  */
 
 import type { Hooks } from "@opencode-ai/plugin";
-import type {
-	NotificationQueue,
-	NotificationQueueLogger,
-	TaskNotice,
-} from "./notify";
+import { humanizeDuration } from "./format";
+import type { NotificationQueueLogger, TaskNotice } from "./notify";
 import type { TaskStatus } from "./types";
 import type { WakeNotifier } from "./wake-notifier";
 
@@ -77,25 +74,6 @@ const STATUS_VARIANT: Record<TaskStatus, ToastVariant> = {
 export interface NotifyRenderOptions {
 	/** Visible toast title, given a terminal notice. Default: `Background task <status>`. */
 	toastTitle?: (notice: TaskNotice) => string;
-}
-
-/** Humanize a millisecond duration into a compact `32s` / `4m12s` / `120ms` form. */
-function humanizeDuration(ms: number): string {
-	if (ms < 1000) {
-		return `${Math.round(ms)}ms`;
-	}
-	const totalSeconds = Math.round(ms / 1000);
-	if (totalSeconds < 60) {
-		return `${totalSeconds}s`;
-	}
-	const minutes = Math.floor(totalSeconds / 60);
-	const seconds = totalSeconds % 60;
-	if (minutes < 60) {
-		return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
-	}
-	const hours = Math.floor(minutes / 60);
-	const remMinutes = minutes % 60;
-	return remMinutes > 0 ? `${hours}h${remMinutes}m` : `${hours}h`;
 }
 
 /** One compact human line for the visible summary part. */
@@ -142,11 +120,13 @@ function makeTextPart(opts: {
  * Build the `chat.message` hook bound to a notification queue.
  *
  * @param queue  the per-parent notice queue; `flushFor` drains oldest-first and
- *               fires `markNotified` internally.
+ *               fires `markNotified` internally. Typed structurally at the ONE
+ *               member the hook uses, so any `NotificationQueue<T>` (BgTask or
+ *               the workflows RunRecord) passes without casts (finding #3).
  * @param logger optional structured logger for swallowed-failure reporting.
  */
 export function createChatMessageHook(
-	queue: NotificationQueue,
+	queue: { flushFor(parentSessionID: string): TaskNotice[] },
 	logger?: NotificationQueueLogger,
 ): NonNullable<Hooks["chat.message"]> {
 	return async (input, output) => {
@@ -162,14 +142,15 @@ export function createChatMessageHook(
 			const visibleText = notices.map(visibleLine).join("\n");
 			const syntheticText = notices.map((n) => n.hint).join("\n");
 
-			// Mutate in place — push, never reassign output.parts.
+			// Mutate in place — push, never reassign output.parts. TextPart is a
+			// member of the Part union, so no cast is needed.
 			output.parts.push(
 				makeTextPart({
 					id: `prt_bgnotify_${messageID}_visible`,
 					sessionID,
 					messageID,
 					text: visibleText,
-				}) as Part,
+				}),
 			);
 			output.parts.push(
 				makeTextPart({
@@ -178,7 +159,7 @@ export function createChatMessageHook(
 					messageID,
 					text: syntheticText,
 					synthetic: true,
-				}) as Part,
+				}),
 			);
 		} catch (err) {
 			// chat.message is prompt-pipeline: a throw kills the user's message.
@@ -217,13 +198,16 @@ export function createToastNotifier(
 ): (notice: TaskNotice) => void {
 	const toastTitle = render?.toastTitle ?? defaultToastTitle;
 	return (notice) => {
-		const variant = STATUS_VARIANT[notice.status] ?? "info";
-		const title = toastTitle(notice);
-		const message =
-			notice.durationMs !== undefined
-				? `${notice.taskId} '${notice.description}' in ${humanizeDuration(notice.durationMs)}`
-				: `${notice.taskId} '${notice.description}'`;
+		// EVERYTHING inside the fence (finding #8): `toastTitle` is user-supplied,
+		// so its render runs under the same try as the toast call — a throwing
+		// override must not escape the notifier any more than a throwing toast.
 		try {
+			const variant = STATUS_VARIANT[notice.status] ?? "info";
+			const title = toastTitle(notice);
+			const message =
+				notice.durationMs !== undefined
+					? `${notice.taskId} '${notice.description}' in ${humanizeDuration(notice.durationMs)}`
+					: `${notice.taskId} '${notice.description}'`;
 			const result = showToast({ body: { title, message, variant } });
 			if (result && typeof result.then === "function") {
 				result.catch((err: unknown) => {
@@ -265,7 +249,17 @@ export function createWakeOnNotify(
 	logger?: NotificationQueueLogger,
 ): (notice: TaskNotice) => void {
 	return (notice) => {
-		toast(notice);
+		// Fence the toast (finding #8): it is a user-supplied callback invoked on
+		// the queue's push path — a throw here must not break the enqueue, and must
+		// not suppress the wake.
+		try {
+			toast(notice);
+		} catch (err) {
+			logger?.error?.("toast callback threw", {
+				id: notice.taskId,
+				err: err instanceof Error ? err.message : String(err),
+			});
+		}
 		const wake = getWake();
 		if (!wake) {
 			return;

@@ -115,6 +115,18 @@ export interface SessionRunnerLogger {
 
 export interface SessionRunnerConfig extends CompletionConfig {
 	maxDepth?: number;
+	/**
+	 * How long a TERMINAL task stays in the in-memory maps (ms) before the
+	 * terminal-teardown sweep evicts it. Mirrors the on-disk task store's 24h
+	 * TTL — without it, terminal tasks accumulate forever (finding #7). Default
+	 * 24h. `readOutput`/`list` keep working for recently-terminal tasks.
+	 */
+	terminalTtlMs?: number;
+	/**
+	 * Hard cap on terminal tasks held in memory; the sweep evicts oldest-first
+	 * (by `completedAt`) beyond it, regardless of TTL. Default 500.
+	 */
+	maxTerminalTasks?: number;
 }
 
 export interface SessionRunnerDeps {
@@ -152,6 +164,15 @@ export interface SessionRunnerDeps {
 const DEFAULT_MAX_DEPTH = 2;
 /** Concurrency key seed when a request carries no model. */
 const DEFAULT_MODEL_KEY = "default";
+/** Terminal in-memory retention defaults (finding #7): TTL mirrors the disk
+ *  store's 24h; the cap bounds memory regardless of clock. */
+const DEFAULT_TERMINAL_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_TERMINAL_TASKS = 500;
+/** Bound for a queued resume acquire (finding #3): reuses the stale-timeout
+ *  semantics (a queued LAUNCH gets the same window via the poll's
+ *  queue-timeout cancel; a queued RESUME is invisible to the poll — the task
+ *  is still terminal — so it gets its own timer with the same default). */
+const DEFAULT_RESUME_ACQUIRE_TIMEOUT_MS = 45 * 60 * 1000;
 
 /** The recursion-guard tool map: every spawn/workflow tool disabled. */
 const SPAWN_GUARD: Record<string, boolean> = {
@@ -201,6 +222,12 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	const { client, concurrency, ids, clock } = deps;
 	const persist = deps.persist;
 	const maxDepth = deps.config?.maxDepth ?? DEFAULT_MAX_DEPTH;
+	const terminalTtlMs = deps.config?.terminalTtlMs ?? DEFAULT_TERMINAL_TTL_MS;
+	const maxTerminalTasks =
+		deps.config?.maxTerminalTasks ?? DEFAULT_MAX_TERMINAL_TASKS;
+	const resumeAcquireTimeoutMs =
+		deps.config?.staleTimeoutMs ?? DEFAULT_RESUME_ACQUIRE_TIMEOUT_MS;
+	const setTimerFn = deps.setTimer ?? defaultTimer;
 
 	const tasks = new Map<string, BgTask>();
 	// Secondary index: sessionID → task, so the completion gate resolves a task by
@@ -225,6 +252,50 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	// only after a successful acquire; the completion gate's `freeSlot` consults
 	// it to release exactly once (or cancel the still-queued waiter instead).
 	const heldSlots = new Map<string, string>();
+	// Per-task resume guard (finding #3): a SYNCHRONOUS check-and-set at the top
+	// of resume() — two concurrent resumes would double-acquire and the second
+	// `heldSlots.set` overwrite would leak a slot permanently.
+	const resumesInFlight = new Set<string>();
+
+	/**
+	 * Evict stale TERMINAL tasks from the in-memory maps (finding #7). Runs at
+	 * every terminal teardown (the gate's onTaskComplete hook): drops terminal
+	 * entries older than {@link SessionRunnerConfig.terminalTtlMs} and enforces
+	 * {@link SessionRunnerConfig.maxTerminalTasks} oldest-first. The task that
+	 * JUST completed has `completedAt = now`, so it always survives (recently-
+	 * terminal tasks stay visible to `readOutput`/`list`/`resume`).
+	 */
+	function evictTerminal(now: number): void {
+		const terminal: BgTask[] = [];
+		for (const t of tasks.values()) {
+			if (isTerminal(t.status)) {
+				terminal.push(t);
+			}
+		}
+		const evict = (t: BgTask): void => {
+			tasks.delete(t.id);
+			// Recovered terminal tasks were indexed at construction and never tore
+			// down, so their sessionID entries are cleaned here too.
+			if (t.sessionID !== undefined && tasksBySession.get(t.sessionID) === t) {
+				tasksBySession.delete(t.sessionID);
+			}
+		};
+		const completedOf = (t: BgTask): number => t.completedAt ?? t.createdAt;
+		const survivors: BgTask[] = [];
+		for (const t of terminal) {
+			if (now - completedOf(t) >= terminalTtlMs) {
+				evict(t);
+			} else {
+				survivors.push(t);
+			}
+		}
+		if (survivors.length > maxTerminalTasks) {
+			survivors.sort((a, b) => completedOf(a) - completedOf(b));
+			for (const t of survivors.slice(0, survivors.length - maxTerminalTasks)) {
+				evict(t);
+			}
+		}
+	}
 
 	// Release a slot recorded in `heldSlots` exactly once. Used to recover from
 	// the launch race where teardown already ran with `heldSlots` still empty.
@@ -277,22 +348,41 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			return res.data ?? [];
 		},
 		// Turn-liveness read (Task 7.1.1): the GLOBAL status map narrowed to THIS
-		// session's entry. busy/retry → live; idle → not working; absent → idle-
-		// equivalent (returns undefined). A throw here propagates to the gate, which
-		// treats a failed read as a completion veto (conservative). Reuses the same
-		// `session.status()` map the wake notifier reads (audit row f).
+		// session's entry. busy/retry → live; idle → not working; absent FROM A
+		// SUCCESSFULLY-READ map → idle-equivalent (returns undefined). A throw here
+		// propagates to the gate, which treats a failed read as a completion veto
+		// (conservative). A response with NO map at all is a FAILED read, not an
+		// absent session — it must THROW into the veto, never read as idle
+		// (finding #1e). Reuses the same `session.status()` map the wake notifier
+		// reads (audit row f).
 		fetchStatus: async (sessionID) => {
 			const res = await client.session.status();
-			return res.data?.[sessionID]?.type;
+			if (res.data === undefined) {
+				throw new Error("session.status returned no data");
+			}
+			return res.data[sessionID]?.type;
 		},
 		sessionExists: async (sessionID) => {
 			await client.session.get({ path: { id: sessionID } });
 		},
 		clock,
 		persist: maybePersist,
-		onTaskComplete: deps.onTaskComplete,
+		// Wrapped (finding #7): every terminal teardown evicts the completing
+		// task's sessionID index entry (the gate filters terminal tasks out of
+		// every lookup, so the entry is dead weight; resume() re-indexes) and
+		// sweeps stale terminal tasks, THEN forwards to the notification hook.
+		onTaskComplete: (task) => {
+			if (
+				task.sessionID !== undefined &&
+				tasksBySession.get(task.sessionID) === task
+			) {
+				tasksBySession.delete(task.sessionID);
+			}
+			evictTerminal(clock.now());
+			deps.onTaskComplete?.(task);
+		},
 		logger: deps.logger,
-		setTimer: deps.setTimer ?? defaultTimer,
+		setTimer: setTimerFn,
 		setIntervalFn: deps.setIntervalFn ?? defaultInterval,
 		config: deps.config,
 	});
@@ -432,7 +522,11 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		const modelKey = req.model ?? DEFAULT_MODEL_KEY;
 		const concurrencyKey = concurrency.keyFor(modelKey);
 
-		// (2) register a pending task.
+		// (2) register a pending task. The effective tools map is computed once
+		// and STORED on the task (finding #3): resume() replays it instead of a
+		// bare recursion guard, so a launch-time `toolsOverride` (e.g. the
+		// structured_output tool) survives into resumed turns. Persisted too —
+		// the task store serializes the full BgTask.
 		const id = ids.next(liveIds());
 		const task: BgTask = {
 			id,
@@ -444,9 +538,20 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			depth: req.depth,
 			concurrencyKey,
 			model: req.model,
+			tools: buildTools(req),
 		};
 		tasks.set(id, task);
-		await maybePersist(task);
+		try {
+			await maybePersist(task);
+		} catch (err) {
+			// A raw rethrow here would leave a REGISTERED pending task with no
+			// slot and no session — a ghost only the 45-min stale poll could clear
+			// (finding #4). Route through the gate like steps 3/5/7 so the task
+			// lands terminal (persist retried, waiters resolved, hook fired), then
+			// rethrow to the caller.
+			gate.tryComplete(id, "error", errorMessage(err));
+			throw err;
+		}
 
 		// (3) acquire a slot. Hold the AcquireResult so a cancel mid-acquire can
 		// cancel the waiter by id.
@@ -565,13 +670,26 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			throw err;
 		}
 
+		// (7b) terminal re-check across the persist await (finding #3d): a cancel
+		// (or session.error flip) landing during the persist already ran teardown
+		// — aborted the session, released the slot, deleted the turn watermark.
+		// Dispatching now would prompt an aborted session and re-insert a leaked
+		// watermark entry. Skip dispatch; return the (terminal) task.
+		{
+			const s = statusOf(id);
+			if (s !== undefined && isTerminal(s)) {
+				return task;
+			}
+		}
+
 		// (8) fire-and-forget prompt. Failure routes through the gate (error flip
 		// releases the slot). Context parts (forked transcript) are prepended.
+		// `task.tools` is the stored effective map from step (2).
 		dispatchPrompt(
 			task,
 			sessionID,
 			req.prompt,
-			buildTools(req),
+			task.tools ?? buildTools(req),
 			req.contextParts,
 		);
 
@@ -594,38 +712,86 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 	 * waiter (so the launch acquire rejects with `WaiterCancelledError`) or
 	 * releases a held slot, and aborts a live session in detached teardown.
 	 *
-	 * Already-terminal → no-op: resolve with the current state (never reject, no
-	 * second teardown — the gate's mutex denies the flip). Otherwise join the
-	 * detached teardown via `awaitCompletion` so the caller observes the released
-	 * slot and persisted state at resolve time (the 1.3.3 sharp edge).
+	 * The returned promise JOINS the teardown (finding #2): `awaitCompletion`
+	 * tracks the in-flight detached teardown per task, so cancel resolves only
+	 * once the slot is released, `completedAt` is stamped, and the terminal
+	 * state is persisted — never on the synchronous flip alone.
+	 *
+	 * Already-terminal → no-op flip: resolve with the current state (never
+	 * reject, no second teardown — the gate's mutex denies the flip), still
+	 * joining any teardown that is in flight. A terminal task may also hold a
+	 * QUEUED resume acquire (invisible to the gate, whose freeSlot only runs on
+	 * a won flip) — that waiter is cancelled here directly.
 	 */
 	async function cancel(taskId: string): Promise<BgTask> {
 		const task = tasks.get(taskId);
 		if (!task) {
 			throw new Error(`Unknown task: ${taskId}`);
 		}
-		// Won the flip → join teardown. Lost it (already terminal) → no-op; the
-		// task is already torn down, so awaitCompletion resolves immediately.
 		gate.tryComplete(taskId, "cancelled", "cancelled by user");
+		// Cancel a queued RESUME acquire: the task is terminal, so the flip above
+		// was denied and the gate's freeSlot/cancelWaiter never ran. Idempotent
+		// against the gate's own cancelWaiter on a won flip (settle-once waiters).
+		const pending = inflightAcquire.get(taskId);
+		if (pending) {
+			concurrency.cancelWaiter(pending.model, pending.waiterId);
+		}
 		return gate.awaitCompletion(taskId);
 	}
 
 	/**
 	 * Resume a terminal task with a new prompt on its existing session. No
 	 * pending-resume queue in v1: a non-terminal task rejects with
-	 * `taskStillRunning`. A missing session rejects with `sessionExpired` and the
-	 * task stays terminal. On success the task re-acquires its concurrency slot,
-	 * resets to `running` (fresh `startedAt`, cleared error/completedAt/notified),
-	 * and the completion machinery picks it up like any running task.
+	 * `taskStillRunning`; a CONCURRENT resume for the same task rejects with
+	 * `resumeInFlight` (synchronous check-and-set — two concurrent resumes would
+	 * double-acquire and leak a slot via `heldSlots` overwrite, finding #3). A
+	 * missing session rejects with `sessionExpired` and the task stays terminal.
+	 *
+	 * Fences on any in-flight terminal teardown before touching state (finding
+	 * #2), and bounds the slot re-acquire wait (a queued resume is invisible to
+	 * the stale poll — the task is still terminal — so an unbounded acquire
+	 * could hang forever; it rejects with `resumeTimeout` and leaks nothing).
+	 *
+	 * On success the task re-acquires its concurrency slot, resets to `running`
+	 * (fresh `startedAt`, cleared error/completedAt/notified), replays the
+	 * LAUNCH's effective tools map ({@link BgTask.tools}; bare recursion guard
+	 * for pre-field persisted tasks), and the completion machinery picks it up
+	 * like any running task.
 	 */
 	async function resume(taskId: string, prompt: string): Promise<BgTask> {
 		const task = tasks.get(taskId);
 		if (!task) {
 			throw new Error(`Unknown task: ${taskId}`);
 		}
+		// SYNCHRONOUS check-and-set before any await (mirrors the wake notifier's
+		// per-parent inFlight guard).
+		if (resumesInFlight.has(taskId)) {
+			throw new Error(
+				`resumeInFlight: a resume for ${taskId} is already in progress`,
+			);
+		}
+		resumesInFlight.add(taskId);
+		try {
+			return await doResume(task, taskId, prompt);
+		} finally {
+			resumesInFlight.delete(taskId);
+		}
+	}
+
+	async function doResume(
+		task: BgTask,
+		taskId: string,
+		prompt: string,
+	): Promise<BgTask> {
 		if (!isTerminal(task.status)) {
 			throw new Error(`taskStillRunning: ${taskId} is ${task.status}`);
 		}
+		// Fence on the terminal flip's DETACHED teardown (finding #2): the status
+		// is flipped synchronously but completedAt/error stamps, bookkeeping
+		// deletes, and the terminal persist run detached. awaitCompletion joins
+		// the in-flight teardown for a terminal task, so past this await no stale
+		// teardown write can clobber the resumed task.
+		await gate.awaitCompletion(taskId);
 		const sessionID = task.sessionID;
 		if (!sessionID) {
 			throw new Error(`sessionExpired: ${taskId} has no session`);
@@ -638,21 +804,38 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 		}
 
 		// Re-acquire the concurrency slot on the original model (same derivation as
-		// launch). Mirror launch's cancel-during-acquire handling.
+		// launch), with a BOUNDED wait: on timeout the still-queued waiter is
+		// cancelled (slot never held → nothing to leak) and resume rejects. If the
+		// grant races the timer, cancelWaiter no-ops on the settled waiter and the
+		// resume proceeds normally.
 		const modelKey = task.model ?? DEFAULT_MODEL_KEY;
 		const acquire = concurrency.acquire(modelKey);
 		inflightAcquire.set(taskId, { model: modelKey, waiterId: acquire.id });
+		let acquireTimedOut = false;
+		const acquireTimer = setTimerFn(() => {
+			acquireTimedOut = true;
+			concurrency.cancelWaiter(modelKey, acquire.id);
+		}, resumeAcquireTimeoutMs);
 		try {
 			await acquire;
 		} catch (err) {
 			inflightAcquire.delete(taskId);
 			if (err instanceof WaiterCancelledError) {
-				// Cancelled mid-acquire: stays/returns terminal. The task is already
-				// terminal from before resume, so flip is a no-op; ensure cancelled.
+				if (acquireTimedOut) {
+					throw new Error(
+						`resumeTimeout: ${taskId} did not acquire a concurrency slot ` +
+							`within ${resumeAcquireTimeoutMs}ms (queue for ${modelKey} stayed saturated)`,
+					);
+				}
+				// Cancelled mid-acquire (cancel() cancels a queued resume waiter
+				// directly): stays/returns terminal. The task is already terminal
+				// from before resume, so the flip is a no-op; ensure cancelled.
 				gate.tryComplete(taskId, "cancelled", "cancelled by user");
 				return gate.awaitCompletion(taskId);
 			}
 			throw err;
+		} finally {
+			acquireTimer.clear();
 		}
 		inflightAcquire.delete(taskId);
 		heldSlots.set(taskId, modelKey);
@@ -673,12 +856,27 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			throw err;
 		}
 
+		// Terminal re-check across the persist await (finding #3d, mirror of
+		// launch step 7b): a cancel landing during the persist already aborted
+		// the session and released the slot — skip dispatch.
+		{
+			const s = statusOf(taskId);
+			if (s !== undefined && isTerminal(s)) {
+				return task;
+			}
+		}
+
+		// Re-index the sessionID → task entry: the terminal teardown evicted it
+		// (finding #7), and the gate needs it to track the resumed turn.
+		indexSession(task);
+
 		// Invalidate the gate's per-turn caches so a stale idle / cached positive
 		// from the previous turn can't instantly complete the new one.
 		gate.resetForResume(task);
 
-		// Dispatch the new prompt with the same recursion-guard logic as launch.
-		dispatchPrompt(task, sessionID, prompt, { ...SPAWN_GUARD });
+		// Dispatch the new prompt replaying the launch's effective tools map
+		// (finding #3); bare recursion guard for tasks persisted before the field.
+		dispatchPrompt(task, sessionID, prompt, task.tools ?? { ...SPAWN_GUARD });
 
 		return task;
 	}
@@ -713,15 +911,22 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 			return { status: task.status, summaryText: task.error ?? "" };
 		}
 
-		const summaryText = lastAssistantText(messages);
-		if (!opts?.full) {
-			return { status: task.status, summaryText };
+		// Post-processing shares the fetch's degrade path (finding #6): the
+		// transcript is unvalidated wire data, so a malformed message must not
+		// reject the read — same graceful fallback as an unreachable session.
+		try {
+			const summaryText = lastAssistantText(messages);
+			if (!opts?.full) {
+				return { status: task.status, summaryText };
+			}
+			return {
+				status: task.status,
+				summaryText,
+				messages: filterTranscript(messages),
+			};
+		} catch {
+			return { status: task.status, summaryText: task.error ?? "" };
 		}
-		return {
-			status: task.status,
-			summaryText,
-			messages: filterTranscript(messages),
-		};
 	}
 
 	return {
@@ -749,14 +954,16 @@ const ERROR_HEAD = 1200;
 const ERROR_TAIL = 600;
 const ERROR_PATTERN = /error|fail|exception|denied|timeout/i;
 
-/** Concatenated text of the last assistant message (its text parts only). */
+/** Concatenated text of the last assistant message (its text parts only).
+ *  Defensive on unvalidated wire data (finding #6): a message missing `info`
+ *  or `parts` is skipped/empty, not a TypeError. */
 function lastAssistantText(messages: GateMessage[]): string {
 	for (let i = messages.length - 1; i >= 0; i -= 1) {
 		const m = messages[i];
-		if (m?.info.role !== "assistant") {
+		if (m?.info?.role !== "assistant") {
 			continue;
 		}
-		return m.parts
+		return (m.parts ?? [])
 			.filter((p) => p.type === "text" && !p.synthetic && p.text)
 			.map((p) => p.text ?? "")
 			.join("");
@@ -797,8 +1004,14 @@ function capToolText(text: string): string {
 function filterTranscript(messages: GateMessage[]): TaskOutputMessage[] {
 	const out: TaskOutputMessage[] = [];
 	for (const m of messages) {
+		// Defensive on unvalidated wire data (finding #6): drop messages with no
+		// readable role/parts instead of throwing mid-read.
+		const role = m?.info?.role;
+		if (role !== "user" && role !== "assistant") {
+			continue;
+		}
 		const parts: TaskOutputPart[] = [];
-		for (const p of m.parts) {
+		for (const p of m.parts ?? []) {
 			if (p.synthetic) {
 				continue;
 			}
@@ -809,7 +1022,7 @@ function filterTranscript(messages: GateMessage[]): TaskOutputMessage[] {
 			}
 		}
 		if (parts.length > 0) {
-			out.push({ role: m.info.role, parts });
+			out.push({ role, parts });
 		}
 	}
 	return out;

@@ -62,4 +62,20 @@ describe("createIdGenerator", () => {
 		const gen = createIdGenerator({});
 		expect(gen.next(new Set())).toMatch(/^bg_[a-z0-9]{8}$/);
 	});
+
+	// Finding #8: a misbehaving random source (NaN / negative) must never leak
+	// literal "undefined" into an id — the index clamps to a valid position.
+	test("NaN-returning random source still produces a well-formed id", () => {
+		const gen = createIdGenerator({ random: () => Number.NaN });
+		const id = gen.next(new Set());
+		expect(id).toMatch(/^bg_[a-z0-9]{8}$/);
+		expect(id).not.toContain("undefined");
+	});
+
+	test("negative-returning random source still produces a well-formed id", () => {
+		const gen = createIdGenerator({ random: () => -0.5 });
+		const id = gen.next(new Set());
+		expect(id).toMatch(/^bg_[a-z0-9]{8}$/);
+		expect(id).not.toContain("undefined");
+	});
 });

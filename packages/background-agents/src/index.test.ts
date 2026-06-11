@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
-	adaptWakeClient,
+	adaptSdkClient,
 	createNotificationQueue,
 	createWakeNotifier,
 	createWakeOnNotify,
-	type SdkWakeSessionClient,
+	type NoticeRecord,
+	type SdkSessionClient,
 	type TaskNotice,
 } from "@drawers/core";
 import * as entry from "./index";
@@ -29,11 +30,12 @@ describe("background-agents plugin entry module", () => {
 // ---- Task 6.3.2: active-wake wiring (toast + wake on the onNotify seam) -----
 //
 // The plugin entry composes onNotify exactly as below: a toast notifier wrapped
-// by createWakeOnNotify, with the wake notifier built from adaptWakeClient over
-// the raw SDK client and the engine's queue. These tests pin that composition's
-// behavior (idle parent → wake prompt naming bg_output; busy parent → no prompt,
-// passive flush intact) without instantiating the fs-backed engine — the wake
-// notifier itself is exhaustively tested in core's wake-notifier.test.ts.
+// by createWakeOnNotify, with the wake notifier riding the SAME adaptSdkClient-
+// wrapped client the engine uses (finding #5 — the wake adapter duplicate was
+// deleted). These tests pin that composition's behavior (idle parent → wake
+// prompt naming bg_output; busy parent → no prompt, passive flush intact)
+// without instantiating the fs-backed engine — the wake notifier itself is
+// exhaustively tested in core's wake-notifier.test.ts.
 
 interface RawStatusMap {
 	[sessionID: string]:
@@ -42,20 +44,28 @@ interface RawStatusMap {
 		| { type: "busy" };
 }
 
-function makeRawWakeClient(status: RawStatusMap): SdkWakeSessionClient & {
+function makeRawClient(status: RawStatusMap): SdkSessionClient & {
 	prompts: Array<{ id: string; text: string }>;
 } {
 	const prompts: Array<{ id: string; text: string }> = [];
+	const unexpected = (name: string) => async (): Promise<never> => {
+		throw new Error(`unexpected call: session.${name}`);
+	};
 	return {
 		prompts,
 		session: {
+			create: unexpected("create"),
+			abort: unexpected("abort"),
+			messages: unexpected("messages"),
+			get: unexpected("get"),
 			status: async () => ({ data: status }),
 			promptAsync: async (opts) => {
 				prompts.push({
 					id: opts.path.id,
 					text: opts.body.parts.map((p) => p.text).join("\n"),
 				});
-				return undefined;
+				// Real-SDK envelope: success resolves { data, error: undefined }.
+				return { data: undefined };
 			},
 		},
 	};
@@ -82,13 +92,14 @@ function settle(): Promise<void> {
 
 describe("background-agents plugin wake wiring (Task 6.3.2)", () => {
 	test("idle parent → onNotify fires toast AND a wake promptAsync naming bg_output", async () => {
-		const queue = createNotificationQueue({});
-		const raw = makeRawWakeClient({ ses_parent: { type: "idle" } });
+		// The queue is generic over NoticeRecord (finding #3), so the minimal
+		// record-shaped payload pushes honestly — no `as any`.
+		const queue = createNotificationQueue<NoticeRecord>({});
+		const raw = makeRawClient({ ses_parent: { type: "idle" } });
 		const toasted: TaskNotice[] = [];
 		const wake = createWakeNotifier({
-			client: adaptWakeClient(raw),
+			client: adaptSdkClient(raw),
 			queue,
-			clock: { now: () => 0 },
 		});
 		const onNotify = createWakeOnNotify(
 			(n) => toasted.push(n),
@@ -103,8 +114,7 @@ describe("background-agents plugin wake wiring (Task 6.3.2)", () => {
 			status: notice.status,
 			createdAt: 1,
 			completedAt: 2,
-			// biome-ignore lint/suspicious/noExplicitAny: minimal BgTask-shaped push payload.
-		} as any);
+		});
 		onNotify(queue.pending("ses_parent")[0] ?? notice);
 		await settle();
 
@@ -117,13 +127,12 @@ describe("background-agents plugin wake wiring (Task 6.3.2)", () => {
 	});
 
 	test("busy parent → toast fires, NO wake prompt, notice stays for the flush", async () => {
-		const queue = createNotificationQueue({});
-		const raw = makeRawWakeClient({ ses_parent: { type: "busy" } });
+		const queue = createNotificationQueue<NoticeRecord>({});
+		const raw = makeRawClient({ ses_parent: { type: "busy" } });
 		const toasted: TaskNotice[] = [];
 		const wake = createWakeNotifier({
-			client: adaptWakeClient(raw),
+			client: adaptSdkClient(raw),
 			queue,
-			clock: { now: () => 0 },
 		});
 		const onNotify = createWakeOnNotify(
 			(n) => toasted.push(n),
@@ -138,8 +147,7 @@ describe("background-agents plugin wake wiring (Task 6.3.2)", () => {
 			status: notice.status,
 			createdAt: 1,
 			completedAt: 2,
-			// biome-ignore lint/suspicious/noExplicitAny: minimal BgTask-shaped push payload.
-		} as any);
+		});
 		onNotify(queue.pending("ses_parent")[0] ?? notice);
 		await settle();
 

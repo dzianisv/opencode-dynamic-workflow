@@ -20,7 +20,7 @@
  */
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { FsFacade } from "@drawers/core";
+import { type FsFacade, nodeFsFacade } from "@drawers/core";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { parseScript } from "../../runtime/meta";
 import { BUILTIN_WORKFLOWS, lookupBuiltin } from "../builtins";
@@ -72,25 +72,13 @@ function joinPath(base: string, rel: string): string {
 	return `${b}/${r}`;
 }
 
-/** A node:fs/promises-backed default facade (used when no fs is injected). */
-export function nodeFs(): FsFacade {
-	// Lazy require so the module stays import-light for the in-memory test path.
-	const fs = require("node:fs/promises") as {
-		mkdir: FsFacade["mkdir"];
-		readdir: FsFacade["readdir"];
-		readFile: FsFacade["readFile"];
-		writeFile: FsFacade["writeFile"];
-		rename: FsFacade["rename"];
-		rm: FsFacade["rm"];
-		// node:fs/promises carries these natively; widening the cast formalizes
-		// them so the catalog walk's cycle guard (realpath visited-set) and the
-		// engine's stat probe see them on the production facade.
-		stat: NonNullable<FsFacade["stat"]>;
-		lstat: NonNullable<FsFacade["lstat"]>;
-		realpath: NonNullable<FsFacade["realpath"]>;
-	};
-	return fs;
-}
+/**
+ * The production default facade — core's `node:fs/promises`-backed
+ * {@link nodeFsFacade}, re-exported under the historical local name (review
+ * finding #6: ONE production facade repo-wide). Other plugin modules
+ * (skill-catalog, workflow-save) import it from here.
+ */
+export const nodeFs: () => FsFacade = nodeFsFacade;
 
 /**
  * Resolve `args` to the verbatim JSON value the script will see, or a typed

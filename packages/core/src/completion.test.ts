@@ -118,6 +118,7 @@ function makeSdk() {
 	const getFails = new Set<string>();
 	const statusBySession = new Map<string, FakeStatus>();
 	const statusThrows = new Set<string>();
+	const messagesThrows = new Set<string>();
 	const abortCalls: string[] = [];
 	let abortRejects = false;
 
@@ -131,9 +132,14 @@ function makeSdk() {
 			statusBySession.set(id, status),
 		setStatusThrows: (id: string, throws: boolean) =>
 			throws ? statusThrows.add(id) : statusThrows.delete(id),
+		setMessagesThrows: (id: string, throws: boolean) =>
+			throws ? messagesThrows.add(id) : messagesThrows.delete(id),
 		setAbortRejects: (v: boolean) => (abortRejects = v),
 		client: {
-			messages: async (id: string) => messagesBySession.get(id) ?? [],
+			messages: async (id: string) => {
+				if (messagesThrows.has(id)) throw new Error("messages fetch failed");
+				return messagesBySession.get(id) ?? [];
+			},
 			get: async (id: string) => {
 				if (getFails.has(id)) throw new Error("session gone");
 				return { id };
@@ -168,6 +174,12 @@ interface Harness {
 	clock: Clock & { set: (t: number) => void };
 	completes: BgTask[];
 	freed: string[];
+	/** Captured `logger.error` messages (teardown-resilience pins read these). */
+	errors: string[];
+	/** Swap the persist implementation (failure-injection tests). */
+	setPersist: (fn: (task: BgTask) => Promise<void>) => void;
+	/** Swap the onTaskComplete implementation (failure-injection tests). */
+	setOnTaskComplete: (fn: (task: BgTask) => void) => void;
 }
 
 interface HarnessOpts {
@@ -185,6 +197,11 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 	const sdk = makeSdk();
 	const completes: BgTask[] = [];
 	const freed: string[] = [];
+	const errors: string[] = [];
+	let persistImpl: (task: BgTask) => Promise<void> = async () => {};
+	let onCompleteImpl: (task: BgTask) => void = (t) => {
+		completes.push(t);
+	};
 
 	const task: BgTask = {
 		id: "bg_test0001",
@@ -220,9 +237,12 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 			await sdk.client.get(id);
 		},
 		clock,
-		persist: async () => {},
-		onTaskComplete: (t) => {
-			completes.push(t);
+		persist: (t) => persistImpl(t),
+		onTaskComplete: (t) => onCompleteImpl(t),
+		logger: {
+			error: (msg) => {
+				errors.push(msg);
+			},
 		},
 		setTimer: timers.setTimer,
 		setIntervalFn: timers.setIntervalFn,
@@ -235,7 +255,23 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
 	};
 
 	const gate = createCompletionGate(deps);
-	return { gate, task, tasks, timers, sdk, clock, completes, freed };
+	return {
+		gate,
+		task,
+		tasks,
+		timers,
+		sdk,
+		clock,
+		completes,
+		freed,
+		errors,
+		setPersist: (fn) => {
+			persistImpl = fn;
+		},
+		setOnTaskComplete: (fn) => {
+			onCompleteImpl = fn;
+		},
+	};
 }
 
 // ===========================================================================
@@ -849,6 +885,29 @@ describe("turn liveness — message-completion veto (Task 7.1.1)", () => {
 		expect(h.completes).toHaveLength(1);
 	});
 
+	test("fetchMessages throws during assessTurn → conservative veto; completes once the fetch recovers (finding #8)", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", VALID_OUTPUT);
+		h.sdk.setStatus("ses_child", "idle"); // status alone would allow completion
+		h.sdk.setMessagesThrows("ses_child", true); // …but the message fetch fails
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		// A failed validity/liveness read must NOT complete (sibling of the
+		// status-throws veto): wait for the next tick instead.
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+
+		h.sdk.setMessagesThrows("ses_child", false);
+		h.clock.set(1000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+
 	test("stale timeout still force-cancels a session that stays busy forever (liveness bypassed by design)", async () => {
 		const h = makeHarness({
 			pollMs: 5000,
@@ -866,5 +925,208 @@ describe("turn liveness — message-completion veto (Task 7.1.1)", () => {
 		expect(statusOf(h.task)).toBe("cancelled");
 		expect(h.task.error).toMatch(/do not create a replacement/i);
 		expect(h.sdk.abortCalls).toEqual(["ses_child"]);
+	});
+});
+
+// ===========================================================================
+// TEARDOWN JOIN + RESILIENCE (findings #2/#5/#8): the flip is synchronous but
+// teardown is detached; anything observing "terminal" must be able to JOIN the
+// in-flight teardown, and teardown itself must survive failing collaborators.
+// ===========================================================================
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason: unknown) => void;
+}
+
+function defer<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+async function settledState(
+	promise: Promise<unknown>,
+): Promise<"pending" | "resolved" | "rejected"> {
+	let state: "pending" | "resolved" | "rejected" = "pending";
+	promise.then(
+		() => {
+			state = "resolved";
+		},
+		() => {
+			state = "rejected";
+		},
+	);
+	await flush();
+	return state;
+}
+
+describe("teardown resilience (finding #8)", () => {
+	test("persist rejection: waiters still resolve, onTaskComplete still fires, failure logged", async () => {
+		const h = makeHarness();
+		h.setPersist(async () => {
+			throw new Error("disk full");
+		});
+		const p = h.gate.awaitCompletion(h.task.id);
+
+		h.gate.tryComplete(h.task.id, "completed");
+		const done = await p; // must NOT hang or reject on the persist failure
+		expect(done.status).toBe("completed");
+		expect(done.completedAt).toBeDefined();
+		expect(h.completes).toHaveLength(1);
+		expect(h.errors).toContain("persist failed during teardown");
+	});
+
+	test("onTaskComplete throw: teardown completes, waiters resolved, failure logged", async () => {
+		const h = makeHarness();
+		h.setOnTaskComplete(() => {
+			throw new Error("toast renderer blew up");
+		});
+		const p = h.gate.awaitCompletion(h.task.id);
+
+		h.gate.tryComplete(h.task.id, "error", "boom");
+		const done = await p;
+		expect(done.status).toBe("error");
+		expect(h.errors).toContain("onTaskComplete callback threw");
+
+		// the gate is still functional after the throw: a second task's teardown runs.
+		const other: BgTask = { ...h.task, id: "bg_other001", status: "running" };
+		h.tasks.set(other.id, other);
+		h.setOnTaskComplete(() => {});
+		h.gate.tryComplete(other.id, "completed");
+		await flush();
+		expect(other.status).toBe("completed");
+	});
+});
+
+describe("awaitCompletion joins the in-flight teardown (finding #2)", () => {
+	test("called AFTER the flip: resolves only once teardown (persist) has settled", async () => {
+		const h = makeHarness();
+		const persistGate = defer<void>();
+		h.setPersist(() => persistGate.promise);
+
+		// Flip first (e.g. cancel()'s tryComplete), THEN await — the old behavior
+		// resolved immediately off the terminal status while teardown still ran.
+		expect(
+			h.gate.tryComplete(h.task.id, "cancelled", "cancelled by user"),
+		).toBe(true);
+		const joined = h.gate.awaitCompletion(h.task.id);
+		expect(await settledState(joined)).toBe("pending"); // teardown not done
+
+		persistGate.resolve();
+		const done = await joined;
+		expect(done.status).toBe("cancelled");
+		expect(done.completedAt).toBeDefined();
+		// teardown fully ran before resolution: slot freed + abort + callback.
+		expect(h.freed).toEqual([h.task.id]);
+		expect(h.sdk.abortCalls).toEqual(["ses_child"]);
+		expect(h.completes).toHaveLength(1);
+	});
+
+	test("multiple concurrent waiters on one task all resolve with the terminal task (finding #8)", async () => {
+		const h = makeHarness();
+		const w1 = h.gate.awaitCompletion(h.task.id);
+		const w2 = h.gate.awaitCompletion(h.task.id);
+		const w3 = h.gate.awaitCompletion(h.task.id, 60_000); // with timeout
+
+		h.gate.tryComplete(h.task.id, "completed");
+		const [r1, r2, r3] = await Promise.all([w1, w2, w3]);
+		expect(r1.status).toBe("completed");
+		expect(r2).toBe(r1); // same task object
+		expect(r3).toBe(r1);
+		expect(h.completes).toHaveLength(1); // single teardown
+		expect(h.freed).toEqual([h.task.id]);
+	});
+
+	test("dispose awaits live detached teardowns (finding #2)", async () => {
+		const h = makeHarness();
+		const persistGate = defer<void>();
+		h.setPersist(() => persistGate.promise);
+
+		h.gate.tryComplete(h.task.id, "completed");
+		const disposed = h.gate.dispose();
+		expect(await settledState(disposed)).toBe("pending"); // teardown in flight
+
+		persistGate.resolve();
+		await disposed;
+		expect(h.task.completedAt).toBeDefined();
+		expect(h.completes).toHaveLength(1);
+	});
+});
+
+// ===========================================================================
+// MALFORMED TRANSCRIPTS (finding #5): `session.messages` is unvalidated wire
+// data. A message missing `info`/`time`/`parts` must degrade conservatively
+// (no completion, no unhandled rejection per poll tick) — never throw out of
+// the poll or the deferred-idle timer.
+// ===========================================================================
+
+describe("malformed transcript degrades conservatively (finding #5)", () => {
+	const MALFORMED = [
+		{},
+		{ info: {} },
+		{ info: { role: "assistant" } }, // no time
+		{ info: { role: "assistant", time: {} }, parts: undefined }, // no created/parts
+	] as unknown as MessageEntry[];
+
+	test("poll tick over a malformed transcript: stays running, poll keeps working", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", MALFORMED);
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		// one bad message must not complete the task nor kill the poll.
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+
+		// the transcript heals → the NEXT tick still functions and completes.
+		h.sdk.setMessages("ses_child", assistantText("done", 6500, 6800));
+		h.clock.set(1000 + 12000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
+	});
+
+	test("deferred-idle timer over a malformed transcript: no throw, stays running", async () => {
+		const h = makeHarness({ minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", MALFORMED);
+
+		// idle before grace → defers; the timer fires the `void maybeComplete…` path.
+		h.clock.set(1000 + 2000);
+		await h.gate.handleEvent({
+			type: "session.idle",
+			properties: { sessionID: "ses_child" },
+		} as never);
+		await flush();
+		expect(h.timers.liveTimerCount()).toBe(1);
+
+		h.clock.set(1000 + 6000);
+		h.timers.fireAllTimers();
+		await flush();
+		expect(statusOf(h.task)).toBe("running");
+		expect(h.completes).toHaveLength(0);
+	});
+
+	test("a malformed message ALONGSIDE a valid completed one neither blocks nor crashes completion", async () => {
+		const h = makeHarness({ pollMs: 5000, minIdleMs: 5000 });
+		h.sdk.setMessages("ses_child", [
+			...MALFORMED,
+			...assistantText("real result", 1500, 2000),
+		]);
+		h.gate.start();
+
+		h.clock.set(1000 + 6000);
+		h.timers.tick();
+		await flush();
+		expect(statusOf(h.task)).toBe("completed");
+		expect(h.completes).toHaveLength(1);
 	});
 });

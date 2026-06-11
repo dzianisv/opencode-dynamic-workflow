@@ -247,4 +247,105 @@ describe("notification queue", () => {
 		expect(q.pending(task.parentSessionID)).toHaveLength(1);
 		expect(fired).toHaveLength(0);
 	});
+
+	// Finding #8: the onNotify fence — a throwing toast callback must not break
+	// the push path (the notice still enqueues) and must be logged.
+	test("onNotify throwing is fenced: notice still enqueues, error logged", () => {
+		const errors: string[] = [];
+		const q = createNotificationQueue({
+			onNotify: () => {
+				throw new Error("toast boom");
+			},
+			logger: { error: (msg) => errors.push(msg) },
+		});
+		const task = makeTask();
+		expect(() => q.push(task)).not.toThrow();
+		expect(q.pending(task.parentSessionID)).toHaveLength(1);
+		expect(errors.some((m) => m.includes("onNotify"))).toBe(true);
+	});
+
+	// Finding #8: the `"${id}:?"` seenKey fallback — a terminal push with NO
+	// completedAt still dedups (both pushes key to `id:?`). Near-unreachable from
+	// the engine (terminal transitions stamp completedAt) but the type allows it.
+	test("terminal push without completedAt dedups via the ':?' seenKey fallback", () => {
+		const q = createNotificationQueue({});
+		const task = makeTask({ id: "bg_nocomp01", completedAt: undefined });
+		q.push(task);
+		q.push({ ...task });
+		expect(q.pending(task.parentSessionID)).toHaveLength(1);
+	});
+});
+
+// ---- finding #4 primitive: consume(parent, notices) -------------------------
+
+describe("notification queue — consume", () => {
+	test("consume drains EXACTLY the given notices, leaving later arrivals queued", () => {
+		const q = createNotificationQueue({});
+		const a = makeTask({ description: "alpha" });
+		q.push(a);
+		const snapshot = q.pending(a.parentSessionID);
+		// A second notice arrives AFTER the snapshot was taken (the wake's
+		// mid-flight scenario).
+		const b = makeTask({ description: "beta" });
+		q.push(b);
+
+		q.consume(a.parentSessionID, snapshot);
+
+		const remaining = q.pending(a.parentSessionID);
+		expect(remaining).toHaveLength(1);
+		expect(remaining[0]?.description).toBe("beta");
+	});
+
+	test("consume runs markNotified for exactly the drained notices", async () => {
+		const marked: string[] = [];
+		const q = createNotificationQueue({
+			markNotified: async (id) => {
+				marked.push(id);
+			},
+		});
+		const a = makeTask({ id: "bg_consume1" });
+		q.push(a);
+		const snapshot = q.pending(a.parentSessionID);
+		const b = makeTask({ id: "bg_consume2" });
+		q.push(b);
+
+		q.consume(a.parentSessionID, snapshot);
+		await flush();
+		expect(marked).toEqual(["bg_consume1"]);
+	});
+
+	test("consume of already-drained notices is a no-op (no double markNotified)", async () => {
+		const marked: string[] = [];
+		const q = createNotificationQueue({
+			markNotified: async (id) => {
+				marked.push(id);
+			},
+		});
+		const a = makeTask({ id: "bg_raced001" });
+		q.push(a);
+		const snapshot = q.pending(a.parentSessionID);
+		// The passive flush wins the race and drains everything first.
+		q.flushFor(a.parentSessionID);
+		q.consume(a.parentSessionID, snapshot);
+		await flush();
+		expect(marked).toEqual(["bg_raced001"]);
+		expect(q.pending(a.parentSessionID)).toHaveLength(0);
+	});
+
+	test("consume prunes the dedup seen-set so a resume-style re-completion re-queues", () => {
+		const q = createNotificationQueue({});
+		const a = makeTask({ id: "bg_reseen01", completedAt: 2000 });
+		q.push(a);
+		q.consume(a.parentSessionID, q.pending(a.parentSessionID));
+		expect(q.pending(a.parentSessionID)).toHaveLength(0);
+		// Same completion key again — drained keys must not block (parity with
+		// flushFor's prune-on-drain semantics).
+		q.push({ ...a });
+		expect(q.pending(a.parentSessionID)).toHaveLength(1);
+	});
+
+	test("consume for an unknown parent is a silent no-op", () => {
+		const q = createNotificationQueue({});
+		expect(() => q.consume("parent_nobody", [])).not.toThrow();
+	});
 });

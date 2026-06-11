@@ -10,8 +10,8 @@
  *   - a {@link createTaskStore} for the runner's child tasks at
  *     `<dataDir>/workflow-tasks`;
  *   - a SECOND {@link createTaskStore} for {@link RunRecord}s at
- *     `<dataDir>/workflow-runs` (the store validates only id/parentSessionID/
- *     status, so the wider RunRecord round-trips through one documented widening);
+ *     `<dataDir>/workflow-runs`, typed at RunRecord with an honest load-time
+ *     validator (the core store is generic — review finding #3);
  *   - ONE {@link createSchemaRegistry} shared across every run, behind the single
  *     global `structured_output` tool the plugin entry registers;
  *   - a {@link createNotificationQueue} whose `markNotified` persists the flag
@@ -39,10 +39,10 @@ import {
 	type FsFacade,
 	type IdGenerator,
 	type NotificationQueue,
+	nodeFsFacade,
 	resolveDataBaseDir,
 	type SessionRunner,
 	type TaskNotice,
-	type TaskStore,
 } from "@drawers/core";
 import { createWorkflowRun, type WorkflowRun } from "../runtime/index";
 import { parseScript } from "../runtime/meta";
@@ -179,10 +179,10 @@ interface LaunchMeta {
 }
 
 /**
- * The persisted record of one workflow run. Stored through {@link createTaskStore},
- * whose validation only requires `id`/`parentSessionID`/`status` — the remaining
- * fields ride along verbatim (the store serializes the whole object). The store's
- * type is `BgTask`, so save/load cross ONE documented widening (see {@link RunStore}).
+ * The persisted record of one workflow run. Stored through a RunRecord-typed
+ * {@link createTaskStore} with {@link isValidRunRecord} as its load-time
+ * validator; the optional payload fields ride along verbatim (the store
+ * serializes the whole object). No BgTask widening anywhere (finding #3).
  */
 export interface RunRecord {
 	id: string;
@@ -191,6 +191,13 @@ export interface RunRecord {
 	description: string;
 	createdAt: number;
 	completedAt?: number;
+	/**
+	 * Notification-queue flush state (parity with `BgTask.notified`): set by the
+	 * queue's `markNotified` once a terminal notice is drained, so a restart does
+	 * not re-queue an already-delivered notice. Declared (not cast in) so the
+	 * record honestly satisfies core's `NoticeRecord`.
+	 */
+	notified?: boolean;
 	scriptPath: string;
 	args?: unknown;
 	returnValue?: unknown;
@@ -367,8 +374,8 @@ export interface WorkflowEngine {
 	runs: Map<string, RunHandle>;
 	/** The run-record persistence store. */
 	runStore: RunStore;
-	/** The per-parent terminal-notice queue. */
-	queue: NotificationQueue;
+	/** The per-parent terminal-notice queue, typed at the record it carries. */
+	queue: NotificationQueue<RunRecord>;
 	/** The ONE schema registry behind the global structured_output tool. */
 	registry: SchemaRegistry;
 	/** Resolves once startup recovery has been applied + the queue seeded. */
@@ -412,15 +419,58 @@ export interface WorkflowEngine {
 }
 
 /**
- * The run-record store: a typed wrapper around a core {@link TaskStore}. The
- * single documented widening lives here — a {@link RunRecord} is NOT a `BgTask`,
- * but the store only validates id/parentSessionID/status (all present on a record)
- * and serializes the whole object, so the extra fields round-trip intact.
+ * The run-record store: a core {@link createTaskStore} typed at {@link RunRecord}
+ * with an honest run-record validator (review finding #3 — the former
+ * `as unknown as BgTask` widening is gone; the store is generic).
  */
 interface RunStore {
 	save(record: RunRecord): Promise<void>;
 	load(): Promise<RunRecord[]>;
 	dispose(): Promise<void>;
+}
+
+/**
+ * Load-time validation for a persisted {@link RunRecord}: every REQUIRED field
+ * of the interface, plus type checks on the optionals the engine's recovery and
+ * notification paths read (`completedAt`, `notified`). The remaining optional
+ * payload fields (returnValue/agents/checkpoints/…) ride along verbatim — they
+ * are display data, never control flow, so they are not gated here.
+ */
+function isValidRunRecord(value: unknown): value is RunRecord {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	const v = value as Record<string, unknown>;
+	if (typeof v.id !== "string" || v.id.length === 0) {
+		return false;
+	}
+	if (typeof v.parentSessionID !== "string") {
+		return false;
+	}
+	if (
+		v.status !== "running" &&
+		v.status !== "completed" &&
+		v.status !== "error" &&
+		v.status !== "cancelled"
+	) {
+		return false;
+	}
+	if (typeof v.description !== "string") {
+		return false;
+	}
+	if (typeof v.createdAt !== "number" || !Number.isFinite(v.createdAt)) {
+		return false;
+	}
+	if (typeof v.scriptPath !== "string") {
+		return false;
+	}
+	if (v.completedAt !== undefined && typeof v.completedAt !== "number") {
+		return false;
+	}
+	if (v.notified !== undefined && typeof v.notified !== "boolean") {
+		return false;
+	}
+	return true;
 }
 
 const RUN_PREFIX = "wf_";
@@ -503,21 +553,6 @@ function feedFsFromFacade(fs: FsFacade): FeedFs {
 
 const defaultClock: Clock = { now: () => Date.now() };
 
-/**
- * A node:fs/promises-backed {@link FsFacade} — the engine's production default when
- * no fs is injected. The plugin entry builds the engine without an fs, and the
- * engine's OWN paths (script persistence, journal writes, resume-read) are NOT the
- * stores' internal default fs — they need this concrete facade or they silently
- * no-op (the live-harness Scenario C bug: resume could not read the prior script,
- * "no fs configured"). `node:fs/promises` exposes mkdir/readdir/readFile/writeFile/
- * rename/rm with runtime-compatible signatures; the structural cast bridges the
- * minor optional-arg differences. Lazy-required so the in-memory test path that
- * injects its own fs never loads it.
- */
-function nodeFsFacade(): FsFacade {
-	return require("node:fs/promises") as FsFacade;
-}
-
 /** Cheap meta-name extraction: parse JUST for the name, fall back to "workflow". */
 function extractName(source: string): string {
 	try {
@@ -546,7 +581,7 @@ function extractDeclaredPhases(source: string): string[] | undefined {
 	}
 }
 
-/** Wrap a core TaskStore as a typed RunStore (the one documented widening). */
+/** Build the RunRecord-typed core store (honest validator, no casts). */
 function createRunStore(opts: {
 	baseDir?: string;
 	fs?: FsFacade;
@@ -561,21 +596,13 @@ function createRunStore(opts: {
 					opts.logger?.error(msg, meta),
 			}
 		: undefined;
-	const store: TaskStore = createTaskStore({
+	return createTaskStore<RunRecord>({
 		baseDir: opts.baseDir,
 		fs: opts.fs,
 		clock: opts.clock,
 		logger: storeLogger,
+		validate: isValidRunRecord,
 	});
-	return {
-		// RunRecord carries id/parentSessionID/status (the store's only validated
-		// fields) plus extra fields the store serializes verbatim. Widen across the
-		// BgTask-typed surface here, once.
-		save: (record) =>
-			store.save(record as unknown as Parameters<TaskStore["save"]>[0]),
-		load: async () => (await store.load()) as unknown as RunRecord[],
-		dispose: () => store.dispose(),
-	};
 }
 
 export function createWorkflowEngine(
@@ -844,35 +871,33 @@ export function createWorkflowEngine(
 	});
 	control.start();
 
-	// (4) The terminal-notice queue. markNotified flips + re-persists the record.
-	const queue = createNotificationQueue({
+	// (4) The terminal-notice queue, typed at RunRecord (finding #3 — the queue is
+	// generic over core's NoticeRecord minimum, which RunRecord satisfies honestly).
+	// markNotified flips + re-persists the record.
+	const queue = createNotificationQueue<RunRecord>({
 		onNotify: opts.onNotify,
 		markNotified: async (runId) => {
 			const handle = runs.get(runId);
 			if (handle) {
-				// `notified` is a BgTask-shaped flag the queue persists through; the
-				// record round-trips it like any extra field.
-				(handle.record as RunRecord & { notified?: boolean }).notified = true;
+				handle.record.notified = true;
 				await runStore.save(handle.record);
 			}
 		},
 		logger: storeLogger,
 		// The synthetic notice part carries a per-agent digest (status, stats, and each
-		// agent's conclusion), not a bare pointer — the `task` shim IS the settled
+		// agent's conclusion), not a bare pointer — the record IS the settled
 		// RunRecord, whose `agents[]` is fully rolled up by push time. The digest appends
 		// the workflow_status pointer, so the retrieval affordance survives.
-		renderHint: (task) => renderRunDigest(task as unknown as RunRecord),
+		renderHint: (record) => renderRunDigest(record),
 	});
 
 	function liveRunIds(): ReadonlySet<string> {
 		return new Set(runs.keys());
 	}
 
-	/** Build the TaskNotice-bearing BgTask shim the queue needs from a record. */
+	/** Push a settled record's terminal notice (the queue is RunRecord-typed). */
 	function noticePush(record: RunRecord): void {
-		// The queue's push() reads id/parentSessionID/description/status/timestamps —
-		// all present on a RunRecord. Cross the BgTask-typed surface once, here.
-		queue.push(record as unknown as Parameters<NotificationQueue["push"]>[0]);
+		queue.push(record);
 	}
 
 	function persistRecord(record: RunRecord): void {
@@ -1963,7 +1988,7 @@ export function createWorkflowEngine(
 			seed.push(record);
 		}
 		// seed() re-queues terminal && !notified records silently (no toast storm).
-		queue.seed(seed as unknown as Parameters<NotificationQueue["seed"]>[0]);
+		queue.seed(seed);
 		logger?.info("workflow engine recovered", { recovered: recovered.length });
 	})();
 

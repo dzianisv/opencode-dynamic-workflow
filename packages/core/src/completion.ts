@@ -228,16 +228,21 @@ function sessionErrorMessage(
  * `watermark` has non-empty text/tool parts. The watermark is the current turn's
  * dispatch time (Task 6.1.1): messages from earlier turns (created before it)
  * are ignored, so the previous turn's output can't complete a resumed turn.
+ *
+ * Defensive against malformed wire data (finding #5): `session.messages` is
+ * unvalidated, so a message missing `info`/`time`/`parts` is skipped (a missing
+ * `created` reads as 0 → pre-watermark → stale) instead of throwing out of the
+ * poll/idle paths.
  */
 function hasValidOutput(messages: GateMessage[], watermark: number): boolean {
 	for (const m of messages) {
-		if (m.info.role !== "assistant") {
+		if (m?.info?.role !== "assistant") {
 			continue;
 		}
-		if (m.info.time.created < watermark) {
+		if ((m.info.time?.created ?? 0) < watermark) {
 			continue; // stale: from a turn dispatched before this one
 		}
-		for (const p of m.parts) {
+		for (const p of m.parts ?? []) {
 			if (p.type === "text" && p.text && p.text.trim().length > 0) {
 				return true;
 			}
@@ -267,22 +272,28 @@ function messageTurnIsLive(
 	messages: GateMessage[],
 	watermark: number,
 ): boolean {
+	// Defensive against malformed wire data (finding #5): same guards as
+	// {@link hasValidOutput}. A malformed newest message (no `time`) reads as
+	// `completed === undefined` → live → conservative veto.
 	let newest: GateMessage | undefined;
+	let newestCreated = 0;
 	for (const m of messages) {
-		if (m.info.role !== "assistant") {
+		if (m?.info?.role !== "assistant") {
 			continue;
 		}
-		if (m.info.time.created < watermark) {
+		const created = m.info.time?.created ?? 0;
+		if (created < watermark) {
 			continue; // stale: from a turn dispatched before this one
 		}
-		if (!newest || m.info.time.created >= newest.info.time.created) {
+		if (!newest || created >= newestCreated) {
 			newest = m;
+			newestCreated = created;
 		}
 	}
 	if (!newest) {
 		return false;
 	}
-	return newest.info.time.completed === undefined;
+	return newest.info.time?.completed === undefined;
 }
 
 export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
@@ -323,6 +334,16 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	const turnWatermark = new Map<string, number>();
 	/** Pending deferred-idle timers per task id (so dispose can clear them). */
 	const deferTimers = new Map<string, TimerHandle>();
+	/**
+	 * In-flight detached teardown per task id (finding #2). `tryComplete` flips
+	 * synchronously and schedules teardown detached; anything that observes the
+	 * terminal status and must also observe the COMPLETED teardown (persisted
+	 * state, released slot, stamped `completedAt`) joins this promise:
+	 * `awaitCompletion` on an already-terminal task, the runner's `resume()`
+	 * fence, and `dispose`. Removed once the teardown settles (teardown itself
+	 * never rejects — every step is fenced internally).
+	 */
+	const teardowns = new Map<string, Promise<void>>();
 
 	let pollHandle: IntervalHandle | undefined;
 	let polling = false;
@@ -369,7 +390,14 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		// (stale=cancelled needs abort; completed/error of a live session do not)
 
 		// Detached teardown. Errors here must never reject the caller's flow.
-		void teardown(task, terminal, reason);
+		// Tracked per task so awaitCompletion/resume/dispose can JOIN it
+		// (finding #2): without the join, a caller resuming off the flip alone
+		// races the old teardown's late writes (completedAt/error stamps,
+		// bookkeeping deletes, terminal persist).
+		const inflight = teardown(task, terminal, reason).finally(() => {
+			teardowns.delete(task.id);
+		});
+		teardowns.set(task.id, inflight);
 		return true;
 	}
 
@@ -574,19 +602,32 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 		task: BgTask,
 		sessionID: string,
 	): Promise<void> {
-		// Re-read status: between scheduling and here it may have flipped.
-		const liveTask = getTask(task.id);
-		if (liveTask?.status !== "running") {
-			return;
+		// Internally fenced (finding #5): this runs detached from the deferred-idle
+		// timer (`void maybeCompleteOnOutput(...)`) and awaited from handleEvent —
+		// a throw from either call site would surface as an unhandled rejection
+		// every time a malformed transcript/SDK hiccup slips past assessTurn's own
+		// fences. Degrade conservatively (no completion) and log instead.
+		try {
+			// Re-read status: between scheduling and here it may have flipped.
+			const liveTask = getTask(task.id);
+			if (liveTask?.status !== "running") {
+				return;
+			}
+			// One liveness+validity assessment after grace, before the flip (Task 7.1.1).
+			const { valid, live } = await assessTurn(liveTask, sessionID);
+			if (valid && !live) {
+				tryComplete(task.id, "completed");
+			}
+			// invalid OR still-live → do not complete; the model may still be mid-flight
+			// (quiet time is not proof of turn end). Safety nets (poll / stale) will
+			// catch a truly-finished session later.
+		} catch (err) {
+			logger?.error?.("completion assessment failed", {
+				id: task.id,
+				sessionID,
+				err: errorText(err),
+			});
 		}
-		// One liveness+validity assessment after grace, before the flip (Task 7.1.1).
-		const { valid, live } = await assessTurn(liveTask, sessionID);
-		if (valid && !live) {
-			tryComplete(task.id, "completed");
-		}
-		// invalid OR still-live → do not complete; the model may still be mid-flight
-		// (quiet time is not proof of turn end). Safety nets (poll / stale) will
-		// catch a truly-finished session later.
 	}
 
 	async function handleEvent(event: Event): Promise<void> {
@@ -650,6 +691,11 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 				}
 				await pollTask(task, now);
 			}
+		} catch (err) {
+			// The poll is fired detached (`void runPoll()`) every tick: a throw here
+			// would be an UNHANDLED REJECTION per pollMs, forever (finding #5). Log
+			// and let the next tick retry.
+			logger?.error?.("safety poll tick failed", { err: errorText(err) });
 		} finally {
 			polling = false;
 		}
@@ -703,7 +749,11 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 	): Promise<BgTask> {
 		const task = getTask(taskId);
 		if (task && isTerminal(task.status)) {
-			return Promise.resolve(task);
+			// Already terminal — but the detached teardown may still be in flight
+			// (finding #2): join it so the caller observes the released slot,
+			// stamped completedAt, and persisted terminal state at resolve time.
+			const inflight = teardowns.get(taskId);
+			return inflight ? inflight.then(() => task) : Promise.resolve(task);
 		}
 		return new Promise<BgTask>((resolve, reject) => {
 			if (!task) {
@@ -766,7 +816,12 @@ export function createCompletionGate(deps: CompletionGateDeps): CompletionGate {
 			handle.clear();
 		}
 		deferTimers.clear();
-		// Reject pending waiters; no status mutation.
+		// Drain live detached teardowns FIRST (finding #2): they resolve their own
+		// waiters and persist terminal state — rejecting those waiters here would
+		// race the teardown's resolution, and dropping the teardowns would lose
+		// persists mid-shutdown.
+		await Promise.allSettled([...teardowns.values()]);
+		// Reject the remaining pending waiters; no status mutation.
 		for (const [, set] of waiters) {
 			for (const w of set) {
 				w.timer?.clear();
