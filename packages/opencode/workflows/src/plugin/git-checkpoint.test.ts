@@ -912,14 +912,25 @@ describe("createGitCheckpointer — per-run ref marker / promote / discard", () 
 		);
 	});
 
-	test("promote() deletes the marker and NEVER rewinds the branch", async () => {
-		const { cp, commands } = await committedCheckpointer();
+	test("promote() rewinds HEAD to baseline (leaves NO commits on the branch), THEN deletes the marker", async () => {
+		// SUCCESS now collapses to baseline exactly like discard: the run's net edits
+		// stay uncommitted and the operator commits them with their own message, so the
+		// branch never carries pi-drawers checkpoint commits.
+		const { cp, commands } = await committedCheckpointer([
+			{
+				match: (c) => c === "git rev-parse refs/wf-checkpoints/wf_1",
+				out: ok("sha_x"),
+			},
+		]);
 		await cp.promote();
-		expect(commands).toContain("git update-ref -d refs/wf-checkpoints/wf_1");
-		// Promotion never touches the branch.
-		expect(commands.some((c) => c.startsWith("git update-ref HEAD"))).toBe(
-			false,
+		const rewindIdx = commands.indexOf("git update-ref HEAD base000");
+		const delIdx = commands.indexOf(
+			"git update-ref -d refs/wf-checkpoints/wf_1",
 		);
+		expect(rewindIdx).toBeGreaterThanOrEqual(0);
+		expect(delIdx).toBeGreaterThanOrEqual(0);
+		// Rewind precedes the marker delete (same ordering as discard).
+		expect(rewindIdx).toBeLessThan(delIdx);
 	});
 
 	test("discard() with branch tip == marker tip rewinds HEAD to baseline, THEN deletes the marker", async () => {

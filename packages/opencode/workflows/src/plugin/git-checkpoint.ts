@@ -128,10 +128,12 @@ export interface Checkpointer {
 	/** The run-start HEAD captured by {@link Checkpointer.baseline}; null in a zero-commit repo or before baseline. */
 	baselineRef(): string | null;
 	/**
-	 * SUCCESS terminal (Epic 4.1): the run completed, so its checkpoint commits stay
-	 * on the working branch. Promotion only removes the now-redundant per-run marker
-	 * ref ({@link checkpointRefFor}); it NEVER touches the branch. No-op when the run
-	 * committed nothing or the checkpointer is dead. Fenced — never rejects.
+	 * SUCCESS terminal (Epic 4.1, revised): collapse the run's checkpoint commits back
+	 * to the run-start baseline so the operator's branch carries NO workflow commits —
+	 * the run's net edits remain as staged/uncommitted changes the operator commits
+	 * with their OWN message. Non-destructive (moves only the branch pointer, never the
+	 * index/working tree) and foreign-commit-guarded; deletes the marker afterward.
+	 * No-op when the run committed nothing or the checkpointer is dead. Fenced.
 	 */
 	promote(): Promise<void>;
 	/**
@@ -586,25 +588,33 @@ export function createGitCheckpointer(
 		};
 	}
 
-	async function promote(): Promise<void> {
-		// Success terminal: commits are already on the branch; only drop the now-
-		// redundant marker. No-op on a dead checkpointer or a run with no commits.
-		if (dead || ownRunId === undefined) {
-			return;
-		}
-		const del =
-			await git()`git update-ref -d ${checkpointRefFor(ownRunId)}`.quiet();
-		if (del.exitCode !== 0) {
-			logger?.debug("git checkpoint marker delete (promote) failed", {
-				runId: ownRunId,
-				stderr: readText({ text: () => del.stderr.toString() }),
-			});
-		}
-	}
-
-	async function discard(): Promise<void> {
-		// Failure/abort/cancel terminal. No-op on a dead checkpointer or a run with no
-		// commits (nothing to rewind, no marker to delete).
+	/**
+	 * Terminal teardown (Epic 4.1, revised): collapse this run's checkpoint commits
+	 * back to the run-start baseline so the operator's branch NEVER carries
+	 * `pi-drawers`-authored commits. Both terminals — SUCCESS and FAILURE/ABORT/CANCEL
+	 * — rewind: the per-agent commits are an INTRA-RUN mechanism (mid-run recovery +
+	 * the worktree merge-back anchor), torn down at the end regardless of outcome.
+	 *
+	 * A NON-destructive `update-ref HEAD <baseline>` moves ONLY the branch pointer —
+	 * never the index/working tree — so the run's net edits survive as staged/
+	 * uncommitted changes: the operator commits them with their OWN message (success)
+	 * or reviews/drops them (failure). The marker is always deleted afterward (rewound
+	 * commits become unreachable → GC'd).
+	 *
+	 * FOREIGN-COMMIT GUARD: rewind ONLY when a baseline exists AND every commit in
+	 * `baseline..HEAD` carries THIS run's forensic `run=<runId>` marker in its subject
+	 * (checkpoint commits, worktree scratch commits, and merge-back commits all stamp
+	 * it). A bare tip-equality check is NOT enough: two CONCURRENT runs interleave
+	 * checkpoint commits on one branch, so a rewind-to-baseline could orphan a sibling
+	 * run's commits even when this run's marker sits at the tip. ANY foreign commit in
+	 * the range (an operator's, a sibling run's) → SKIP the rewind (keep the marker
+	 * cleanup) and warn with the residue SHAs to inspect/clean manually.
+	 *
+	 * No-op on a dead checkpointer or a run that committed nothing. Fenced — never rejects.
+	 */
+	async function rewindToBaseline(
+		outcome: "promote" | "discard",
+	): Promise<void> {
 		if (dead || ownRunId === undefined) {
 			return;
 		}
@@ -614,17 +624,6 @@ export function createGitCheckpointer(
 		const branchTip = branch.exitCode === 0 ? readText(branch).trim() : "";
 		const marker = await git()`git rev-parse ${ref}`.quiet();
 		const markerTip = marker.exitCode === 0 ? readText(marker).trim() : "";
-		// (c) FOREIGN-COMMIT GUARD: rewind ONLY when a baseline exists AND every
-		// commit in `baseline..HEAD` carries THIS run's forensic `run=<runId>` marker
-		// in its subject (checkpoint commits, worktree scratch commits, and merge-back
-		// commits all stamp it). A bare tip-equality check is NOT enough: two
-		// CONCURRENT runs interleave checkpoint commits on one branch, so run A's
-		// rewind-to-baseline would orphan run B's commits even when A's marker happens
-		// to sit at the tip. ANY foreign commit in the range (an operator's, a sibling
-		// run's) → SKIP the rewind (keep the marker cleanup) and warn. A NON-destructive
-		// `update-ref HEAD <baseline>`: it follows the checked-out branch symref and
-		// moves ONLY the pointer, never the index/working tree, so the abandoned run's
-		// edits survive on disk as uncommitted changes.
 		const base = baselineHead;
 		let ownsRange = base !== null;
 		if (base !== null && ownsRange) {
@@ -645,8 +644,9 @@ export function createGitCheckpointer(
 		if (base !== null && ownsRange) {
 			const rewind = await git()`git update-ref HEAD ${base}`.quiet();
 			if (rewind.exitCode !== 0) {
-				logger?.debug("git checkpoint discard rewind failed", {
+				logger?.debug("git checkpoint rewind failed", {
 					runId: ownRunId,
+					outcome,
 					stderr: readText({ text: () => rewind.stderr.toString() }),
 				});
 			}
@@ -655,22 +655,41 @@ export function createGitCheckpointer(
 			// log, or no baseline: surface the residue SHA(s) the operator can
 			// inspect/clean before GC (ISSUES.md Issue 1 fallback).
 			logger?.warn(
-				"git checkpoint discard skipped the branch rewind: the baseline..tip " +
-					"range contains commits that do not belong to this run (an operator's " +
-					"or a concurrent run's), or there is no run-start baseline — this " +
-					"run's checkpoint commits are left in place; inspect/clean them manually",
-				{ runId: ownRunId, markerTip, branchTip, baselineRef: baselineHead },
+				"git checkpoint could not collapse to baseline: the baseline..tip range " +
+					"contains commits that do not belong to this run (an operator's or a " +
+					"concurrent run's), or there is no run-start baseline — this run's " +
+					"checkpoint commits are left on the branch; inspect/clean them manually",
+				{
+					runId: ownRunId,
+					outcome,
+					markerTip,
+					branchTip,
+					baselineRef: baselineHead,
+				},
 			);
 		}
-		// (d) Always delete the marker (the orphaned commits, if rewound, become
-		// unreachable → GC'd).
+		// Always delete the marker (the rewound commits, now unreachable, GC away).
 		const del = await git()`git update-ref -d ${ref}`.quiet();
 		if (del.exitCode !== 0) {
-			logger?.debug("git checkpoint marker delete (discard) failed", {
+			logger?.debug("git checkpoint marker delete failed", {
 				runId: ownRunId,
+				outcome,
 				stderr: readText({ text: () => del.stderr.toString() }),
 			});
 		}
+	}
+
+	async function promote(): Promise<void> {
+		// SUCCESS terminal: collapse to baseline so the run leaves NO commits on the
+		// operator's branch — its net edits stay uncommitted for the operator to commit
+		// with their own message. (Was: keep the per-agent commits on the branch.)
+		await rewindToBaseline("promote");
+	}
+
+	async function discard(): Promise<void> {
+		// FAILURE/ABORT/CANCEL terminal: collapse to baseline, leaving the partial edits
+		// as uncommitted changes to review or drop.
+		await rewindToBaseline("discard");
 	}
 
 	async function sweepMarkers(): Promise<void> {

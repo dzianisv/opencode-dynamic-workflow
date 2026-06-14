@@ -1661,7 +1661,7 @@ describe("createWorkflowEngine — per-agent git checkpoints (Epic 2.1)", () => 
 // ---- Epic 4.1: abandoned-run checkpoint residue (promote / discard) ----------
 
 describe("createWorkflowEngine — abandoned-run checkpoint residue (Epic 4.1)", () => {
-	test("a completed run advances the per-run marker during the run and PROMOTES (marker delete, no rewind) at settle", async () => {
+	test("a completed run advances the per-run marker during the run and COLLAPSES TO BASELINE (rewind + marker delete) at settle", async () => {
 		const { facade } = makeFs();
 		const { clock: mclock, bump } = bumpClock(NOW);
 		const { client, sessions } = makeClockedCompletingClient(
@@ -1697,23 +1697,23 @@ describe("createWorkflowEngine — abandoned-run checkpoint residue (Epic 4.1)",
 		expect(repo.commands).toContain(
 			`git update-ref refs/wf-checkpoints/wf_prom001 ${sha}`,
 		);
-		// At settle (success): the marker is deleted, the branch is NOT rewound.
-		expect(repo.commands).toContain(
+		// At settle (success): collapse to baseline — rewind the branch to the
+		// run-start baseline, THEN delete the marker, so the completed run leaves NO
+		// commits on the operator's branch (its net edits stay uncommitted).
+		const rewindIdx = repo.commands.indexOf("git update-ref HEAD base0000");
+		const delIdx = repo.commands.indexOf(
 			"git update-ref -d refs/wf-checkpoints/wf_prom001",
 		);
-		expect(repo.commands.some((c) => c.startsWith("git update-ref HEAD"))).toBe(
-			false,
-		);
-		// Ordering: the marker delete follows the last commit.
+		expect(rewindIdx).toBeGreaterThanOrEqual(0);
+		expect(delIdx).toBeGreaterThanOrEqual(0);
+		// Rewind precedes the marker delete; both follow the last checkpoint commit.
+		expect(rewindIdx).toBeLessThan(delIdx);
 		const lastCommitIdx = repo.commands.lastIndexOf(
 			repo.commands
 				.filter((c) => c.includes("commit --no-verify"))
 				.pop() as string,
 		);
-		const delIdx = repo.commands.indexOf(
-			"git update-ref -d refs/wf-checkpoints/wf_prom001",
-		);
-		expect(delIdx).toBeGreaterThan(lastCommitIdx);
+		expect(rewindIdx).toBeGreaterThan(lastCommitIdx);
 
 		await engine.dispose();
 	});
