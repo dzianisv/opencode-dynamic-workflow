@@ -1,10 +1,12 @@
 /**
- * semantic-release `prepareCmd`: stamp the computed version into both PUBLISHED
+ * semantic-release `prepareCmd`: stamp the computed version into all PUBLISHED
  * plugin manifests (lockstep — one version for the set) and build the bundles.
  *
- * `@drawers/core` stays npm-private; the build inlines it (see scripts/build.ts).
- * Runs BEFORE publish; the version-bumped package.jsons are committed back to main
- * by @semantic-release/git afterwards.
+ * opencode's `@drawers/core` stays npm-private; the build inlines it (see
+ * scripts/build.ts). pi's `@drawers/pi-core` IS published (pi loads TS via jiti,
+ * so it can't be inlined) — it gets the same version stamp here, and the publish
+ * step pins each pi plugin's workspace ref to it. Runs BEFORE publish; the
+ * version-bumped package.jsons are committed back to main by @semantic-release/git.
  *
  * Usage: `bun run scripts/release-prepare.ts <version>`
  */
@@ -18,8 +20,15 @@ if (!version) {
 }
 
 const MANIFESTS = [
-	"packages/background-agents/package.json",
-	"packages/workflows/package.json",
+	"packages/opencode/background-agents/package.json",
+	"packages/opencode/workflows/package.json",
+	"packages/opencode/cadence/package.json",
+	"packages/opencode/statusline/package.json",
+	"packages/pi/core/package.json",
+	"packages/pi/background-agents/package.json",
+	"packages/pi/cadence/package.json",
+	"packages/pi/workflows/package.json",
+	"packages/pi/statusline/package.json",
 ];
 
 for (const path of MANIFESTS) {

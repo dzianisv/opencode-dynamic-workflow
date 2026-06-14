@@ -35,7 +35,7 @@ jobs:
           bun test
           bun run typecheck
           bun run lint
-      - name: Release (semantic-release → build → npm publish both plugins)
+      - name: Release (semantic-release → build → npm publish all plugins)
         run: npx --no-install semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

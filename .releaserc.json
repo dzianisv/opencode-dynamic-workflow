@@ -16,8 +16,15 @@
 			{
 				"assets": [
 					"CHANGELOG.md",
-					"packages/background-agents/package.json",
-					"packages/workflows/package.json"
+					"packages/opencode/background-agents/package.json",
+					"packages/opencode/workflows/package.json",
+					"packages/opencode/cadence/package.json",
+					"packages/opencode/statusline/package.json",
+					"packages/pi/core/package.json",
+					"packages/pi/background-agents/package.json",
+					"packages/pi/cadence/package.json",
+					"packages/pi/workflows/package.json",
+					"packages/pi/statusline/package.json"
 				],
 				"message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
 			}
