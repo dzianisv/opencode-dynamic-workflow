@@ -1,0 +1,42 @@
+{
+	"name": "pi-drawer-ask-user",
+	"version": "0.1.0",
+	"description": "An ask_user tool for pi — presents 1-4 multiple-choice questions (2-4 options each) in an interactive overlay with single/multi-select, custom free-text answers, and tabbed navigation.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fredcamaral/drawers.git",
+		"directory": "packages/pi/ask-user"
+	},
+	"keywords": [
+		"pi",
+		"pi-package",
+		"ask-user",
+		"questions",
+		"interactive"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.79.0",
+		"@earendil-works/pi-tui": ">=0.79.0"
+	},
+	"dependencies": {
+		"typebox": "1.1.38"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.79.3",
+		"@earendil-works/pi-tui": "0.79.3"
+	}
+}

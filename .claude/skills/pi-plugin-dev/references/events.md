@@ -20,7 +20,8 @@ on a return.
 
 ```
 pi starts
-  ├─ project_trust            (user/global + CLI -e extensions only, pre project resources)
+  ├─ project_trust            (user/global + CLI -e extensions only, pre project resources;
+  │                            also re-fires on /resume into an unresolved-trust cwd — see below)
   ├─ session_start { reason: "startup" }
   └─ resources_discover { reason: "startup" }
 
@@ -85,6 +86,16 @@ after trust). `ctx` is a limited `ProjectTrustContext` (`cwd`, `mode`, `hasUI`, 
 - **Must return** `{ trusted: "yes"|"no"|"undecided", remember?: boolean }`. First
   yes/no wins and suppresses the built-in prompt; `remember: true` persists it.
   `"undecided"` defers. Guard with `ctx.hasUI` before prompting.
+- **Not startup-only — write it re-entrant.** pi resolves trust *per cwd*, not once
+  per process. The handler also fires when a session replacement (e.g. `/resume`)
+  enters a cwd whose trust hasn't been resolved in this process yet. Don't cache an
+  "already decided" flag keyed to process start — pi's own per-cwd cache only short-
+  circuits a cwd it has *already* resolved, so a cache keyed to startup would skip the
+  gate (or prompt against a stale cwd) on a `/resume` into a new untrusted directory.
+- On that re-resolution path `ctx.hasUI` is **`false`** (the prompt is only offered on
+  the initial startup runtime), so the `ctx.hasUI` guard isn't optional hygiene — a
+  handler that prompts unconditionally will hang or no-op there. Decide from saved
+  state / `remember`ed decisions on the re-entrant path, prompt only at startup.
 
 ### `resources_discover` — `types.ts:528-539`
 Fired after `session_start` so extensions can contribute resource paths.
@@ -198,6 +209,13 @@ Event: `{ type, level, previousLevel }`. Notification.
 ### `input` — `types.ts:784-800`
 After extension `/commands` are checked, **before** skill/template expansion (sees raw
 `/skill:foo`, `/template`).
+
+Full pipeline order: **(1)** extension `/commands` matched first — **if matched, the
+`input` event is skipped entirely**; **(2)** `input` fires; **(3)** `/skill:name`
+expansion; **(4)** `/template` expansion; **(5)** agent processing. The consequence
+beyond the source-routing guard below: **an `input` handler does not see every
+keystroke** — anything routed to a registered slash command bypasses it. Don't treat
+`input` as a universal keylogger / command gate.
 - Event: `{ type, text, images?, source: "interactive"|"rpc"|"extension", streamingBehavior?: "steer"|"followUp" }`.
 - Return `{ action: "continue" }` (default), `{ action: "transform", text, images? }`
   (rewrite, then expansion continues — transforms chain), or `{ action: "handled" }`

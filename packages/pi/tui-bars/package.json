@@ -1,0 +1,41 @@
+{
+	"name": "pi-drawer-tui-bars",
+	"version": "0.1.0",
+	"description": "A two-line footer for pi — repo, persona, session name (auto-named via Haiku), model, token usage, cost, context %, and git branch.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fredcamaral/drawers.git",
+		"directory": "packages/pi/tui-bars"
+	},
+	"keywords": [
+		"pi",
+		"pi-package",
+		"tui-bars",
+		"footer",
+		"statusline"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": ">=0.79.0",
+		"@earendil-works/pi-coding-agent": ">=0.79.0",
+		"@earendil-works/pi-tui": ">=0.79.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.79.3",
+		"@earendil-works/pi-coding-agent": "0.79.3",
+		"@earendil-works/pi-tui": "0.79.3"
+	}
+}

@@ -29,6 +29,13 @@ const MANIFESTS = [
 	"packages/pi/cadence/package.json",
 	"packages/pi/workflows/package.json",
 	"packages/pi/statusline/package.json",
+	"packages/pi/ask-user/package.json",
+	"packages/pi/btw/package.json",
+	"packages/pi/pierre-diffs/package.json",
+	"packages/pi/personas/package.json",
+	"packages/pi/tui-bars/package.json",
+	"packages/pi/handoff/package.json",
+	"packages/pi/subagents/package.json",
 ];
 
 for (const path of MANIFESTS) {

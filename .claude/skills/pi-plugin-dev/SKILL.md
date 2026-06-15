@@ -270,11 +270,16 @@ export default function (pi: ExtensionAPI) {
 ### Output discipline
 
 Route user-facing output through `ctx.ui.*` (`notify`, `setStatus`, `setWidget`).
-In TUI mode the terminal is owned by pi's differential renderer; writing raw
-`stdout` can disrupt it. `console.log` appears in pi examples for one-off provider
-debugging, but it is not a UI channel — do not use it for anything the user is meant
-to read. In `print`/`json` modes UI methods are no-ops, so never depend on a dialog
-result for control flow without a `ctx.hasUI` guard.
+While a TUI is mounted the terminal is owned by pi's differential renderer, which
+tracks a model of the screen and writes only diffs. **Any** `console.log` /
+`console.error` / `console.warn` or raw `stdout`/`stderr` write desyncs that model
+from the real terminal and corrupts every subsequent diff — ghost lines, misplaced
+cursor, garbled output. This is the #1 "my extension breaks the TUI" cause, not a
+cosmetic "don't print user text here" note. The only free surface is `print`/`json`/
+`rpc`, where stdout is not under renderer control. Gate any debug write behind
+`if (!ctx.hasUI)`, and send diagnostics to a **file**, never the console. In
+`print`/`json` modes UI methods are no-ops, so never depend on a dialog result for
+control flow without a `ctx.hasUI` guard.
 
 ## Which reference file to read
 
@@ -293,6 +298,7 @@ result for control flow without a `ctx.hasUI` guard.
 
 | Mistake | Fix |
 |---------|-----|
+| `console.log`/`console.error`/`console.warn` (or raw `stdout`/`stderr`) from extension code in TUI mode | Corrupts pi's differential renderer (garbled output, ghost lines). Send diagnostics to a **file** sink; user-facing text via `ctx.ui.notify`/`setStatus`; guard any unavoidable stdout debug behind `if (!ctx.hasUI)`. |
 | Calling `pi.sendMessage` / `ctx.appendEntry` / other **action** methods from the factory body | They throw `"Extension runtime not initialized"` during load. Only *registration* is valid in the factory; act from `session_start` or a handler. |
 | Returning `{ isError: true }` from a tool's `execute` to signal failure | Ignored. **Throw** to mark the tool errored and report it to the model. |
 | `Type.Union` / `Type.Literal` for a string enum in tool params | Use `StringEnum([...] as const)` from `@earendil-works/pi-ai` — `Type.Union` breaks Google's API. |

@@ -1,0 +1,41 @@
+{
+	"name": "pi-drawer-btw",
+	"version": "0.1.0",
+	"description": "A concurrent side-discussion chat overlay for pi — /btw opens a streaming chat with the current model while the main agent keeps working. Read-only, no file edits.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fredcamaral/drawers.git",
+		"directory": "packages/pi/btw"
+	},
+	"keywords": [
+		"pi",
+		"pi-package",
+		"btw",
+		"side-discussion",
+		"chat"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": ">=0.79.0",
+		"@earendil-works/pi-coding-agent": ">=0.79.0",
+		"@earendil-works/pi-tui": ">=0.79.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.79.3",
+		"@earendil-works/pi-coding-agent": "0.79.3",
+		"@earendil-works/pi-tui": "0.79.3"
+	}
+}

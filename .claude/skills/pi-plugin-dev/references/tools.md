@@ -137,10 +137,18 @@ pi.on("session_tree",  (_e, ctx) => reconstruct(ctx))   // branches diverge — 
 ## Overriding a built-in tool
 
 Register a tool with a built-in name (`read`, `bash`, `edit`, `write`, `grep`, `find`,
-`ls`) to replace it (the TUI warns). Rendering is resolved per slot: omit `renderCall`
+`ls`) to replace it. Rendering is resolved per slot: omit `renderCall`
 or `renderResult` and the built-in renderer is reused (diffs, highlighting). Your
 result **must match the built-in's `details` shape** — the UI and session logic depend
 on it. `promptSnippet`/`promptGuidelines` are **not** inherited; redeclare them.
+
+**Silent, not blocked — a name collision is an override switch.** Registering a tool
+whose name matches a built-in silently *replaces* pi's tool for the session (the registry
+is last-write-wins; extension tools overwrite the built-in entry) — with no warning in any
+mode. An accidental collision quietly disables pi's tool and nothing tells you. Pick a
+distinct name unless you mean to shadow. And if you do override, you inherit the built-in's **full contract**,
+not just the `details` shape: path normalization, the per-file `withFileMutationQueue`
+serialization, and the truncation budgets above. Half an override is a regression.
 
 Or start with `pi --no-builtin-tools` (extension tools only) for a clean slate.
 
@@ -166,5 +174,20 @@ handler (see `events.md`).
 
 `renderCall(args, theme, ctx)` and `renderResult(result, options, theme, ctx)` return a
 `@earendil-works/pi-tui` `Component`. Defaults: `renderCall` shows the tool name,
-`renderResult` shows raw `content` text. See `ui.md` for the component/theme API,
+`renderResult` shows raw `content` text. See `ui.md` for the full component/theme API,
 `renderShell: "self"`, and `keyHint()`.
+
+**Your renderer is a Component and obeys the same render contract** — it is not exempt
+because it is "just a tool result." Measure with `visibleWidth()`, clamp with
+`truncateToWidth()` / `wrapTextWithAnsi()` (from `@earendil-works/pi-tui`), and
+tab-replace **before** measuring — a raw `\t` is one byte but multiple display columns and
+will blow your width math. Apply this to the **error branch too**: tool error strings
+routinely embed raw file content, the worst-case input for overflow. An unclamped error
+renderer corrupts the frame just as badly as an unclamped success one. See `ui.md` for
+the width-safety details.
+
+**Guard interactive UI in tools with `pi.hasUI`.** A tool that pops a `ctx.ui.custom()`
+overlay or a dialog must branch to a text-only result when `hasUI` is false — in RPC /
+`print` / `json` mode `custom()` resolves to `undefined` (typed `undefined as never`),
+so an unguarded `await` silently returns nothing and your tool produces empty output.
+Decide the result from data, not from a UI prompt, whenever `!pi.hasUI`.

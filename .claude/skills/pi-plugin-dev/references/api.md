@@ -165,7 +165,7 @@ createLocalBashOperations(): BashOperations               // wrap pi's local she
 // UI / rendering (ui.md):
 CustomEditor                                              // base class for custom editors
 keyHint(id, desc) ; keyText(id) ; rawKeyHint(key, desc)  // app.* / tui.* namespaced keybinding ids
-highlightCode(code, lang, theme) ; getLanguageFromPath(path)
+highlightCode(code, lang) -> string[] ; getLanguageFromPath(path)   // uses the global theme; no theme arg
 
 // Session:
 SessionManager                                            // static list()/listAll(); appendMessage/appendEntry on instances

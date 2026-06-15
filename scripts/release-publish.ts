@@ -37,6 +37,13 @@ const PACKAGES = [
 	"packages/pi/cadence",
 	"packages/pi/workflows",
 	"packages/pi/statusline",
+	"packages/pi/ask-user",
+	"packages/pi/btw",
+	"packages/pi/pierre-diffs",
+	"packages/pi/personas",
+	"packages/pi/tui-bars",
+	"packages/pi/handoff",
+	"packages/pi/subagents",
 ];
 
 for (const dir of PACKAGES) {
