@@ -74,3 +74,5 @@ export {
 	type SettledJournalEntry,
 	type WorkflowFn,
 } from "./runtime/types";
+
+export { WorkflowsPlugin as default } from "./plugin/index";

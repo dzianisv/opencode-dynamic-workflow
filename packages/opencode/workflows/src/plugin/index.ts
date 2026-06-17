@@ -147,3 +147,5 @@ export const WorkflowsPlugin: Plugin = async ({ client, directory, $ }) => {
 		},
 	};
 };
+
+export default WorkflowsPlugin;
